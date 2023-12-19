@@ -284,7 +284,7 @@ class Struct:
             value_func=lambda *_: self,
             input_types={},
             initializer_list_func=lambda *_: False,
-            native_func=make_full_qualified_name(self.cls),
+            native_func=make_full_qualified_name(self.key),
         )
 
         # build a constructor that takes each param as a value
@@ -297,7 +297,7 @@ class Struct:
             value_func=lambda *_: self,
             input_types=input_types,
             initializer_list_func=lambda *_: False,
-            native_func=make_full_qualified_name(self.cls),
+            native_func=make_full_qualified_name(self.key),
         )
 
         self.default_constructor.add_overload(self.value_constructor)
@@ -446,7 +446,7 @@ class Var:
             if hasattr(t.dtype, "_wp_generic_type_str_"):
                 dtypestr = compute_type_str(f"wp::{t.dtype._wp_generic_type_str_}", t.dtype._wp_type_params_)
             elif isinstance(t.dtype, Struct):
-                dtypestr = make_full_qualified_name(t.dtype.cls)
+                dtypestr = make_full_qualified_name(t.dtype.key)
             elif t.dtype.__name__ in ("bool", "int", "float"):
                 dtypestr = t.dtype.__name__
             else:
@@ -454,7 +454,7 @@ class Var:
             classstr = f"wp::{type(t).__name__}"
             return f"{classstr}_t<{dtypestr}>"
         elif isinstance(t, Struct):
-            return make_full_qualified_name(t.cls)
+            return make_full_qualified_name(t.key)
         elif is_reference(t):
             if not value_type:
                 return Var.type_to_ctype(t.value_type) + "*"
@@ -2339,7 +2339,7 @@ def make_full_qualified_name(func):
 
 
 def codegen_struct(struct, device="cpu", indent_size=4):
-    name = make_full_qualified_name(struct.cls)
+    name = make_full_qualified_name(struct.key)
 
     body = []
     indent_block = " " * indent_size
