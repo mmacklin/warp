@@ -1168,8 +1168,8 @@ class OpenGLRenderer:
         scaling=1.0,
         fps=60,
         up_axis="Y",
-        screen_width=1024,
-        screen_height=768,
+        screen_width=1280,
+        screen_height=720,
         near_plane=1.0,
         far_plane=100.0,
         camera_fov=45.0,
@@ -1278,9 +1278,33 @@ class OpenGLRenderer:
 
         self._title = title
 
-        self.window = pyglet.window.Window(
-            width=screen_width, height=screen_height, caption=title, resizable=True, vsync=vsync, visible=not headless
-        )
+        try:
+            # try to enable MSAA
+            config = pyglet.gl.Config(sample_buffers=1, samples=4)
+            self.window = pyglet.window.Window(
+                width=screen_width,
+                height=screen_height,
+                caption=title,
+                resizable=True,
+                vsync=vsync,
+                visible=not headless,
+                config=config,
+            )
+            gl.glEnable(gl.GL_MULTISAMPLE)
+            # remember sample count for later (e.g., resolving FBO)
+            self.msaa_samples = 4
+        except pyglet.window.NoSuchConfigException:
+            print("Warning: Could not get MSAA config, falling back to non-AA.")
+            self.window = pyglet.window.Window(
+                width=screen_width,
+                height=screen_height,
+                caption=title,
+                resizable=True,
+                vsync=vsync,
+                visible=not headless,
+            )
+            self.msaa_samples = 0
+
         if headless is None:
             self.headless = pyglet.options.get("headless", False)
         else:
@@ -1946,6 +1970,14 @@ class OpenGLRenderer:
     def _setup_framebuffer(self):
         gl = OpenGLRenderer.gl
 
+        # Ensure MSAA member variables exist even on first call
+        if not hasattr(self, "_frame_msaa_color_rb"):
+            self._frame_msaa_color_rb = None
+        if not hasattr(self, "_frame_msaa_depth_rb"):
+            self._frame_msaa_depth_rb = None
+        if not hasattr(self, "_frame_msaa_fbo"):
+            self._frame_msaa_fbo = None
+
         self._switch_context()
 
         if self._frame_texture is None:
@@ -2027,6 +2059,45 @@ class OpenGLRenderer:
         )
         gl.glBufferData(gl.GL_PIXEL_PACK_BUFFER, pixels.nbytes, pixels.ctypes.data, gl.GL_DYNAMIC_DRAW)
         gl.glBindBuffer(gl.GL_PIXEL_PACK_BUFFER, 0)
+
+        # ---------------------------------------------------------------------
+        # Additional: create MSAA framebuffer if multi-sampling is enabled
+        # ---------------------------------------------------------------------
+        if getattr(self, "msaa_samples", 0) > 0:
+            # color renderbuffer
+            if self._frame_msaa_color_rb is None:
+                self._frame_msaa_color_rb = gl.GLuint()
+                gl.glGenRenderbuffers(1, self._frame_msaa_color_rb)
+            gl.glBindRenderbuffer(gl.GL_RENDERBUFFER, self._frame_msaa_color_rb)
+            gl.glRenderbufferStorageMultisample(
+                gl.GL_RENDERBUFFER, self.msaa_samples, gl.GL_RGB8, self.screen_width, self.screen_height
+            )
+
+            # depth renderbuffer
+            if self._frame_msaa_depth_rb is None:
+                self._frame_msaa_depth_rb = gl.GLuint()
+                gl.glGenRenderbuffers(1, self._frame_msaa_depth_rb)
+            gl.glBindRenderbuffer(gl.GL_RENDERBUFFER, self._frame_msaa_depth_rb)
+            gl.glRenderbufferStorageMultisample(
+                gl.GL_RENDERBUFFER, self.msaa_samples, gl.GL_DEPTH_COMPONENT32, self.screen_width, self.screen_height
+            )
+
+            # FBO
+            if self._frame_msaa_fbo is None:
+                self._frame_msaa_fbo = gl.GLuint()
+                gl.glGenFramebuffers(1, self._frame_msaa_fbo)
+            gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, self._frame_msaa_fbo)
+            gl.glFramebufferRenderbuffer(
+                gl.GL_FRAMEBUFFER, gl.GL_COLOR_ATTACHMENT0, gl.GL_RENDERBUFFER, self._frame_msaa_color_rb
+            )
+            gl.glFramebufferRenderbuffer(
+                gl.GL_FRAMEBUFFER, gl.GL_DEPTH_ATTACHMENT, gl.GL_RENDERBUFFER, self._frame_msaa_depth_rb
+            )
+
+            if gl.glCheckFramebufferStatus(gl.GL_FRAMEBUFFER) != gl.GL_FRAMEBUFFER_COMPLETE:
+                print("Warning: MSAA framebuffer incomplete, disabling MSAA.")
+                self.msaa_samples = 0
+            gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
 
     @staticmethod
     def compute_projection_matrix(
@@ -2259,8 +2330,10 @@ class OpenGLRenderer:
         else:
             gl.glDisable(gl.GL_CULL_FACE)
 
-        if self._frame_fbo is not None:
-            gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, self._frame_fbo)
+        # select target framebuffer (MSAA or regular) for scene rendering
+        target_fbo = self._frame_msaa_fbo if getattr(self, "msaa_samples", 0) > 0 else self._frame_fbo
+        if target_fbo is not None:
+            gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, target_fbo)
 
         gl.glClearColor(*self.background_color, 1)
         gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
@@ -2369,6 +2442,28 @@ Instances: {len(self._instances)}"""
 
         for cb in self.render_2d_callbacks:
             cb()
+
+        # ------------------------------------------------------------------
+        # If MSAA is enabled, resolve the multi-sample buffer into texture FBO
+        # ------------------------------------------------------------------
+        if getattr(self, "msaa_samples", 0) > 0 and self._frame_msaa_fbo is not None:
+            gl.glBindFramebuffer(gl.GL_READ_FRAMEBUFFER, self._frame_msaa_fbo)
+            gl.glBindFramebuffer(gl.GL_DRAW_FRAMEBUFFER, self._frame_fbo)
+            gl.glBlitFramebuffer(
+                0,
+                0,
+                self.screen_width,
+                self.screen_height,
+                0,
+                0,
+                self.screen_width,
+                self.screen_height,
+                gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT,
+                gl.GL_NEAREST,
+            )
+            gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
+        else:
+            gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
 
     def _draw_grid(self, is_tiled=False):
         gl = OpenGLRenderer.gl
