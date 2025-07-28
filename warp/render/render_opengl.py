@@ -72,7 +72,6 @@ layout (location = 6) in vec4 aInstanceTransform3;
 
 // colors to use for the checkerboard pattern
 layout (location = 7) in vec3 aObjectColor1;
-layout (location = 8) in vec3 aObjectColor2;
 
 uniform mat4 view;
 uniform mat4 model;
@@ -83,7 +82,6 @@ out vec3 Normal;
 out vec3 FragPos;
 out vec2 TexCoord;
 out vec3 ObjectColor1;
-out vec3 ObjectColor2;
 out vec4 FragPosLightSpace;
 
 void main()
@@ -95,7 +93,6 @@ void main()
     Normal = mat3(transpose(inverse(transform))) * aNormal;
     TexCoord = aTexCoord;
     ObjectColor1 = aObjectColor1;
-    ObjectColor2 = aObjectColor2;
     FragPosLightSpace = lightSpaceMatrix * worldPos;
 }
 """
@@ -107,8 +104,7 @@ out vec4 FragColor;
 in vec3 Normal;
 in vec3 FragPos;
 in vec2 TexCoord;
-in vec3 ObjectColor1;
-in vec3 ObjectColor2;
+in vec3 ObjectColor1; // used as albedo
 in vec4 FragPosLightSpace;
 
 uniform vec3 viewPos;
@@ -116,7 +112,15 @@ uniform vec3 lightColor;
 uniform vec3 sunDirection;
 uniform sampler2D shadowMap;
 
+// uniforms kept for backward-compatibility (unused)
+uniform float metallic;
+uniform float roughness;
+
+uniform vec3 fogColor;
+uniform int up_axis;
+
 const float PI = 3.14159265359;
+
 float rand(vec2 co){
     return fract(sin(dot(co.xy ,vec2(12.9898,78.233))) * 43758.5453);
 }
@@ -140,8 +144,7 @@ vec2 poissonDisk[16] = vec2[](
    vec2( 0.14383161, -0.14100790 )
 );
 
-float ShadowCalculation()
-{
+float ShadowCalculation() {
     vec3 projCoords = FragPosLightSpace.xyz / FragPosLightSpace.w;
     projCoords = projCoords * 0.5 + 0.5;
     if (projCoords.z > 1.0)
@@ -170,37 +173,60 @@ float ShadowCalculation()
 
 void main()
 {
-    float ambientStrength = 0.3;
-    vec3 ambient = ambientStrength * lightColor;
-    vec3 norm = normalize(Normal);
-    float diff = max(dot(norm, sunDirection), 0.0);
-    vec3 diffuse = diff * lightColor;
-    vec3 lightDir2 = normalize(vec3(1.0, 0.3, -0.3));
-    diff = max(dot(norm, lightDir2), 0.0);
-    diffuse += diff * lightColor * 0.3;
-    float specularStrength = 0.5;
-    vec3 viewDir = normalize(viewPos - FragPos);
-    vec3 reflectDir = reflect(-sunDirection, norm);
-    float spec = pow(max(dot(viewDir, reflectDir), 0.0), 32);
-    vec3 specular = specularStrength * spec * lightColor;
-    reflectDir = reflect(-lightDir2, norm);
-    spec = pow(max(dot(viewDir, reflectDir), 0.0), 64);
-    specular += specularStrength * spec * lightColor * 0.3;
-    // checkerboard pattern
-    float u = TexCoord.x;
-    float v = TexCoord.y;
-    // blend the checkerboard pattern dependent on the gradient of the texture
-    // coordinates to void Moire patterns
-    vec2 grad = abs(dFdx(TexCoord)) + abs(dFdy(TexCoord));
-    float blendRange = 1.5;
-    float blendFactor = max(grad.x, grad.y) * blendRange;
-    float scale = 2.0;
-    float checker = mod(floor(u * scale) + floor(v * scale), 2.0);
-    checker = mix(checker, 0.5, smoothstep(0.0, 1.0, blendFactor));
-    vec3 checkerColor = mix(ObjectColor1, ObjectColor2, checker);
+
+    // convert to linear space
+    vec3 albedo = pow(ObjectColor1, vec3(2.2));
+
+    // surface vectors
+    vec3 N = normalize(Normal);
+    vec3 V = normalize(viewPos - FragPos);
+    vec3 L = normalize(sunDirection);
+    vec3 H = normalize(V + L);
+
+    // Blinn-Phong terms
+    float NdotL = max(dot(N, L), 0.0);
+    float NdotH = max(dot(N, H), 0.0);
+
+    // Derive Blinn-Phong exponent from perceptual roughness.
+    // roughness 0 → very rough, 1 → perfectly smooth
+    float gloss = clamp(1.0 - roughness, 0.0, 1.0);
+    // Map gloss to exponent range ~[2, 1024]
+    float shininess = 1.0 + pow(gloss, 4.0) * 1023.0;
+
+    // energy-preserving normalization for Blinn-Phong
+    float normFactor = (shininess + 2.0) / (8.0 * PI);
+
+    vec3 diffuse  = albedo * lightColor * NdotL;
+
+    // Specular color: dielectrics ~0.04, metals use albedo
+    vec3 F0 = mix(vec3(0.04), albedo, metallic);
+    vec3 spec = F0 * lightColor * normFactor * pow(NdotH, shininess) * NdotL;
+
+    // simple hemispherical ambient term
+    vec3 skyColor    = vec3(0.1, 0.2, 0.3);
+    vec3 groundColor = vec3(0.3, 0.2, 0.1);
+    vec3 up = vec3(0.0, 1.0, 0.0);
+    if (up_axis == 0) up = vec3(1.0, 0.0, 0.0);
+    if (up_axis == 2) up = vec3(0.0, 0.0, 1.0);
+    float sky_fac = dot(N, up) * 0.5 + 0.5;
+    vec3 ambient = mix(groundColor, skyColor, sky_fac) * albedo;
+
+    // shadows
     float shadow = ShadowCalculation();
-    vec3 result = (ambient + (1.0 - shadow) * (diffuse + specular)) * checkerColor;
-    FragColor = vec4(result, 1.0);
+
+    vec3 color = ambient + (1.0 - shadow) * (diffuse + spec);
+
+    // fog
+    float dist = length(FragPos - viewPos);
+    float fog_start = 20.0;
+    float fog_end   = 100.0;
+    float fog_factor = clamp((dist - fog_start) / (fog_end - fog_start), 0.0, 1.0);
+    color = mix(color, fogColor, fog_factor);
+
+    // gamma correction (sRGB)
+    color = pow(color, vec3(1.0 / 2.2));
+
+    FragColor = vec4(color, 1.0);
 }
 """
 
@@ -213,8 +239,12 @@ uniform mat4 projection;
 
 in vec3 position;
 
+out vec3 worldPos;
+
 void main() {
-    gl_Position = projection * view * model * vec4(position, 1.0);
+    vec3 scaled_pos = position * 100.0;
+    gl_Position = projection * view * model * vec4(scaled_pos, 1.0);
+    worldPos = vec3(model * vec4(scaled_pos, 1.0));
 }
 """
 
@@ -222,10 +252,49 @@ void main() {
 grid_fragment_shader = """
 #version 330 core
 
+in vec3 worldPos;
+
+uniform vec3 viewPos;
+uniform vec3 fogColor;
+uniform int up_axis;
+
 out vec4 outColor;
 
+float grid(vec2 parameter, float width, float feather)
+{
+    float w1 = width - feather;
+    float d1 = abs(parameter.x);
+    float d2 = abs(parameter.y);
+    vec2 d = vec2(d1, d2);
+    vec2 d_smooth = smoothstep(w1, width, d);
+    return max(d_smooth.x, d_smooth.y);
+}
+
 void main() {
-    outColor = vec4(0.5, 0.5, 0.5, 1.0);
+    float feather = 0.005;
+    float width = 0.01;
+
+    vec2 grid_uv;
+    if (up_axis == 1) { // Y-up
+        grid_uv = worldPos.xy;
+    } else if (up_axis == 0) { // X-up
+        grid_uv = worldPos.yz;
+    } else { // Z-up
+        grid_uv = worldPos.xy;
+    }
+
+    float grid_val = 1.0 - grid(fract(grid_uv) - 0.5, width, feather);
+    float major_grid_val = 1.0 - grid(fract(grid_uv / 10.0) - 0.5, width * 2.0, feather);
+
+    float g = max(grid_val, major_grid_val);
+    vec3 grid_color = vec3(0.5, 0.5, 0.5);
+
+    // fog
+    float dist = length(worldPos - viewPos);
+    float fog_factor = smoothstep(20.0, 80.0, dist);
+
+    // final color, fade out grid lines
+    outColor = vec4(mix(grid_color, fogColor, fog_factor), g);
 }
 """
 
@@ -778,9 +847,7 @@ class ShapeInstancer:
         self.device = device
         self.face_count = 0
         self.instance_color1_buffer = None
-        self.instance_color2_buffer = None
         self.color1 = (1.0, 1.0, 1.0)
-        self.color2 = (0.0, 0.0, 0.0)
         self.num_instances = 0
         self.transforms = None
         self.scalings = None
@@ -795,7 +862,6 @@ class ShapeInstancer:
             try:
                 gl.glDeleteBuffers(1, self.instance_transform_gl_buffer)
                 gl.glDeleteBuffers(1, self.instance_color1_buffer)
-                gl.glDeleteBuffers(1, self.instance_color2_buffer)
             except gl.GLException:
                 pass
         if self.vao is not None:
@@ -806,13 +872,10 @@ class ShapeInstancer:
             except gl.GLException:
                 pass
 
-    def register_shape(self, vertices, indices, color1=(1.0, 1.0, 1.0), color2=(0.0, 0.0, 0.0)):
+    def register_shape(self, vertices, indices, color1=(1.0, 1.0, 1.0)):
         gl = ShapeInstancer.gl
 
-        if color1 is not None and color2 is None:
-            color2 = np.clip(np.array(color1) + 0.25, 0.0, 1.0)
         self.color1 = color1
-        self.color2 = color2
 
         gl.glUseProgram(self.shape_shader.id)
 
@@ -847,19 +910,14 @@ class ShapeInstancer:
 
         self.face_count = len(indices)
 
-    def update_colors(self, colors1, colors2):
+    def update_colors(self, colors1):
         gl = ShapeInstancer.gl
 
         if colors1 is None:
             colors1 = np.tile(self.color1, (self.num_instances, 1))
-        if colors2 is None:
-            colors2 = np.tile(self.color2, (self.num_instances, 1))
         if np.shape(colors1) != (self.num_instances, 3):
             colors1 = np.tile(colors1, (self.num_instances, 1))
-        if np.shape(colors2) != (self.num_instances, 3):
-            colors2 = np.tile(colors2, (self.num_instances, 1))
         colors1 = np.array(colors1, dtype=np.float32)
-        colors2 = np.array(colors2, dtype=np.float32)
 
         gl.glBindVertexArray(self.vao)
 
@@ -870,23 +928,12 @@ class ShapeInstancer:
         gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.instance_color1_buffer)
         gl.glBufferData(gl.GL_ARRAY_BUFFER, colors1.nbytes, colors1.ctypes.data, gl.GL_STATIC_DRAW)
 
-        if self.instance_color2_buffer is None:
-            self.instance_color2_buffer = gl.GLuint()
-            gl.glGenBuffers(1, self.instance_color2_buffer)
-        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.instance_color2_buffer)
-        gl.glBufferData(gl.GL_ARRAY_BUFFER, colors2.nbytes, colors2.ctypes.data, gl.GL_STATIC_DRAW)
-
         gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.instance_color1_buffer)
         gl.glVertexAttribPointer(7, 3, gl.GL_FLOAT, gl.GL_FALSE, colors1[0].nbytes, ctypes.c_void_p(0))
         gl.glEnableVertexAttribArray(7)
         gl.glVertexAttribDivisor(7, 1)
 
-        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.instance_color2_buffer)
-        gl.glVertexAttribPointer(8, 3, gl.GL_FLOAT, gl.GL_FALSE, colors2[0].nbytes, ctypes.c_void_p(0))
-        gl.glEnableVertexAttribArray(8)
-        gl.glVertexAttribDivisor(8, 1)
-
-    def allocate_instances(self, positions, rotations=None, colors1=None, colors2=None, scalings=None):
+    def allocate_instances(self, positions, rotations=None, colors1=None, scalings=None):
         gl = ShapeInstancer.gl
 
         gl.glBindVertexArray(self.vao)
@@ -945,7 +992,7 @@ class ShapeInstancer:
             int(self.instance_transform_gl_buffer.value), self.device
         )
 
-        self.update_colors(colors1, colors2)
+        self.update_colors(colors1)
 
         # Set up instance attribute pointers
         matrix_size = vbo_transforms[0].nbytes
@@ -962,7 +1009,7 @@ class ShapeInstancer:
 
         gl.glBindVertexArray(0)
 
-    def update_instances(self, transforms: wp.array = None, scalings: wp.array = None, colors1=None, colors2=None):
+    def update_instances(self, transforms: wp.array = None, scalings: wp.array = None, colors1=None):
         gl = ShapeInstancer.gl
 
         if transforms is not None:
@@ -1001,8 +1048,8 @@ class ShapeInstancer:
 
             self._instance_transform_cuda_buffer.unmap()
 
-        if colors1 is not None or colors2 is not None:
-            self.update_colors(colors1, colors2)
+        if colors1 is not None:
+            self.update_colors(colors1)
 
     def render(self):
         gl = ShapeInstancer.gl
@@ -1316,23 +1363,30 @@ class OpenGLRenderer:
                 self._shape_shader.id, str_buffer("lightSpaceMatrix")
             )
             self._loc_shape_shadow_map = gl.glGetUniformLocation(self._shape_shader.id, str_buffer("shadowMap"))
+            self._loc_shape_metallic = gl.glGetUniformLocation(self._shape_shader.id, str_buffer("metallic"))
+            self._loc_shape_roughness = gl.glGetUniformLocation(self._shape_shader.id, str_buffer("roughness"))
+            self._loc_shape_fog_color = gl.glGetUniformLocation(self._shape_shader.id, str_buffer("fogColor"))
+            self._loc_shape_up_axis = gl.glGetUniformLocation(self._shape_shader.id, str_buffer("up_axis"))
 
         # create grid data
-        limit = 10.0
-        ticks = np.linspace(-limit, limit, 21)
-        grid_vertices = []
-        for i in ticks:
-            if self._camera_axis == 0:
-                grid_vertices.extend([0, -limit, i, 0, limit, i])
-                grid_vertices.extend([0, i, -limit, 0, i, limit])
-            elif self._camera_axis == 1:
-                grid_vertices.extend([-limit, 0, i, limit, 0, i])
-                grid_vertices.extend([i, 0, -limit, i, 0, limit])
-            elif self._camera_axis == 2:
-                grid_vertices.extend([-limit, i, 0, limit, i, 0])
-                grid_vertices.extend([i, -limit, 0, i, limit, 0])
-        grid_vertices = np.array(grid_vertices, dtype=np.float32)
-        self._grid_vertex_count = len(grid_vertices) // 3
+        grid_quad_vertices = np.array(
+            [
+                -1.0,
+                0.0,
+                -1.0,
+                1.0,
+                0.0,
+                -1.0,
+                1.0,
+                0.0,
+                1.0,
+                -1.0,
+                0.0,
+                1.0,
+            ],
+            dtype=np.float32,
+        )
+        self._grid_quad_indices = np.array([0, 1, 2, 0, 2, 3], dtype=np.uint32)
 
         with self._grid_shader:
             self._grid_vao = gl.GLuint()
@@ -1342,11 +1396,26 @@ class OpenGLRenderer:
             self._grid_vbo = gl.GLuint()
             gl.glGenBuffers(1, self._grid_vbo)
             gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self._grid_vbo)
-            gl.glBufferData(gl.GL_ARRAY_BUFFER, grid_vertices.nbytes, grid_vertices.ctypes.data, gl.GL_STATIC_DRAW)
+            gl.glBufferData(
+                gl.GL_ARRAY_BUFFER, grid_quad_vertices.nbytes, grid_quad_vertices.ctypes.data, gl.GL_STATIC_DRAW
+            )
+
+            self._grid_ebo = gl.GLuint()
+            gl.glGenBuffers(1, self._grid_ebo)
+            gl.glBindBuffer(gl.GL_ELEMENT_ARRAY_BUFFER, self._grid_ebo)
+            gl.glBufferData(
+                gl.GL_ELEMENT_ARRAY_BUFFER,
+                self._grid_quad_indices.nbytes,
+                self._grid_quad_indices.ctypes.data,
+                gl.GL_STATIC_DRAW,
+            )
 
             self._loc_grid_view = gl.glGetUniformLocation(self._grid_shader.id, str_buffer("view"))
             self._loc_grid_model = gl.glGetUniformLocation(self._grid_shader.id, str_buffer("model"))
             self._loc_grid_projection = gl.glGetUniformLocation(self._grid_shader.id, str_buffer("projection"))
+            self._loc_grid_view_pos = gl.glGetUniformLocation(self._grid_shader.id, str_buffer("viewPos"))
+            self._loc_grid_fog_color = gl.glGetUniformLocation(self._grid_shader.id, str_buffer("fogColor"))
+            self._loc_grid_up_axis = gl.glGetUniformLocation(self._grid_shader.id, str_buffer("up_axis"))
 
             self._loc_grid_pos_attribute = gl.glGetAttribLocation(self._grid_shader.id, str_buffer("position"))
             gl.glVertexAttribPointer(self._loc_grid_pos_attribute, 3, gl.GL_FLOAT, gl.GL_FALSE, 0, None)
@@ -1417,9 +1486,12 @@ class OpenGLRenderer:
         sqh = np.sqrt(0.5)
         self._axis_instancer.allocate_instances(
             positions=[(0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)],
-            rotations=[(0.0, 0.0, 0.0, 1.0), (0.0, 0.0, -sqh, sqh), (sqh, 0.0, 0.0, sqh)],
+            rotations=[
+                (0.0, 0.0, 0.0, 1.0),
+                (0.0, 0.0, -sqh, sqh),
+                (sqh, 0.0, 0.0, sqh),
+            ],
             colors1=[(0.0, 1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0)],
-            colors2=[(0.0, 1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0)],
         )
 
         # create frame buffer for rendering to a texture
@@ -1519,6 +1591,9 @@ class OpenGLRenderer:
 
             # start event loop
             self.app.event_loop.dispatch_event("on_enter")
+
+        self.pbr_metallic = 0.0
+        self.pbr_roughness = 0.5
 
     def _setup_shadow_mapping(self):
         gl = OpenGLRenderer.gl
@@ -1626,6 +1701,11 @@ class OpenGLRenderer:
         self._wp_instance_scalings = None
         self._wp_instance_bodies = None
         self._np_instance_visible = None
+        self._instance_ids = None
+        self._inverse_instance_ids = None
+        self._wp_instance_transforms = None
+        self._wp_instance_scalings = None
+        self._wp_instance_bodies = None
         self._update_shape_instances = False
 
     def close(self):
@@ -2124,6 +2204,10 @@ class OpenGLRenderer:
             gl.glUniform3f(self._loc_shape_view_pos, *self._camera_pos)
             gl.glUniformMatrix4fv(self._loc_shape_view, 1, gl.GL_FALSE, view_mat_ptr)
             gl.glUniformMatrix4fv(self._loc_shape_projection, 1, gl.GL_FALSE, projection_mat_ptr)
+            gl.glUniform1f(self._loc_shape_metallic, self.pbr_metallic)
+            gl.glUniform1f(self._loc_shape_roughness, self.pbr_roughness)
+            gl.glUniform3f(self._loc_shape_fog_color, *self.background_color)
+            gl.glUniform1i(self._loc_shape_up_axis, self._camera_axis)
 
             if self.render_wireframe:
                 gl.glPolygonMode(gl.GL_FRONT_AND_BACK, gl.GL_LINE)
@@ -2209,9 +2293,15 @@ Instances: {len(self._instances)}"""
 
             gl.glUniformMatrix4fv(self._loc_grid_view, 1, gl.GL_FALSE, arr_pointer(self._view_matrix))
             gl.glUniformMatrix4fv(self._loc_grid_projection, 1, gl.GL_FALSE, arr_pointer(self._projection_matrix))
+            gl.glUniform3f(self._loc_grid_view_pos, *self._camera_pos)
+            gl.glUniform3f(self._loc_grid_fog_color, *self.background_color)
+            gl.glUniform1i(self._loc_grid_up_axis, self._camera_axis)
 
         gl.glBindVertexArray(self._grid_vao)
-        gl.glDrawArrays(gl.GL_LINES, 0, self._grid_vertex_count)
+        gl.glEnable(gl.GL_BLEND)
+        gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
+        gl.glDrawElements(gl.GL_TRIANGLES, len(self._grid_quad_indices), gl.GL_UNSIGNED_INT, None)
+        gl.glDisable(gl.GL_BLEND)
         gl.glBindVertexArray(0)
 
     def _draw_sky(self, is_tiled=False):
@@ -2912,7 +3002,6 @@ Instances: {len(self._instances)}"""
         width: float,
         length: float,
         color: tuple = (1.0, 1.0, 1.0),
-        color2=None,
         parent_body: str | None = None,
         is_template: bool = False,
         u_scaling=1.0,
@@ -2952,7 +3041,7 @@ Instances: {len(self._instances)}"""
                 ],
                 dtype=np.float32,
             )
-            shape = self.register_shape(geo_hash, gfx_vertices, faces, color1=color, color2=color2)
+            shape = self.register_shape(geo_hash, gfx_vertices, faces, color1=color)
         if not is_template:
             body = self._resolve_body_id(parent_body)
             self.add_shape_instance(name, shape, body, pos, rot)
@@ -2965,7 +3054,6 @@ Instances: {len(self._instances)}"""
             size: The size of the ground plane
         """
         color1 = (200 / 255, 200 / 255, 200 / 255)
-        color2 = (150 / 255, 150 / 255, 150 / 255)
         sqh = np.sqrt(0.5)
         if self._camera_axis == 0:
             q = (0.0, 0.0, -sqh, sqh)
@@ -2994,7 +3082,6 @@ Instances: {len(self._instances)}"""
             size,
             size,
             color1,
-            color2=color2,
             u_scaling=1.0,
             v_scaling=1.0,
         )
