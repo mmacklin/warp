@@ -72,6 +72,7 @@ layout (location = 6) in vec4 aInstanceTransform3;
 
 // colors to use for the checkerboard pattern
 layout (location = 7) in vec3 aObjectColor1;
+layout (location = 8) in vec3 aObjectColor2;
 
 uniform mat4 view;
 uniform mat4 model;
@@ -82,6 +83,7 @@ out vec3 Normal;
 out vec3 FragPos;
 out vec2 TexCoord;
 out vec3 ObjectColor1;
+out vec3 ObjectColor2;
 out vec4 FragPosLightSpace;
 
 void main()
@@ -93,6 +95,7 @@ void main()
     Normal = mat3(transpose(inverse(transform))) * aNormal;
     TexCoord = aTexCoord;
     ObjectColor1 = aObjectColor1;
+    ObjectColor2 = aObjectColor2;
     FragPosLightSpace = lightSpaceMatrix * worldPos;
 }
 """
@@ -105,6 +108,7 @@ in vec3 Normal;
 in vec3 FragPos;
 in vec2 TexCoord;
 in vec3 ObjectColor1; // used as albedo
+in vec3 ObjectColor2;
 in vec4 FragPosLightSpace;
 
 uniform vec3 viewPos;
@@ -119,10 +123,36 @@ uniform float roughness;
 uniform vec3 fogColor;
 uniform int up_axis;
 
+// Checkerboard mode controls
+uniform int checkerboard;       // 0 = disabled, 1 = enabled
+uniform float checker_scale;    // Tiling factor for checker pattern
+
 const float PI = 3.14159265359;
 
 float rand(vec2 co){
     return fract(sin(dot(co.xy ,vec2(12.9898,78.233))) * 43758.5453);
+}
+
+// Analytic filtering helpers for smooth checkerboard pattern
+float filterwidth(vec2 v)
+{
+    vec2 fw = max(abs(dFdx(v)), abs(dFdy(v)));
+    return max(fw.x, fw.y);
+}
+
+vec2 bump(vec2 x)
+{
+    return (floor(x / 2.0) + 2.0 * max(x / 2.0 - floor(x / 2.0) - 0.5, 0.0));
+}
+
+float checker(vec2 uv)
+{
+    float width = filterwidth(uv);
+    vec2 p0 = uv - 0.5 * width;
+    vec2 p1 = uv + 0.5 * width;
+
+    vec2 i = (bump(p1) - bump(p0)) / width;
+    return i.x * i.y + (1.0 - i.x) * (1.0 - i.y);
 }
 
 vec2 poissonDisk[16] = vec2[](
@@ -176,6 +206,15 @@ void main()
 
     // convert to linear space
     vec3 albedo = pow(ObjectColor1, vec3(2.2));
+
+    // Optional checkerboard pattern based on surface UVs
+    if (checkerboard == 1) {
+        vec2 uv = TexCoord * checker_scale;
+        float cb = checker(uv);
+        vec3 albedo2 = pow(ObjectColor2, vec3(2.2));
+        // pick between the two colors
+        albedo = mix(albedo, albedo2, cb);
+    }
 
     // surface vectors
     vec3 N = normalize(Normal);
@@ -242,7 +281,9 @@ in vec3 position;
 out vec3 worldPos;
 
 void main() {
+
     vec3 scaled_pos = position * 100.0;
+    scaled_pos.y += 0.001;      // small lift to avoid depth conflict
     gl_Position = projection * view * model * vec4(scaled_pos, 1.0);
     worldPos = vec3(model * vec4(scaled_pos, 1.0));
 }
@@ -276,10 +317,13 @@ void main() {
 
     vec2 grid_uv;
     if (up_axis == 1) { // Y-up
-        grid_uv = worldPos.xy;
+        // Use the horizontal XZ-plane when Y is up.
+        grid_uv = worldPos.xz;
     } else if (up_axis == 0) { // X-up
+        // Use the horizontal YZ-plane when X is up.
         grid_uv = worldPos.yz;
     } else { // Z-up
+        // Use the horizontal XY-plane when Z is up.
         grid_uv = worldPos.xy;
     }
 
@@ -847,7 +891,9 @@ class ShapeInstancer:
         self.device = device
         self.face_count = 0
         self.instance_color1_buffer = None
+        self.instance_color2_buffer = None
         self.color1 = (1.0, 1.0, 1.0)
+        self.color2 = (1.0, 1.0, 1.0)
         self.num_instances = 0
         self.transforms = None
         self.scalings = None
@@ -862,6 +908,7 @@ class ShapeInstancer:
             try:
                 gl.glDeleteBuffers(1, self.instance_transform_gl_buffer)
                 gl.glDeleteBuffers(1, self.instance_color1_buffer)
+                gl.glDeleteBuffers(1, self.instance_color2_buffer)
             except gl.GLException:
                 pass
         if self.vao is not None:
@@ -872,10 +919,13 @@ class ShapeInstancer:
             except gl.GLException:
                 pass
 
-    def register_shape(self, vertices, indices, color1=(1.0, 1.0, 1.0)):
+    def register_shape(self, vertices, indices, color1=(1.0, 1.0, 1.0), color2=None):
         gl = ShapeInstancer.gl
 
         self.color1 = color1
+        if color2 is None:
+            color2 = np.clip(np.array(color1) + 0.25, 0.0, 1.0)
+        self.color2 = color2
 
         gl.glUseProgram(self.shape_shader.id)
 
@@ -910,7 +960,7 @@ class ShapeInstancer:
 
         self.face_count = len(indices)
 
-    def update_colors(self, colors1):
+    def update_colors(self, colors1, colors2):
         gl = ShapeInstancer.gl
 
         if colors1 is None:
@@ -918,6 +968,12 @@ class ShapeInstancer:
         if np.shape(colors1) != (self.num_instances, 3):
             colors1 = np.tile(colors1, (self.num_instances, 1))
         colors1 = np.array(colors1, dtype=np.float32)
+
+        if colors2 is None:
+            colors2 = np.tile(self.color2, (self.num_instances, 1))
+        if np.shape(colors2) != (self.num_instances, 3):
+            colors2 = np.tile(colors2, (self.num_instances, 1))
+        colors2 = np.array(colors2, dtype=np.float32)
 
         gl.glBindVertexArray(self.vao)
 
@@ -933,7 +989,18 @@ class ShapeInstancer:
         gl.glEnableVertexAttribArray(7)
         gl.glVertexAttribDivisor(7, 1)
 
-    def allocate_instances(self, positions, rotations=None, colors1=None, scalings=None):
+        if self.instance_color2_buffer is None:
+            self.instance_color2_buffer = gl.GLuint()
+            gl.glGenBuffers(1, self.instance_color2_buffer)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.instance_color2_buffer)
+        gl.glBufferData(gl.GL_ARRAY_BUFFER, colors2.nbytes, colors2.ctypes.data, gl.GL_STATIC_DRAW)
+
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.instance_color2_buffer)
+        gl.glVertexAttribPointer(8, 3, gl.GL_FLOAT, gl.GL_FALSE, colors2[0].nbytes, ctypes.c_void_p(0))
+        gl.glEnableVertexAttribArray(8)
+        gl.glVertexAttribDivisor(8, 1)
+
+    def allocate_instances(self, positions, rotations=None, colors1=None, colors2=None, scalings=None):
         gl = ShapeInstancer.gl
 
         gl.glBindVertexArray(self.vao)
@@ -992,7 +1059,7 @@ class ShapeInstancer:
             int(self.instance_transform_gl_buffer.value), self.device
         )
 
-        self.update_colors(colors1)
+        self.update_colors(colors1, colors2)
 
         # Set up instance attribute pointers
         matrix_size = vbo_transforms[0].nbytes
@@ -1009,7 +1076,7 @@ class ShapeInstancer:
 
         gl.glBindVertexArray(0)
 
-    def update_instances(self, transforms: wp.array = None, scalings: wp.array = None, colors1=None):
+    def update_instances(self, transforms: wp.array = None, scalings: wp.array = None, colors1=None, colors2=None):
         gl = ShapeInstancer.gl
 
         if transforms is not None:
@@ -1049,7 +1116,7 @@ class ShapeInstancer:
             self._instance_transform_cuda_buffer.unmap()
 
         if colors1 is not None:
-            self.update_colors(colors1)
+            self.update_colors(colors1, colors2)
 
     def render(self):
         gl = ShapeInstancer.gl
@@ -1368,6 +1435,13 @@ class OpenGLRenderer:
             self._loc_shape_fog_color = gl.glGetUniformLocation(self._shape_shader.id, str_buffer("fogColor"))
             self._loc_shape_up_axis = gl.glGetUniformLocation(self._shape_shader.id, str_buffer("up_axis"))
 
+            # Checkerboard uniforms
+            self._loc_shape_checkerboard = gl.glGetUniformLocation(self._shape_shader.id, str_buffer("checkerboard"))
+            self._loc_shape_checker_scale = gl.glGetUniformLocation(self._shape_shader.id, str_buffer("checker_scale"))
+            # Default values
+            gl.glUniform1i(self._loc_shape_checkerboard, 0)
+            gl.glUniform1f(self._loc_shape_checker_scale, 10.0)
+
         # create grid data
         grid_quad_vertices = np.array(
             [
@@ -1492,6 +1566,7 @@ class OpenGLRenderer:
                 (sqh, 0.0, 0.0, sqh),
             ],
             colors1=[(0.0, 1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0)],
+            colors2=[(0.5, 1.0, 0.5), (1.0, 0.5, 0.5), (0.5, 0.5, 1.0)],
         )
 
         # create frame buffer for rendering to a texture
@@ -1592,8 +1667,16 @@ class OpenGLRenderer:
             # start event loop
             self.app.event_loop.dispatch_event("on_enter")
 
+        # PBR parameters
         self.pbr_metallic = 0.0
         self.pbr_roughness = 0.5
+
+        # Checkerboard settings
+        self.show_checkerboard = True
+        self.checker_scale = 10.0
+
+        # track shapes that correspond to planes (for checkerboard)
+        self._plane_shapes: set[int] = set()
 
     def _setup_shadow_mapping(self):
         gl = OpenGLRenderer.gl
@@ -2208,6 +2291,10 @@ class OpenGLRenderer:
             gl.glUniform1f(self._loc_shape_roughness, self.pbr_roughness)
             gl.glUniform3f(self._loc_shape_fog_color, *self.background_color)
             gl.glUniform1i(self._loc_shape_up_axis, self._camera_axis)
+
+            # Update checkerboard uniforms
+            gl.glUniform1i(self._loc_shape_checkerboard, 1 if self.show_checkerboard else 0)
+            gl.glUniform1f(self._loc_shape_checker_scale, self.checker_scale)
 
             if self.render_wireframe:
                 gl.glPolygonMode(gl.GL_FRONT_AND_BACK, gl.GL_LINE)
