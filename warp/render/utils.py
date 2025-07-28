@@ -45,22 +45,79 @@ def bourke_color_map(low, high, v):
     return c
 
 
-def tab10_color_map(i):
-    # matplotlib "tab10" colors
+# def tab10_color_map(i):
+#     # matplotlib "tab10" colors
+#     colors = [
+#         [31, 119, 180],
+#         [255, 127, 14],
+#         [44, 160, 44],
+#         [214, 39, 40],
+#         [148, 103, 189],
+#         [140, 86, 75],
+#         [227, 119, 194],
+#         [127, 127, 127],
+#         [188, 189, 34],
+#         [23, 190, 207],
+#     ]
+
+#     num_colors = len(colors)
+#     return [c / 255.0 for c in colors[i % num_colors]]
+
+
+def tab10_color_map(i: int) -> list[float]:
+    # Paul Tol - Bright 9
     colors = [
-        [31, 119, 180],
-        [255, 127, 14],
-        [44, 160, 44],
-        [214, 39, 40],
-        [148, 103, 189],
-        [140, 86, 75],
-        [227, 119, 194],
-        [127, 127, 127],
-        [188, 189, 34],
-        [23, 190, 207],
+        [68, 119, 170],  # blue
+        [102, 204, 238],  # cyan
+        [34, 136, 51],  # green
+        [204, 187, 68],  # yellow
+        [238, 102, 119],  # red
+        [170, 51, 119],  # magenta
+        [187, 187, 187],  # grey
+        [238, 153, 51],  # orange
+        [0, 153, 136],  # teal
     ]
+
     num_colors = len(colors)
     return [c / 255.0 for c in colors[i % num_colors]]
+
+
+# def tab10_color_map(i: int) -> list[float]:
+#     # Flat UI - Designmodo
+#     colors = [
+#         [ 52, 152, 219],   # Peter River
+#         [ 46, 204, 113],   # Emerald
+#         [231,  76,  60],   # Alizarin
+#         [155,  89, 182],   # Amethyst
+#         [241, 196,  15],   # Sun Flower
+#         [ 52,  73,  94],   # Wet Asphalt
+#         [ 26, 188, 156],   # Turquoise
+#         [230, 126,  34],   # Carrot
+#         [127, 140, 141],   # Concrete
+#         [149, 165, 166],   # Silver
+#     ]
+
+#     num_colors = len(colors)
+#     return [c / 255.0 for c in colors[i % num_colors]]
+
+
+# def tab10_color_map(i: int) -> list[float]:
+#     # Material Design 10
+#     colors = [
+#         [244,  67,  54],   # Red 500
+#         [233,  30,  99],   # Pink 500
+#         [156,  39, 176],   # Purple 500
+#         [103,  58, 183],   # Deep-Purple
+#         [ 33, 150, 243],   # Blue 500
+#         [  3, 169, 244],   # Light-Blue
+#         [  0, 188, 212],   # Cyan 500
+#         [ 76, 175,  80],   # Green 500
+#         [255, 193,   7],   # Amber 500
+#         [255, 152,   0],   # Orange 500
+#     ]
+
+#     num_colors = len(colors)
+#     return [c / 255.0 for c in colors[i % num_colors]]
 
 
 # triangulate mesh around given surface with given thickness
