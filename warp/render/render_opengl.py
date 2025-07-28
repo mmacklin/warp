@@ -1439,7 +1439,7 @@ class OpenGLRenderer:
             gl.glUniform3f(
                 gl.glGetUniformLocation(self._shape_shader.id, str_buffer("sunDirection")), *self._sun_direction
             )
-            gl.glUniform3f(gl.glGetUniformLocation(self._shape_shader.id, str_buffer("lightColor")), 1, 1, 1)
+            gl.glUniform3f(gl.glGetUniformLocation(self._shape_shader.id, str_buffer("lightColor")), 1.5, 1.5, 1.5)
             self._loc_shape_model = gl.glGetUniformLocation(self._shape_shader.id, str_buffer("model"))
             self._loc_shape_view = gl.glGetUniformLocation(self._shape_shader.id, str_buffer("view"))
             self._loc_shape_projection = gl.glGetUniformLocation(self._shape_shader.id, str_buffer("projection"))
@@ -3225,7 +3225,9 @@ Instances: {len(self._instances)}"""
                 ],
                 dtype=np.float32,
             )
-            shape = self.register_shape(geo_hash, gfx_vertices, faces, color1=color)
+            shape = self.register_shape(
+                geo_hash, gfx_vertices, faces, color1=color, color2=(color[0] * 0.8, color[1] * 0.8, color[2] * 0.8)
+            )
         if not is_template:
             body = self._resolve_body_id(parent_body)
             self.add_shape_instance(name, shape, body, pos, rot)
