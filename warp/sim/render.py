@@ -79,6 +79,8 @@ def CreateSimRenderer(renderer):
             show_rigid_contact_points=False,
             contact_points_radius=1e-3,
             show_joints=False,
+            pbr_metallic=0.2,
+            pbr_roughness=0.4,
             **render_kwargs,
         ):
             # create USD stage
@@ -90,6 +92,8 @@ def CreateSimRenderer(renderer):
             self.show_rigid_contact_points = show_rigid_contact_points
             self.show_joints = show_joints
             self.contact_points_radius = contact_points_radius
+            self.pbr_metallic = pbr_metallic
+            self.pbr_roughness = pbr_roughness
             self.populate(model)
 
         def populate(self, model: warp.sim.Model):
@@ -428,4 +432,4 @@ def CreateSimRenderer(renderer):
 
 SimRendererUsd = CreateSimRenderer(wp.render.UsdRenderer)
 SimRendererOpenGL = CreateSimRenderer(wp.render.OpenGLRenderer)
-SimRenderer = SimRendererUsd
+SimRenderer = SimRendererOpenGL
