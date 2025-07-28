@@ -30,6 +30,32 @@ from .utils import tab10_color_map
 Mat44 = Union[List[float], List[List[float]], np.ndarray]
 
 
+shadow_vertex_shader = """
+#version 330 core
+layout (location = 0) in vec3 aPos;
+
+// column vectors of the instance transform matrix
+layout (location = 3) in vec4 aInstanceTransform0;
+layout (location = 4) in vec4 aInstanceTransform1;
+layout (location = 5) in vec4 aInstanceTransform2;
+layout (location = 6) in vec4 aInstanceTransform3;
+
+uniform mat4 lightSpaceMatrix;
+uniform mat4 model;
+
+void main()
+{
+    mat4 transform = model * mat4(aInstanceTransform0, aInstanceTransform1, aInstanceTransform2, aInstanceTransform3);
+    gl_Position = lightSpaceMatrix * transform * vec4(aPos, 1.0);
+}
+"""
+
+shadow_fragment_shader = """
+#version 330 core
+
+void main() { }
+"""
+
 wp.set_module_options({"enable_backward": False})
 
 shape_vertex_shader = """
@@ -51,12 +77,14 @@ layout (location = 8) in vec3 aObjectColor2;
 uniform mat4 view;
 uniform mat4 model;
 uniform mat4 projection;
+uniform mat4 lightSpaceMatrix;
 
 out vec3 Normal;
 out vec3 FragPos;
 out vec2 TexCoord;
 out vec3 ObjectColor1;
 out vec3 ObjectColor2;
+out vec4 FragPosLightSpace;
 
 void main()
 {
@@ -68,6 +96,7 @@ void main()
     TexCoord = aTexCoord;
     ObjectColor1 = aObjectColor1;
     ObjectColor2 = aObjectColor2;
+    FragPosLightSpace = lightSpaceMatrix * worldPos;
 }
 """
 
@@ -80,40 +109,88 @@ in vec3 FragPos;
 in vec2 TexCoord;
 in vec3 ObjectColor1;
 in vec3 ObjectColor2;
+in vec4 FragPosLightSpace;
 
 uniform vec3 viewPos;
 uniform vec3 lightColor;
 uniform vec3 sunDirection;
+uniform sampler2D shadowMap;
+
+const float PI = 3.14159265359;
+float rand(vec2 co){
+    return fract(sin(dot(co.xy ,vec2(12.9898,78.233))) * 43758.5453);
+}
+
+vec2 poissonDisk[16] = vec2[](
+   vec2( -0.94201624, -0.39906216 ),
+   vec2( 0.94558609, -0.76890725 ),
+   vec2( -0.094184101, -0.92938870 ),
+   vec2( 0.34495938, 0.29387760 ),
+   vec2( -0.91588581, 0.45771432 ),
+   vec2( -0.81544232, -0.87912464 ),
+   vec2( -0.38277543, 0.27676845 ),
+   vec2( 0.97484398, 0.75648379 ),
+   vec2( 0.44323325, -0.97511554 ),
+   vec2( 0.53742981, -0.47373420 ),
+   vec2( -0.26496911, -0.41893023 ),
+   vec2( 0.79197514, 0.19090188 ),
+   vec2( -0.24188840, 0.99706507 ),
+   vec2( -0.81409955, 0.91437590 ),
+   vec2( 0.19984126, 0.78641367 ),
+   vec2( 0.14383161, -0.14100790 )
+);
+
+float ShadowCalculation()
+{
+    vec3 projCoords = FragPosLightSpace.xyz / FragPosLightSpace.w;
+    projCoords = projCoords * 0.5 + 0.5;
+    if (projCoords.z > 1.0)
+        return 0.0;
+    float currentDepth = projCoords.z;
+    vec3 normal = normalize(Normal);
+    vec3 lightDir = normalize(sunDirection);
+    float bias = max(0.005 * (1.0 - dot(normal, lightDir)), 0.0005);
+    float shadow = 0.0;
+    float radius = 1.5;
+    vec2 texelSize = 1.0 / textureSize(shadowMap, 0);
+    float angle = rand(gl_FragCoord.xy) * 2.0 * PI;
+    float s = sin(angle);
+    float c = cos(angle);
+    mat2 rotationMatrix = mat2(c, -s, s, c);
+    for(int i = 0; i < 16; i++)
+    {
+        vec2 offset = rotationMatrix * poissonDisk[i];
+        float pcfDepth = texture(shadowMap, projCoords.xy + offset * radius * texelSize).r;
+        if(pcfDepth < currentDepth - bias)
+            shadow += 1.0;
+    }
+    shadow /= 16.0;
+    return shadow;
+}
 
 void main()
 {
     float ambientStrength = 0.3;
     vec3 ambient = ambientStrength * lightColor;
     vec3 norm = normalize(Normal);
-
     float diff = max(dot(norm, sunDirection), 0.0);
     vec3 diffuse = diff * lightColor;
-
     vec3 lightDir2 = normalize(vec3(1.0, 0.3, -0.3));
     diff = max(dot(norm, lightDir2), 0.0);
     diffuse += diff * lightColor * 0.3;
-
     float specularStrength = 0.5;
     vec3 viewDir = normalize(viewPos - FragPos);
-
     vec3 reflectDir = reflect(-sunDirection, norm);
     float spec = pow(max(dot(viewDir, reflectDir), 0.0), 32);
     vec3 specular = specularStrength * spec * lightColor;
-
     reflectDir = reflect(-lightDir2, norm);
     spec = pow(max(dot(viewDir, reflectDir), 0.0), 64);
     specular += specularStrength * spec * lightColor * 0.3;
-
     // checkerboard pattern
     float u = TexCoord.x;
     float v = TexCoord.y;
-    // blend the checkerboard pattern dependent on the gradient of the texture coordinates
-    // to void Moire patterns
+    // blend the checkerboard pattern dependent on the gradient of the texture
+    // coordinates to void Moire patterns
     vec2 grad = abs(dFdx(TexCoord)) + abs(dFdy(TexCoord));
     float blendRange = 1.5;
     float blendFactor = max(grad.x, grad.y) * blendRange;
@@ -121,8 +198,8 @@ void main()
     float checker = mod(floor(u * scale) + floor(v * scale), 2.0);
     checker = mix(checker, 0.5, smoothstep(0.0, 1.0, blendFactor));
     vec3 checkerColor = mix(ObjectColor1, ObjectColor2, checker);
-
-    vec3 result = (ambient + diffuse + specular) * checkerColor;
+    float shadow = ShadowCalculation();
+    vec3 result = (ambient + (1.0 - shadow) * (diffuse + specular)) * checkerColor;
     FragColor = vec4(result, 1.0);
 }
 """
@@ -930,8 +1007,6 @@ class ShapeInstancer:
     def render(self):
         gl = ShapeInstancer.gl
 
-        gl.glUseProgram(self.shape_shader.id)
-
         gl.glBindVertexArray(self.vao)
         gl.glDrawElementsInstanced(gl.GL_TRIANGLES, self.face_count, gl.GL_UNSIGNED_INT, None, self.num_instances)
         gl.glBindVertexArray(0)
@@ -997,6 +1072,8 @@ class OpenGLRenderer:
         axis_scale=1.0,
         vsync=False,
         headless=None,
+        enable_shadows=True,
+        render_shadow_map_debug=False,
         enable_backface_culling=True,
         enable_mouse_interaction=True,
         enable_keyboard_interaction=True,
@@ -1027,6 +1104,8 @@ class OpenGLRenderer:
             axis_scale (float): The scale of the coordinate system axes being rendered (only if ``draw_axis`` is True).
             vsync (bool): Whether to enable vertical synchronization.
             headless (bool): Whether to run in headless mode (no window is created). If None, the value is determined by the Pyglet configuration defined in ``pyglet.options["headless"]``.
+            enable_shadows (bool): Whether to enable shadows.
+            render_shadow_map_debug (bool): Whether to show the shadow map texture instead of the RGB image.
             enable_backface_culling (bool): Whether to enable backface culling.
             enable_mouse_interaction (bool): Whether to enable mouse interaction.
             enable_keyboard_interaction (bool): Whether to enable keyboard interaction.
@@ -1074,6 +1153,8 @@ class OpenGLRenderer:
         self.show_info = show_info
         self.render_wireframe = render_wireframe
         self.render_depth = render_depth
+        self.enable_shadows = enable_shadows
+        self.render_shadow_map_debug = render_shadow_map_debug
         self.enable_backface_culling = enable_backface_culling
 
         if device is None:
@@ -1114,6 +1195,13 @@ class OpenGLRenderer:
 
         self.render_2d_callbacks = []
         self.render_3d_callbacks = []
+
+        self._shadow_fbo = None
+        self._shadow_texture = None
+        self._shadow_shader = None
+        self._light_space_matrix = None
+        self.shadow_width = 2048
+        self.shadow_height = 2048
 
         self._camera_pos = PyVec3(0.0, 0.0, 0.0)
         self._camera_front = PyVec3(0.0, 0.0, -1.0)
@@ -1224,6 +1312,10 @@ class OpenGLRenderer:
             self._loc_shape_projection = gl.glGetUniformLocation(self._shape_shader.id, str_buffer("projection"))
             self._loc_shape_view_pos = gl.glGetUniformLocation(self._shape_shader.id, str_buffer("viewPos"))
             gl.glUniform3f(self._loc_shape_view_pos, 0, 0, 10)
+            self._loc_shape_light_space_matrix = gl.glGetUniformLocation(
+                self._shape_shader.id, str_buffer("lightSpaceMatrix")
+            )
+            self._loc_shape_shadow_map = gl.glGetUniformLocation(self._shape_shader.id, str_buffer("shadowMap"))
 
         # create grid data
         limit = 10.0
@@ -1331,6 +1423,8 @@ class OpenGLRenderer:
         )
 
         # create frame buffer for rendering to a texture
+        if self.enable_shadows:
+            self._setup_shadow_mapping()
         self._frame_texture = None
         self._frame_depth_texture = None
         self._frame_fbo = None
@@ -1425,6 +1519,54 @@ class OpenGLRenderer:
 
             # start event loop
             self.app.event_loop.dispatch_event("on_enter")
+
+    def _setup_shadow_mapping(self):
+        gl = OpenGLRenderer.gl
+
+        self._switch_context()
+
+        # create depth texture FBO
+        self._shadow_fbo = gl.GLuint()
+        gl.glGenFramebuffers(1, self._shadow_fbo)
+
+        self._shadow_texture = gl.GLuint()
+        gl.glGenTextures(1, self._shadow_texture)
+        gl.glBindTexture(gl.GL_TEXTURE_2D, self._shadow_texture)
+        gl.glTexImage2D(
+            gl.GL_TEXTURE_2D,
+            0,
+            gl.GL_DEPTH_COMPONENT,
+            self.shadow_width,
+            self.shadow_height,
+            0,
+            gl.GL_DEPTH_COMPONENT,
+            gl.GL_FLOAT,
+            None,
+        )
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_NEAREST)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_NEAREST)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_CLAMP_TO_BORDER)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_CLAMP_TO_BORDER)
+        border_color = [1.0, 1.0, 1.0, 1.0]
+        gl.glTexParameterfv(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_BORDER_COLOR, (gl.GLfloat * 4)(*border_color))
+
+        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, self._shadow_fbo)
+        gl.glFramebufferTexture2D(gl.GL_FRAMEBUFFER, gl.GL_DEPTH_ATTACHMENT, gl.GL_TEXTURE_2D, self._shadow_texture, 0)
+        gl.glDrawBuffer(gl.GL_NONE)
+        gl.glReadBuffer(gl.GL_NONE)
+        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
+
+        # compile shadow shader
+        from pyglet.graphics.shader import Shader, ShaderProgram
+
+        self._shadow_shader = ShaderProgram(
+            Shader(shadow_vertex_shader, "vertex"), Shader(shadow_fragment_shader, "fragment")
+        )
+
+        self._loc_shadow_light_space_matrix = gl.glGetUniformLocation(
+            self._shadow_shader.id, str_buffer("lightSpaceMatrix")
+        )
+        self._loc_shadow_model = gl.glGetUniformLocation(self._shadow_shader.id, str_buffer("model"))
 
     @property
     def paused(self):
@@ -1711,7 +1853,8 @@ class OpenGLRenderer:
         if self._frame_pbo is None:
             self._frame_pbo = gl.GLuint()
             gl.glGenBuffers(1, self._frame_pbo)  # generate 1 buffer reference
-        gl.glBindBuffer(gl.GL_PIXEL_PACK_BUFFER, self._frame_pbo)  # binding to this buffer
+        # binding to this buffer
+        gl.glBindBuffer(gl.GL_PIXEL_PACK_BUFFER, self._frame_pbo)
 
         # allocate memory for PBO
         rgb_bytes_per_pixel = 3
@@ -1905,6 +2048,33 @@ class OpenGLRenderer:
             else:
                 self._draw()
 
+    def render_shadow_map(self):
+        gl = OpenGLRenderer.gl
+        from pyglet.math import Mat4, Vec3
+
+        self._switch_context()
+
+        light_pos = self._sun_direction * 20.0
+        light_proj = Mat4.orthogonal_projection(
+            -20.0, 20.0, -20.0, 20.0, self.camera_near_plane, self.camera_far_plane * 2.0
+        )
+        light_view = Mat4.look_at(Vec3(*light_pos), Vec3(0, 0, 0), Vec3(*self._camera_up))
+        self._light_space_matrix = np.array(light_proj @ light_view, dtype=np.float32)
+
+        # render from light's point of view
+        with self._shadow_shader:
+            gl.glViewport(0, 0, self.shadow_width, self.shadow_height)
+            gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, self._shadow_fbo)
+            gl.glClear(gl.GL_DEPTH_BUFFER_BIT)
+            gl.glUniformMatrix4fv(
+                self._loc_shadow_light_space_matrix, 1, gl.GL_FALSE, arr_pointer(self._light_space_matrix)
+            )
+            gl.glUniformMatrix4fv(self._loc_shadow_model, 1, gl.GL_FALSE, arr_pointer(self._model_matrix))
+
+            self._render_scene()
+
+        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
+
     def _draw(self):
         gl = OpenGLRenderer.gl
 
@@ -1913,6 +2083,13 @@ class OpenGLRenderer:
         if not self.headless:
             # catch key hold events
             self._process_inputs()
+
+        # 1. render depth of scene to texture (from light's perspective)
+        if self.enable_shadows:
+            self.render_shadow_map()
+
+        # reset viewport
+        gl.glViewport(0, 0, self.screen_width, self.screen_height)
 
         if self.enable_backface_culling:
             gl.glEnable(gl.GL_CULL_FACE)
@@ -1933,24 +2110,31 @@ class OpenGLRenderer:
             if self.draw_sky:
                 self._draw_sky()
 
-        view_mat_ptr = arr_pointer(self._view_matrix)
-        projection_mat_ptr = arr_pointer(self._projection_matrix)
-        gl.glUseProgram(self._shape_shader.id)
-        gl.glUniformMatrix4fv(self._loc_shape_view, 1, gl.GL_FALSE, view_mat_ptr)
-        gl.glUniform3f(self._loc_shape_view_pos, *self._camera_pos)
-        gl.glUniformMatrix4fv(self._loc_shape_view, 1, gl.GL_FALSE, view_mat_ptr)
-        gl.glUniformMatrix4fv(self._loc_shape_projection, 1, gl.GL_FALSE, projection_mat_ptr)
+        with self._shape_shader:
+            view_mat_ptr = arr_pointer(self._view_matrix)
+            projection_mat_ptr = arr_pointer(self._projection_matrix)
+            if self.enable_shadows:
+                gl.glActiveTexture(gl.GL_TEXTURE0)
+                gl.glBindTexture(gl.GL_TEXTURE_2D, self._shadow_texture)
+                gl.glUniform1i(self._loc_shape_shadow_map, 0)
+                gl.glUniformMatrix4fv(
+                    self._loc_shape_light_space_matrix, 1, gl.GL_FALSE, arr_pointer(self._light_space_matrix)
+                )
+            gl.glUniformMatrix4fv(self._loc_shape_view, 1, gl.GL_FALSE, view_mat_ptr)
+            gl.glUniform3f(self._loc_shape_view_pos, *self._camera_pos)
+            gl.glUniformMatrix4fv(self._loc_shape_view, 1, gl.GL_FALSE, view_mat_ptr)
+            gl.glUniformMatrix4fv(self._loc_shape_projection, 1, gl.GL_FALSE, projection_mat_ptr)
 
-        if self.render_wireframe:
-            gl.glPolygonMode(gl.GL_FRONT_AND_BACK, gl.GL_LINE)
+            if self.render_wireframe:
+                gl.glPolygonMode(gl.GL_FRONT_AND_BACK, gl.GL_LINE)
 
-        if self._tiled_rendering:
-            self._render_scene_tiled()
-        else:
-            self._render_scene()
+            if self._tiled_rendering:
+                self._render_scene_tiled()
+            else:
+                self._render_scene()
 
-        for cb in self.render_3d_callbacks:
-            cb()
+            for cb in self.render_3d_callbacks:
+                cb()
 
         gl.glPolygonMode(gl.GL_FRONT_AND_BACK, gl.GL_FILL)
 
@@ -1961,10 +2145,13 @@ class OpenGLRenderer:
 
         # render frame buffer texture to screen
         if self._frame_fbo is not None:
-            if self.render_depth:
+            if self.render_depth or self.render_shadow_map_debug:
                 with self._frame_depth_shader:
                     gl.glActiveTexture(gl.GL_TEXTURE0)
-                    gl.glBindTexture(gl.GL_TEXTURE_2D, self._frame_depth_texture)
+                    gl.glBindTexture(
+                        gl.GL_TEXTURE_2D,
+                        self._shadow_texture if self.render_shadow_map_debug else self._frame_depth_texture,
+                    )
                     gl.glUniform1i(self._frame_loc_depth_texture, 0)
 
                     gl.glBindVertexArray(self._frame_vao)
@@ -2061,10 +2248,12 @@ Instances: {len(self._instances)}"""
             start_instance_idx += num_instances
 
         if self.draw_axis:
-            self._axis_instancer.render()
+            with self._shape_shader:
+                self._axis_instancer.render()
 
-        for instancer in self._shape_instancers.values():
-            instancer.render()
+        with self._shape_shader:
+            for instancer in self._shape_instancers.values():
+                instancer.render()
 
         gl.glBindVertexArray(0)
 
@@ -2111,10 +2300,12 @@ Instances: {len(self._instances)}"""
                 )
 
             if self.draw_axis:
-                self._axis_instancer.render()
+                with self._shape_shader:
+                    self._axis_instancer.render()
 
-            for instancer in self._shape_instancers.values():
-                instancer.render()
+            with self._shape_shader:
+                for instancer in self._shape_instancers.values():
+                    instancer.render()
 
         gl.glBindVertexArray(0)
 
@@ -2206,6 +2397,8 @@ Instances: {len(self._instances)}"""
             self.render_wireframe = not self.render_wireframe
         if symbol == pyglet.window.key.T:
             self.render_depth = not self.render_depth
+        if symbol == pyglet.window.key.Y:
+            self.render_shadow_map_debug = not self.render_shadow_map_debug
         if symbol == pyglet.window.key.B:
             self.enable_backface_culling = not self.enable_backface_culling
 
