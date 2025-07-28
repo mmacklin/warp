@@ -242,13 +242,13 @@ void main()
     vec3 spec = F0 * lightColor * normFactor * pow(NdotH, shininess) * NdotL;
 
     // simple hemispherical ambient term
-    vec3 skyColor    = vec3(0.1, 0.2, 0.3);
-    vec3 groundColor = vec3(0.3, 0.2, 0.1);
+    vec3 skyColor    = pow(vec3(0.53, 0.8, 0.92), vec3(2.2)); // vec3(0.1, 0.2, 0.3);
+    vec3 groundColor = pow(vec3(0.8, 0.4, 0.0), vec3(2.2));   // vec3(0.3, 0.2, 0.1);
     vec3 up = vec3(0.0, 1.0, 0.0);
     if (up_axis == 0) up = vec3(1.0, 0.0, 0.0);
     if (up_axis == 2) up = vec3(0.0, 0.0, 1.0);
     float sky_fac = dot(N, up) * 0.5 + 0.5;
-    vec3 ambient = mix(groundColor, skyColor, sky_fac) * albedo;
+    vec3 ambient = mix(groundColor, skyColor, sky_fac) * albedo * 0.25;
 
     // shadows
     float shadow = ShadowCalculation();
@@ -257,10 +257,10 @@ void main()
 
     // fog
     float dist = length(FragPos - viewPos);
-    float fog_start = 20.0;
+    float fog_start = 10.0;
     float fog_end   = 100.0;
     float fog_factor = clamp((dist - fog_start) / (fog_end - fog_start), 0.0, 1.0);
-    color = mix(color, fogColor, fog_factor);
+    color = mix(color, pow(fogColor, vec3(2.2)), fog_factor);
 
     // gamma correction (sRGB)
     color = pow(color, vec3(1.0 / 2.2));
@@ -383,14 +383,8 @@ uniform vec3 sunDirection;
 
 void main()
 {
-    float y = tanh(FragPos.y/farPlane*10.0)*0.5+0.5;
-    float height = sqrt(1.0-y);
-
-    float s = pow(0.5, 1.0 / 10.0);
-    s = 1.0 - clamp(s, 0.75, 1.0);
-
-    vec3 haze = mix(vec3(1.0), color2 * 1.3, s);
-    vec3 sky = mix(color1, haze, height / 1.3);
+    float height = (FragPos.y/farPlane)*0.5 + 0.5;
+    vec3 sky = mix(color2, color1, height);
 
     float diff = max(dot(sunDirection, normalize(FragPos)), 0.0);
     vec3 sun = pow(diff, 32) * vec3(1.0, 0.8, 0.6) * 0.5;
@@ -1176,7 +1170,7 @@ class OpenGLRenderer:
         camera_pos=(0.0, 2.0, 10.0),
         camera_front=(0.0, 0.0, -1.0),
         camera_up=(0.0, 1.0, 0.0),
-        background_color=(0.53, 0.8, 0.92),
+        background_color=(0.25, 0.3, 0.35),
         draw_grid=True,
         draw_sky=True,
         draw_axis=True,
@@ -1260,7 +1254,8 @@ class OpenGLRenderer:
         self.camera_far_plane = far_plane
         self.camera_fov = camera_fov
 
-        self.background_color = background_color
+        self.sky_upper = background_color
+        self.sky_lower = (0.1, 0.1, 0.1)
         self.draw_grid = draw_grid
         self.draw_sky = draw_sky
         self.draw_axis = draw_axis
@@ -1426,7 +1421,7 @@ class OpenGLRenderer:
             self.window.on_mouse_scroll = self._scroll_callback
             self.window.on_mouse_drag = self._mouse_drag_callback
 
-        gl.glClearColor(*self.background_color, 1)
+        gl.glClearColor(*self.sky_upper, 1)
         gl.glEnable(gl.GL_DEPTH_TEST)
         gl.glDepthMask(True)
         gl.glDepthRange(0.0, 1.0)
@@ -1530,9 +1525,8 @@ class OpenGLRenderer:
             self._loc_sky_color1 = gl.glGetUniformLocation(self._sky_shader.id, str_buffer("color1"))
             self._loc_sky_color2 = gl.glGetUniformLocation(self._sky_shader.id, str_buffer("color2"))
             self._loc_sky_far_plane = gl.glGetUniformLocation(self._sky_shader.id, str_buffer("farPlane"))
-            gl.glUniform3f(self._loc_sky_color1, *background_color)
-            # glUniform3f(self._loc_sky_color2, *np.clip(np.array(background_color)+0.5, 0.0, 1.0))
-            gl.glUniform3f(self._loc_sky_color2, 0.8, 0.4, 0.05)
+            gl.glUniform3f(self._loc_sky_color1, *self.sky_upper)
+            gl.glUniform3f(self._loc_sky_color2, *self.sky_lower)
             gl.glUniform1f(self._loc_sky_far_plane, self.camera_far_plane)
             self._loc_sky_view_pos = gl.glGetUniformLocation(self._sky_shader.id, str_buffer("viewPos"))
             gl.glUniform3f(
@@ -1590,7 +1584,7 @@ class OpenGLRenderer:
                 (sqh, 0.0, 0.0, sqh),
             ],
             colors1=[(0.0, 1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0)],
-            colors2=[(0.5, 1.0, 0.5), (1.0, 0.5, 0.5), (0.5, 0.5, 1.0)],
+            colors2=[(0.0, 1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, 1.0)],
         )
 
         # create frame buffer for rendering to a texture
@@ -1697,7 +1691,7 @@ class OpenGLRenderer:
 
         # Checkerboard settings
         self.show_checkerboard = True
-        self.checker_scale = 10.0
+        self.checker_scale = 1.0
 
         # track shapes that correspond to planes (for checkerboard)
         self._plane_shapes: set[int] = set()
@@ -2335,7 +2329,7 @@ class OpenGLRenderer:
         if target_fbo is not None:
             gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, target_fbo)
 
-        gl.glClearColor(*self.background_color, 1)
+        gl.glClearColor(*self.sky_upper, 1)
         gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
         gl.glBindVertexArray(0)
 
@@ -2362,7 +2356,15 @@ class OpenGLRenderer:
             gl.glUniformMatrix4fv(self._loc_shape_projection, 1, gl.GL_FALSE, projection_mat_ptr)
             gl.glUniform1f(self._loc_shape_metallic, self.pbr_metallic)
             gl.glUniform1f(self._loc_shape_roughness, self.pbr_roughness)
-            gl.glUniform3f(self._loc_shape_fog_color, *self.background_color)
+
+            # compute sky color at the horizon
+            horizon = (
+                (self.sky_upper[0] + self.sky_lower[0]) * 0.5,
+                (self.sky_upper[1] + self.sky_lower[1]) * 0.5,
+                (self.sky_upper[2] + self.sky_lower[2]) * 0.5,
+            )
+
+            gl.glUniform3f(self._loc_shape_fog_color, *horizon)
             gl.glUniform1i(self._loc_shape_up_axis, self._camera_axis)
 
             # Update checkerboard uniforms
@@ -2476,7 +2478,7 @@ Instances: {len(self._instances)}"""
             gl.glUniformMatrix4fv(self._loc_grid_view, 1, gl.GL_FALSE, arr_pointer(self._view_matrix))
             gl.glUniformMatrix4fv(self._loc_grid_projection, 1, gl.GL_FALSE, arr_pointer(self._projection_matrix))
             gl.glUniform3f(self._loc_grid_view_pos, *self._camera_pos)
-            gl.glUniform3f(self._loc_grid_fog_color, *self.background_color)
+            gl.glUniform3f(self._loc_grid_fog_color, *self.sky_upper)
             gl.glUniform1i(self._loc_grid_up_axis, self._camera_axis)
 
         gl.glBindVertexArray(self._grid_vao)
