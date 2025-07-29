@@ -30,6 +30,9 @@ from .utils import tab10_color_map
 Mat44 = Union[List[float], List[List[float]], np.ndarray]
 
 
+wp.set_module_options({"enable_backward": False})
+
+
 shadow_vertex_shader = """
 #version 330 core
 layout (location = 0) in vec3 aPos;
@@ -56,7 +59,6 @@ shadow_fragment_shader = """
 void main() { }
 """
 
-wp.set_module_options({"enable_backward": False})
 
 shape_vertex_shader = """
 #version 330 core
@@ -74,6 +76,9 @@ layout (location = 6) in vec4 aInstanceTransform3;
 layout (location = 7) in vec3 aObjectColor1;
 layout (location = 8) in vec3 aObjectColor2;
 
+// material properties
+layout (location = 9) in vec4 aMaterial;
+
 uniform mat4 view;
 uniform mat4 model;
 uniform mat4 projection;
@@ -85,6 +90,7 @@ out vec2 TexCoord;
 out vec3 ObjectColor1;
 out vec3 ObjectColor2;
 out vec4 FragPosLightSpace;
+out vec4 Material;
 
 void main()
 {
@@ -97,6 +103,7 @@ void main()
     ObjectColor1 = aObjectColor1;
     ObjectColor2 = aObjectColor2;
     FragPosLightSpace = lightSpaceMatrix * worldPos;
+    Material = aMaterial;
 }
 """
 
@@ -110,22 +117,15 @@ in vec2 TexCoord;
 in vec3 ObjectColor1; // used as albedo
 in vec3 ObjectColor2;
 in vec4 FragPosLightSpace;
+in vec4 Material;
 
 uniform vec3 viewPos;
 uniform vec3 lightColor;
 uniform vec3 sunDirection;
 uniform sampler2D shadowMap;
 
-// uniforms kept for backward-compatibility (unused)
-uniform float metallic;
-uniform float roughness;
-
 uniform vec3 fogColor;
 uniform int up_axis;
-
-// Checkerboard mode controls
-uniform int checkerboard;       // 0 = disabled, 1 = enabled
-uniform float checker_scale;    // Tiling factor for checker pattern
 
 const float PI = 3.14159265359;
 
@@ -203,12 +203,18 @@ float ShadowCalculation() {
 
 void main()
 {
+    // material properties from vertex shader
+    float roughness = Material.x;
+    float checkerboard = Material.y;
+    float checker_scale = Material.z;
+    float metallic = Material.w;
 
     // convert to linear space
     vec3 albedo = pow(ObjectColor1, vec3(2.2));
 
     // Optional checkerboard pattern based on surface UVs
-    if (checkerboard == 1) {
+    if (checkerboard > 0.0)
+    {
         vec2 uv = TexCoord * checker_scale;
         float cb = checker(uv);
         vec3 albedo2 = pow(ObjectColor2, vec3(2.2));
@@ -639,12 +645,18 @@ def assemble_gfx_vertices(
     tid = wp.tid()
     v = vertices[tid]
     n = normals[tid] / float(faces_per_vertex[tid])
+
+    # positions
     gfx_vertices[tid, 0] = v[0] * scale[0]
     gfx_vertices[tid, 1] = v[1] * scale[1]
     gfx_vertices[tid, 2] = v[2] * scale[2]
+    # normals
     gfx_vertices[tid, 3] = n[0]
     gfx_vertices[tid, 4] = n[1]
     gfx_vertices[tid, 5] = n[2]
+    # uvs
+    gfx_vertices[tid, 6] = 0.0
+    gfx_vertices[tid, 7] = 0.0
 
 
 @wp.kernel
@@ -877,6 +889,7 @@ class ShapeInstancer:
     def __new__(cls, *args, **kwargs):
         instance = super().__new__(cls)
         instance.instance_transform_gl_buffer = None
+        instance.instance_material_buffer = None
         instance.vao = None
         return instance
 
@@ -886,8 +899,10 @@ class ShapeInstancer:
         self.face_count = 0
         self.instance_color1_buffer = None
         self.instance_color2_buffer = None
+        self.instance_material_buffer = None
         self.color1 = (1.0, 1.0, 1.0)
         self.color2 = (1.0, 1.0, 1.0)
+        self.material = (0.5, 0.0, 1.0, 0.0)  # roughness, checkerboard, checker_scale, metallic
         self.num_instances = 0
         self.transforms = None
         self.scalings = None
@@ -903,6 +918,7 @@ class ShapeInstancer:
                 gl.glDeleteBuffers(1, self.instance_transform_gl_buffer)
                 gl.glDeleteBuffers(1, self.instance_color1_buffer)
                 gl.glDeleteBuffers(1, self.instance_color2_buffer)
+                gl.glDeleteBuffers(1, self.instance_material_buffer)
             except gl.GLException:
                 pass
         if self.vao is not None:
@@ -954,6 +970,28 @@ class ShapeInstancer:
 
         self.face_count = len(indices)
 
+    def update_materials(self, materials):
+        gl = ShapeInstancer.gl
+
+        if materials is None:
+            materials = np.tile(self.material, (self.num_instances, 1))
+        if np.shape(materials) != (self.num_instances, 4):
+            materials = np.tile(materials, (self.num_instances, 1))
+        materials = np.array(materials, dtype=np.float32)
+
+        gl.glBindVertexArray(self.vao)
+
+        if self.instance_material_buffer is None:
+            self.instance_material_buffer = gl.GLuint()
+            gl.glGenBuffers(1, self.instance_material_buffer)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.instance_material_buffer)
+        gl.glBufferData(gl.GL_ARRAY_BUFFER, materials.nbytes, materials.ctypes.data, gl.GL_STATIC_DRAW)
+
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.instance_material_buffer)
+        gl.glVertexAttribPointer(9, 4, gl.GL_FLOAT, gl.GL_FALSE, materials[0].nbytes, ctypes.c_void_p(0))
+        gl.glEnableVertexAttribArray(9)
+        gl.glVertexAttribDivisor(9, 1)
+
     def update_colors(self, colors1, colors2):
         gl = ShapeInstancer.gl
 
@@ -994,7 +1032,7 @@ class ShapeInstancer:
         gl.glEnableVertexAttribArray(8)
         gl.glVertexAttribDivisor(8, 1)
 
-    def allocate_instances(self, positions, rotations=None, colors1=None, colors2=None, scalings=None):
+    def allocate_instances(self, positions, rotations=None, colors1=None, colors2=None, scalings=None, materials=None):
         gl = ShapeInstancer.gl
 
         gl.glBindVertexArray(self.vao)
@@ -1054,6 +1092,7 @@ class ShapeInstancer:
         )
 
         self.update_colors(colors1, colors2)
+        self.update_materials(materials)
 
         # Set up instance attribute pointers
         matrix_size = vbo_transforms[0].nbytes
@@ -1070,7 +1109,9 @@ class ShapeInstancer:
 
         gl.glBindVertexArray(0)
 
-    def update_instances(self, transforms: wp.array = None, scalings: wp.array = None, colors1=None, colors2=None):
+    def update_instances(
+        self, transforms: wp.array = None, scalings: wp.array = None, colors1=None, colors2=None, materials=None
+    ):
         gl = ShapeInstancer.gl
 
         if transforms is not None:
@@ -1111,6 +1152,9 @@ class ShapeInstancer:
 
         if colors1 is not None:
             self.update_colors(colors1, colors2)
+
+        if materials is not None:
+            self.update_materials(materials)
 
     def render(self):
         gl = ShapeInstancer.gl
@@ -1375,6 +1419,7 @@ class OpenGLRenderer:
         self._instance_transform_cuda_buffer = None
         self._instance_color1_buffer = None
         self._instance_color2_buffer = None
+        self._instance_material_buffer = None
         self._instance_count = 0
         self._wp_instance_ids = None
         self._wp_instance_custom_ids = None
@@ -1774,6 +1819,7 @@ class OpenGLRenderer:
                 gl.glDeleteBuffers(1, self._instance_transform_gl_buffer)
                 gl.glDeleteBuffers(1, self._instance_color1_buffer)
                 gl.glDeleteBuffers(1, self._instance_color2_buffer)
+                gl.glDeleteBuffers(1, self._instance_material_buffer)
             except gl.GLException:
                 pass
         for vao, vbo, ebo, _, _vertex_cuda_buffer in self._shape_gl_buffers.values():
@@ -1796,6 +1842,7 @@ class OpenGLRenderer:
         self._instance_transform_cuda_buffer = None
         self._instance_color1_buffer = None
         self._instance_color2_buffer = None
+        self._instance_material_buffer = None
         self._wp_instance_ids = None
         self._wp_instance_custom_ids = None
         self._wp_instance_transforms = None
@@ -2522,12 +2569,11 @@ Instances: {len(self._instances)}"""
             start_instance_idx += num_instances
 
         if self.draw_axis:
-            with self._shape_shader:
-                self._axis_instancer.render()
+            self._axis_instancer.render()
 
-        with self._shape_shader:
-            for instancer in self._shape_instancers.values():
-                instancer.render()
+        # with self._shape_shader:
+        #     for instancer in self._shape_instancers.values():
+        #         instancer.render()
 
         gl.glBindVertexArray(0)
 
@@ -2767,6 +2813,7 @@ Instances: {len(self._instances)}"""
         scale: tuple = (1.0, 1.0, 1.0),
         color1=None,
         color2=None,
+        material=None,
         custom_index: int = -1,
         visible: bool = True,
     ):
@@ -2774,10 +2821,12 @@ Instances: {len(self._instances)}"""
             color1 = self._shapes[shape][2]
         if color2 is None:
             color2 = self._shapes[shape][3]
+        if material is None:
+            material = (0.5, 0.0, 1.0, 0.0)  # roughness, checkerboard, checker_scale, metallic
         instance = len(self._instances)
         self._shape_instances[shape].append(instance)
         body = self._resolve_body_id(body)
-        self._instances[name] = (instance, body, shape, [*pos, *rot], scale, color1, color2, visible)
+        self._instances[name] = (instance, body, shape, [*pos, *rot], scale, color1, color2, material, visible)
         self._instance_shape[instance] = shape
         self._instance_custom_ids[instance] = custom_index
         self._add_shape_instances = True
@@ -2788,7 +2837,7 @@ Instances: {len(self._instances)}"""
         if name not in self._instances:
             return
 
-        instance, _, shape, _, _, _, _, _ = self._instances[name]
+        instance, _, shape, _, _, _, _, _, _ = self._instances[name]
 
         self._shape_instances[shape].remove(instance)
         self._instance_count = len(self._instances)
@@ -2860,6 +2909,7 @@ Instances: {len(self._instances)}"""
         )
 
         self.update_instance_colors()
+        self.update_instance_materials()
 
         # set up instance attribute pointers
         matrix_size = transforms[0].nbytes
@@ -2871,6 +2921,7 @@ Instances: {len(self._instances)}"""
         inverse_instance_ids = {}
         instance_count = 0
         colors_size = np.zeros(3, dtype=np.float32).nbytes
+        materials_size = np.zeros(4, dtype=np.float32).nbytes
         for shape, (vao, _vbo, _ebo, _tri_count, _vertex_cuda_buffer) in self._shape_gl_buffers.items():
             gl.glBindVertexArray(vao)
 
@@ -2894,6 +2945,11 @@ Instances: {len(self._instances)}"""
             gl.glEnableVertexAttribArray(8)
             gl.glVertexAttribDivisor(8, 1)
 
+            gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self._instance_material_buffer)
+            gl.glVertexAttribPointer(9, 4, gl.GL_FLOAT, gl.GL_FALSE, materials_size, ctypes.c_void_p(0))
+            gl.glEnableVertexAttribArray(9)
+            gl.glVertexAttribDivisor(9, 1)
+
             instance_ids.extend(self._shape_instances[shape])
             for i in self._shape_instances[shape]:
                 inverse_instance_ids[i] = instance_count
@@ -2912,7 +2968,7 @@ Instances: {len(self._instances)}"""
 
         gl.glBindVertexArray(0)
 
-    def update_shape_instance(self, name, pos=None, rot=None, color1=None, color2=None, visible=None):
+    def update_shape_instance(self, name, pos=None, rot=None, color1=None, color2=None, material=None, visible=None):
         """Update the instance properties of the shape
 
         Args:
@@ -2921,6 +2977,7 @@ Instances: {len(self._instances)}"""
             rot: The rotation of the shape
             color1: The first color of the checker pattern
             color2: The second color of the checker pattern
+            material: The material properties of the shape
             visible: Whether the shape is visible
         """
         gl = OpenGLRenderer.gl
@@ -2928,7 +2985,7 @@ Instances: {len(self._instances)}"""
         self._switch_context()
 
         if name in self._instances:
-            i, body, shape, tf, scale, old_color1, old_color2, v = self._instances[name]
+            i, body, shape, tf, scale, old_color1, old_color2, old_material, v = self._instances[name]
             if visible is None:
                 visible = v
             new_tf = np.copy(tf)
@@ -2944,6 +3001,7 @@ Instances: {len(self._instances)}"""
                 scale,
                 old_color1 if color1 is None else color1,
                 old_color2 if color2 is None else color2,
+                old_material if material is None else material,
                 visible,
             )
             self._update_shape_instances = True
@@ -2951,6 +3009,11 @@ Instances: {len(self._instances)}"""
                 vao, vbo, ebo, tri_count, vertex_cuda_buffer = self._shape_gl_buffers[shape]
                 gl.glBindVertexArray(vao)
                 self.update_instance_colors()
+                gl.glBindVertexArray(0)
+            if material is not None:
+                vao, vbo, ebo, tri_count, vertex_cuda_buffer = self._shape_gl_buffers[shape]
+                gl.glBindVertexArray(vao)
+                self.update_instance_materials()
                 gl.glBindVertexArray(0)
             return True
         return False
@@ -3206,7 +3269,8 @@ Instances: {len(self._instances)}"""
         geo_hash = hash(("plane", width, length))
         if geo_hash in self._shape_geo_hash:
             shape = self._shape_geo_hash[geo_hash]
-            if self.update_shape_instance(name, pos, rot):
+            plane_material = (0.5, 1.0, 1.0, 0.0)  # roughness, checkerboard, checker_scale, metallic
+            if self.update_shape_instance(name, pos, rot, material=plane_material):
                 return shape
         else:
             faces = np.array([0, 1, 2, 2, 3, 0], dtype=np.uint32)
@@ -3230,7 +3294,8 @@ Instances: {len(self._instances)}"""
             )
         if not is_template:
             body = self._resolve_body_id(parent_body)
-            self.add_shape_instance(name, shape, body, pos, rot)
+            plane_material = (0.5, 1.0, 1.0, 0.0)  # roughness, checkerboard, checker_scale, metallic
+            self.add_shape_instance(name, shape, body, pos, rot, material=plane_material)
         return shape
 
     def render_ground(self, size: float = 1000.0, plane=None):
@@ -4014,6 +4079,28 @@ Instances: {len(self._instances)}"""
             # The window could be in the process of being closed, in which case
             # its corresponding context might have been destroyed and set to `None`.
             pass
+
+    def update_instance_materials(self):
+        gl = OpenGLRenderer.gl
+
+        self._switch_context()
+
+        materials = []
+        all_instances = list(self._instances.values())
+        for _shape, instances in self._shape_instances.items():
+            for i in instances:
+                if i >= len(all_instances):
+                    continue
+                instance = all_instances[i]
+                materials.append(instance[7])
+        materials = np.array(materials, dtype=np.float32)
+
+        if self._instance_material_buffer is None:
+            self._instance_material_buffer = gl.GLuint()
+            gl.glGenBuffers(1, self._instance_material_buffer)
+
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self._instance_material_buffer)
+        gl.glBufferData(gl.GL_ARRAY_BUFFER, materials.nbytes, materials.ctypes.data, gl.GL_STATIC_DRAW)
 
 
 if __name__ == "__main__":
