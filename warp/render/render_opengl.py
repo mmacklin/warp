@@ -29,6 +29,10 @@ from .utils import tab10_color_map
 
 Mat44 = Union[List[float], List[List[float]], np.ndarray]
 
+
+wp.set_module_options({"enable_backward": False})
+
+
 shadow_vertex_shader = """
 #version 330 core
 layout (location = 0) in vec3 aPos;
@@ -55,7 +59,6 @@ shadow_fragment_shader = """
 void main() { }
 """
 
-wp.set_module_options({"enable_backward": False})
 
 shape_vertex_shader = """
 #version 330 core
@@ -73,6 +76,9 @@ layout (location = 6) in vec4 aInstanceTransform3;
 layout (location = 7) in vec3 aObjectColor1;
 layout (location = 8) in vec3 aObjectColor2;
 
+// material properties
+layout (location = 9) in vec4 aMaterial;
+
 uniform mat4 view;
 uniform mat4 model;
 uniform mat4 projection;
@@ -84,6 +90,7 @@ out vec2 TexCoord;
 out vec3 ObjectColor1;
 out vec3 ObjectColor2;
 out vec4 FragPosLightSpace;
+out vec4 Material;
 
 void main()
 {
@@ -96,6 +103,7 @@ void main()
     ObjectColor1 = aObjectColor1;
     ObjectColor2 = aObjectColor2;
     FragPosLightSpace = lightSpaceMatrix * worldPos;
+    Material = aMaterial;
 }
 """
 
@@ -109,22 +117,15 @@ in vec2 TexCoord;
 in vec3 ObjectColor1; // used as albedo
 in vec3 ObjectColor2;
 in vec4 FragPosLightSpace;
+in vec4 Material;
 
 uniform vec3 viewPos;
 uniform vec3 lightColor;
 uniform vec3 sunDirection;
 uniform sampler2D shadowMap;
 
-// uniforms kept for backward-compatibility (unused)
-uniform float metallic;
-uniform float roughness;
-
 uniform vec3 fogColor;
 uniform int up_axis;
-
-// Checkerboard mode controls
-uniform int checkerboard;       // 0 = disabled, 1 = enabled
-uniform float checker_scale;    // Tiling factor for checker pattern
 
 const float PI = 3.14159265359;
 
@@ -202,12 +203,18 @@ float ShadowCalculation() {
 
 void main()
 {
+    // material properties from vertex shader
+    float roughness = Material.x;
+    float checkerboard = Material.y;
+    float checker_scale = Material.z;
+    float metallic = Material.w;
 
     // convert to linear space
     vec3 albedo = pow(ObjectColor1, vec3(2.2));
 
     // Optional checkerboard pattern based on surface UVs
-    if (checkerboard == 1) {
+    if (checkerboard > 0.0)
+    {
         vec2 uv = TexCoord * checker_scale;
         float cb = checker(uv);
         vec3 albedo2 = pow(ObjectColor2, vec3(2.2));
@@ -638,12 +645,18 @@ def assemble_gfx_vertices(
     tid = wp.tid()
     v = vertices[tid]
     n = normals[tid] / float(faces_per_vertex[tid])
+
+    # positions
     gfx_vertices[tid, 0] = v[0] * scale[0]
     gfx_vertices[tid, 1] = v[1] * scale[1]
     gfx_vertices[tid, 2] = v[2] * scale[2]
+    # normals
     gfx_vertices[tid, 3] = n[0]
     gfx_vertices[tid, 4] = n[1]
     gfx_vertices[tid, 5] = n[2]
+    # uvs
+    gfx_vertices[tid, 6] = 0.0
+    gfx_vertices[tid, 7] = 0.0
 
 
 @wp.kernel
@@ -876,6 +889,7 @@ class ShapeInstancer:
     def __new__(cls, *args, **kwargs):
         instance = super().__new__(cls)
         instance.instance_transform_gl_buffer = None
+        instance.instance_material_buffer = None
         instance.vao = None
         return instance
 
@@ -885,8 +899,10 @@ class ShapeInstancer:
         self.face_count = 0
         self.instance_color1_buffer = None
         self.instance_color2_buffer = None
+        self.instance_material_buffer = None
         self.color1 = (1.0, 1.0, 1.0)
         self.color2 = (1.0, 1.0, 1.0)
+        self.material = (0.5, 0.0, 1.0, 0.0)  # roughness, checkerboard, checker_scale, metallic
         self.num_instances = 0
         self.transforms = None
         self.scalings = None
@@ -902,6 +918,7 @@ class ShapeInstancer:
                 gl.glDeleteBuffers(1, self.instance_transform_gl_buffer)
                 gl.glDeleteBuffers(1, self.instance_color1_buffer)
                 gl.glDeleteBuffers(1, self.instance_color2_buffer)
+                gl.glDeleteBuffers(1, self.instance_material_buffer)
             except gl.GLException:
                 pass
         if self.vao is not None:
@@ -953,6 +970,28 @@ class ShapeInstancer:
 
         self.face_count = len(indices)
 
+    def update_materials(self, materials):
+        gl = ShapeInstancer.gl
+
+        if materials is None:
+            materials = np.tile(self.material, (self.num_instances, 1))
+        if np.shape(materials) != (self.num_instances, 4):
+            materials = np.tile(materials, (self.num_instances, 1))
+        materials = np.array(materials, dtype=np.float32)
+
+        gl.glBindVertexArray(self.vao)
+
+        if self.instance_material_buffer is None:
+            self.instance_material_buffer = gl.GLuint()
+            gl.glGenBuffers(1, self.instance_material_buffer)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.instance_material_buffer)
+        gl.glBufferData(gl.GL_ARRAY_BUFFER, materials.nbytes, materials.ctypes.data, gl.GL_STATIC_DRAW)
+
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.instance_material_buffer)
+        gl.glVertexAttribPointer(9, 4, gl.GL_FLOAT, gl.GL_FALSE, materials[0].nbytes, ctypes.c_void_p(0))
+        gl.glEnableVertexAttribArray(9)
+        gl.glVertexAttribDivisor(9, 1)
+
     def update_colors(self, colors1, colors2):
         gl = ShapeInstancer.gl
 
@@ -993,7 +1032,7 @@ class ShapeInstancer:
         gl.glEnableVertexAttribArray(8)
         gl.glVertexAttribDivisor(8, 1)
 
-    def allocate_instances(self, positions, rotations=None, colors1=None, colors2=None, scalings=None):
+    def allocate_instances(self, positions, rotations=None, colors1=None, colors2=None, scalings=None, materials=None):
         gl = ShapeInstancer.gl
 
         gl.glBindVertexArray(self.vao)
@@ -1053,6 +1092,7 @@ class ShapeInstancer:
         )
 
         self.update_colors(colors1, colors2)
+        self.update_materials(materials)
 
         # Set up instance attribute pointers
         matrix_size = vbo_transforms[0].nbytes
@@ -1069,7 +1109,9 @@ class ShapeInstancer:
 
         gl.glBindVertexArray(0)
 
-    def update_instances(self, transforms: wp.array = None, scalings: wp.array = None, colors1=None, colors2=None):
+    def update_instances(
+        self, transforms: wp.array = None, scalings: wp.array = None, colors1=None, colors2=None, materials=None
+    ):
         gl = ShapeInstancer.gl
 
         if transforms is not None:
@@ -1110,6 +1152,9 @@ class ShapeInstancer:
 
         if colors1 is not None:
             self.update_colors(colors1, colors2)
+
+        if materials is not None:
+            self.update_materials(materials)
 
     def render(self):
         gl = ShapeInstancer.gl
@@ -1362,9 +1407,7 @@ class OpenGLRenderer:
         self._fps_alpha = 0.1  # low pass filter rate to update FPS stats
 
         self._body_name = {}
-        self._shapes = []
-        self._shape_geo_hash = {}
-        self._shape_gl_buffers = {}
+        self._shape_lookup = {}
         self._shape_instances = defaultdict(list)
         self._instances = {}
         self._instance_custom_ids = {}
@@ -1374,6 +1417,7 @@ class OpenGLRenderer:
         self._instance_transform_cuda_buffer = None
         self._instance_color1_buffer = None
         self._instance_color2_buffer = None
+        self._instance_material_buffer = None
         self._instance_count = 0
         self._wp_instance_ids = None
         self._wp_instance_custom_ids = None
@@ -1773,20 +1817,18 @@ class OpenGLRenderer:
                 gl.glDeleteBuffers(1, self._instance_transform_gl_buffer)
                 gl.glDeleteBuffers(1, self._instance_color1_buffer)
                 gl.glDeleteBuffers(1, self._instance_color2_buffer)
+                gl.glDeleteBuffers(1, self._instance_material_buffer)
             except gl.GLException:
                 pass
-        for vao, vbo, ebo, _, _vertex_cuda_buffer in self._shape_gl_buffers.values():
+        for mesh_data in self._shape_lookup.values():
             try:
-                gl.glDeleteVertexArrays(1, vao)
-                gl.glDeleteBuffers(1, vbo)
-                gl.glDeleteBuffers(1, ebo)
+                mesh_data.cleanup()
             except gl.GLException:
                 pass
 
         self._body_name.clear()
-        self._shapes.clear()
-        self._shape_geo_hash.clear()
-        self._shape_gl_buffers.clear()
+        # Shape meshes are cleaned up individually in the loop above
+        self._shape_lookup.clear()
         self._shape_instances.clear()
         self._instances.clear()
         self._instance_shape.clear()
@@ -1795,6 +1837,7 @@ class OpenGLRenderer:
         self._instance_transform_cuda_buffer = None
         self._instance_color1_buffer = None
         self._instance_color2_buffer = None
+        self._instance_material_buffer = None
         self._wp_instance_ids = None
         self._wp_instance_custom_ids = None
         self._wp_instance_transforms = None
@@ -2455,7 +2498,7 @@ class OpenGLRenderer:
 Update FPS: {self._fps_update:.1f}
 Render FPS: {self._fps_render:.1f}
 
-Shapes: {len(self._shapes)}
+Shapes: {len(self._shape_lookup)}
 Instances: {len(self._instances)}"""
             if self.paused:
                 text += "\nPaused (press space to resume)"
@@ -2516,13 +2559,13 @@ Instances: {len(self._instances)}"""
 
         start_instance_idx = 0
 
-        for shape, (vao, _, _, tri_count, _) in self._shape_gl_buffers.items():
+        for shape, mesh_data in self._shape_lookup.items():
             num_instances = len(self._shape_instances[shape])
 
-            gl.glBindVertexArray(vao)
-            self._apply_instance_offset(vao, start_instance_idx)
+            gl.glBindVertexArray(mesh_data.vao)
+            self._apply_instance_offset(mesh_data.vao, start_instance_idx)
             gl.glDrawElementsInstanced(
-                gl.GL_TRIANGLES, tri_count, gl.GL_UNSIGNED_INT, None, num_instances)
+                gl.GL_TRIANGLES, mesh_data.triangle_count, gl.GL_UNSIGNED_INT, None, num_instances)
 
             # gl.glDrawElementsInstancedBaseInstance(
             #     gl.GL_TRIANGLES, tri_count, gl.GL_UNSIGNED_INT, None, num_instances, start_instance_idx            )
@@ -2530,12 +2573,11 @@ Instances: {len(self._instances)}"""
             start_instance_idx += num_instances
 
         if self.draw_axis:
-            with self._shape_shader:
-                self._axis_instancer.render()
+            self._axis_instancer.render()
 
-        with self._shape_shader:
-            for instancer in self._shape_instancers.values():
-                instancer.render()
+        # with self._shape_shader:
+        #     for instancer in self._shape_instancers.values():
+        #         instancer.render()
 
         gl.glBindVertexArray(0)
 
@@ -2560,6 +2602,8 @@ Instances: {len(self._instances)}"""
         MAT_STRIDE   = 16 * 4
         # one vec3   =  3 floats = 12 bytes
         COLOR_STRIDE = 3 * 4
+        # one vec4   =  4 floats = 16 bytes
+        VEC4_STRIDE  = 4*4
 
         # Make sure the VAO whose attributes we’ll touch is currently bound
         gl.glBindVertexArray(vao)
@@ -2602,6 +2646,15 @@ Instances: {len(self._instances)}"""
             COLOR_STRIDE, ctypes.c_void_p(byte_offset)
         )
 
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self._instance_material_buffer)
+        gl.glEnableVertexAttribArray(9)
+        gl.glVertexAttribDivisor(9, 1)
+        gl.glVertexAttribPointer(
+            9, 4, gl.GL_FLOAT, gl.GL_FALSE,
+            VEC4_STRIDE, ctypes.c_void_p(first*VEC4_STRIDE)
+        )
+
+
         # Optional: restore binding to zero so later client code doesn’t
         #           assume anything about GL_ARRAY_BUFFER.
         gl.glBindBuffer(gl.GL_ARRAY_BUFFER, 0)
@@ -2640,7 +2693,9 @@ Instances: {len(self._instances)}"""
             for instance in instances:
                 shape = self._instance_shape[instance]
 
-                vao, _, _, tri_count, _ = self._shape_gl_buffers[shape]
+                mesh_data = self._shape_lookup[shape]
+                vao = mesh_data.vao
+                tri_count = mesh_data.triangle_count
 
                 start_instance_idx = self._inverse_instance_ids[instance]
 
@@ -2762,99 +2817,87 @@ Instances: {len(self._instances)}"""
         self._setup_framebuffer()
 
     def register_shape(self, geo_hash, vertices, indices, color1=None, color2=None):
-        gl = OpenGLRenderer.gl
-
         self._switch_context()
 
-        shape = len(self._shapes)
         if color1 is None:
-            color1 = tab10_color_map(len(self._shape_geo_hash))
+            color1 = tab10_color_map(len(self._shape_lookup))
         if color2 is None:
             color2 = np.clip(np.array(color1) + 0.25, 0.0, 1.0)
-        # TODO check if we actually need to store the shape data
-        self._shapes.append((vertices, indices, color1, color2, geo_hash))
-        self._shape_geo_hash[geo_hash] = shape
 
-        gl.glUseProgram(self._shape_shader.id)
+        # Create ShapeMeshData object to encapsulate mesh handling
+        mesh_data = ShapeMeshData(vertices, indices, self._device, color1, color2, geo_hash)
+        self._shape_lookup[geo_hash] = mesh_data
 
-        # Create VAO, VBO, and EBO
-        vao = gl.GLuint()
-        gl.glGenVertexArrays(1, vao)
-        gl.glBindVertexArray(vao)
+        return mesh_data
 
-        vbo = gl.GLuint()
-        gl.glGenBuffers(1, vbo)
-        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, vbo)
-        gl.glBufferData(gl.GL_ARRAY_BUFFER, vertices.nbytes, vertices.ctypes.data, gl.GL_STATIC_DRAW)
+    def lookup_shape(self, geo_hash):
+        """Look up a shape by its geometry hash.
 
-        vertex_cuda_buffer = wp.RegisteredGLBuffer(int(vbo.value), self._device)
+        Args:
+            geo_hash: The geometry hash to look up
 
-        ebo = gl.GLuint()
-        gl.glGenBuffers(1, ebo)
-        gl.glBindBuffer(gl.GL_ELEMENT_ARRAY_BUFFER, ebo)
-        gl.glBufferData(gl.GL_ELEMENT_ARRAY_BUFFER, indices.nbytes, indices.ctypes.data, gl.GL_STATIC_DRAW)
-
-        # Set up vertex attributes
-        vertex_stride = vertices.shape[1] * vertices.itemsize
-        # positions
-        gl.glVertexAttribPointer(0, 3, gl.GL_FLOAT, gl.GL_FALSE, vertex_stride, ctypes.c_void_p(0))
-        gl.glEnableVertexAttribArray(0)
-        # normals
-        gl.glVertexAttribPointer(1, 3, gl.GL_FLOAT, gl.GL_FALSE, vertex_stride, ctypes.c_void_p(3 * vertices.itemsize))
-        gl.glEnableVertexAttribArray(1)
-        # uv coordinates
-        gl.glVertexAttribPointer(2, 2, gl.GL_FLOAT, gl.GL_FALSE, vertex_stride, ctypes.c_void_p(6 * vertices.itemsize))
-        gl.glEnableVertexAttribArray(2)
-
-        gl.glBindVertexArray(0)
-
-        self._shape_gl_buffers[shape] = (vao, vbo, ebo, len(indices), vertex_cuda_buffer)
-
-        return shape
+        Returns:
+            ShapeMeshData object if found, None otherwise
+        """
+        return self._shape_lookup.get(geo_hash, None)
 
     def deregister_shape(self, shape):
         gl = OpenGLRenderer.gl
 
         self._switch_context()
 
-        if shape not in self._shape_gl_buffers:
+        # Handle both ShapeMeshData objects and geo_hash values
+        if isinstance(shape, ShapeMeshData):
+            geo_hash = shape.geo_hash
+            mesh_data = shape
+        else:
+            geo_hash = shape
+            mesh_data = self._shape_lookup.get(geo_hash)
+
+        if geo_hash not in self._shape_lookup or mesh_data is None:
             return
 
-        vao, vbo, ebo, _, vertex_cuda_buffer = self._shape_gl_buffers[shape]
         try:
-            gl.glDeleteVertexArrays(1, vao)
-            gl.glDeleteBuffers(1, vbo)
-            gl.glDeleteBuffers(1, ebo)
+            mesh_data.cleanup()
         except gl.GLException:
             pass
 
-        _, _, _, _, geo_hash = self._shapes[shape]
-        del self._shape_geo_hash[geo_hash]
-        del self._shape_gl_buffers[shape]
-        self._shapes.pop(shape)
+        del self._shape_lookup[geo_hash]
 
     def add_shape_instance(
         self,
         name: str,
-        shape: int,
+        shape,  # Can be ShapeMeshData object or geo_hash
         body,
         pos: tuple,
         rot: tuple,
         scale: tuple = (1.0, 1.0, 1.0),
         color1=None,
         color2=None,
+        material=None,
         custom_index: int = -1,
         visible: bool = True,
     ):
+        # Handle both ShapeMeshData objects and geo_hash values
+        if isinstance(shape, ShapeMeshData):
+            geo_hash = shape.geo_hash
+            mesh_data = shape
+        else:
+            geo_hash = shape
+            mesh_data = self._shape_lookup[geo_hash]
+
         if color1 is None:
-            color1 = self._shapes[shape][2]
+            color1 = mesh_data.color1
         if color2 is None:
-            color2 = self._shapes[shape][3]
+            color2 = mesh_data.color2
+        if material is None:
+            material = (0.5, 0.0, 1.0, 0.0)  # roughness, checkerboard, checker_scale, metallic
         instance = len(self._instances)
-        self._shape_instances[shape].append(instance)
+        self._shape_instances[geo_hash].append(instance)
         body = self._resolve_body_id(body)
-        self._instances[name] = (instance, body, shape, [*pos, *rot], scale, color1, color2, visible)
-        self._instance_shape[instance] = shape
+        # Store geo_hash in instances data for consistency
+        self._instances[name] = (instance, body, geo_hash, [*pos, *rot], scale, color1, color2, material, visible)
+        self._instance_shape[instance] = geo_hash
         self._instance_custom_ids[instance] = custom_index
         self._add_shape_instances = True
         self._instance_count = len(self._instances)
@@ -2864,7 +2907,7 @@ Instances: {len(self._instances)}"""
         if name not in self._instances:
             return
 
-        instance, _, shape, _, _, _, _, _ = self._instances[name]
+        instance, _, shape, _, _, _, _, _, _ = self._instances[name]
 
         self._shape_instances[shape].remove(instance)
         self._instance_count = len(self._instances)
@@ -2936,6 +2979,7 @@ Instances: {len(self._instances)}"""
         )
 
         self.update_instance_colors()
+        self.update_instance_materials()
 
         # set up instance attribute pointers
         matrix_size = transforms[0].nbytes
@@ -2947,8 +2991,9 @@ Instances: {len(self._instances)}"""
         inverse_instance_ids = {}
         instance_count = 0
         colors_size = np.zeros(3, dtype=np.float32).nbytes
-        for shape, (vao, _vbo, _ebo, _tri_count, _vertex_cuda_buffer) in self._shape_gl_buffers.items():
-            gl.glBindVertexArray(vao)
+        materials_size = np.zeros(4, dtype=np.float32).nbytes
+        for shape, mesh_data in self._shape_lookup.items():
+            gl.glBindVertexArray(mesh_data.vao)
 
             gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self._instance_transform_gl_buffer)
 
@@ -2970,6 +3015,11 @@ Instances: {len(self._instances)}"""
             gl.glEnableVertexAttribArray(8)
             gl.glVertexAttribDivisor(8, 1)
 
+            gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self._instance_material_buffer)
+            gl.glVertexAttribPointer(9, 4, gl.GL_FLOAT, gl.GL_FALSE, materials_size, ctypes.c_void_p(0))
+            gl.glEnableVertexAttribArray(9)
+            gl.glVertexAttribDivisor(9, 1)
+
             instance_ids.extend(self._shape_instances[shape])
             for i in self._shape_instances[shape]:
                 inverse_instance_ids[i] = instance_count
@@ -2988,7 +3038,7 @@ Instances: {len(self._instances)}"""
 
         gl.glBindVertexArray(0)
 
-    def update_shape_instance(self, name, pos=None, rot=None, color1=None, color2=None, visible=None):
+    def update_shape_instance(self, name, pos=None, rot=None, color1=None, color2=None, material=None, visible=None):
         """Update the instance properties of the shape
 
         Args:
@@ -2997,6 +3047,7 @@ Instances: {len(self._instances)}"""
             rot: The rotation of the shape
             color1: The first color of the checker pattern
             color2: The second color of the checker pattern
+            material: The material properties of the shape
             visible: Whether the shape is visible
         """
         gl = OpenGLRenderer.gl
@@ -3004,7 +3055,7 @@ Instances: {len(self._instances)}"""
         self._switch_context()
 
         if name in self._instances:
-            i, body, shape, tf, scale, old_color1, old_color2, v = self._instances[name]
+            i, body, shape, tf, scale, old_color1, old_color2, old_material, v = self._instances[name]
             if visible is None:
                 visible = v
             new_tf = np.copy(tf)
@@ -3020,13 +3071,19 @@ Instances: {len(self._instances)}"""
                 scale,
                 old_color1 if color1 is None else color1,
                 old_color2 if color2 is None else color2,
+                old_material if material is None else material,
                 visible,
             )
             self._update_shape_instances = True
             if color1 is not None or color2 is not None:
-                vao, vbo, ebo, tri_count, vertex_cuda_buffer = self._shape_gl_buffers[shape]
-                gl.glBindVertexArray(vao)
+                mesh_data = self._shape_lookup[shape]
+                gl.glBindVertexArray(mesh_data.vao)
                 self.update_instance_colors()
+                gl.glBindVertexArray(0)
+            if material is not None:
+                mesh_data = self._shape_lookup[shape]
+                gl.glBindVertexArray(mesh_data.vao)
+                self.update_instance_materials()
                 gl.glBindVertexArray(0)
             return True
         return False
@@ -3280,9 +3337,10 @@ Instances: {len(self._instances)}"""
             texture: The texture of the plane (optional)
         """
         geo_hash = hash(("plane", width, length))
-        if geo_hash in self._shape_geo_hash:
-            shape = self._shape_geo_hash[geo_hash]
-            if self.update_shape_instance(name, pos, rot):
+        shape = self.lookup_shape(geo_hash)
+        if shape is not None:
+            plane_material = (0.5, 1.0, 1.0, 0.0)  # roughness, checkerboard, checker_scale, metallic
+            if self.update_shape_instance(name, pos, rot, material=plane_material):
                 return shape
         else:
             faces = np.array([0, 1, 2, 2, 3, 0], dtype=np.uint32)
@@ -3306,7 +3364,8 @@ Instances: {len(self._instances)}"""
             )
         if not is_template:
             body = self._resolve_body_id(parent_body)
-            self.add_shape_instance(name, shape, body, pos, rot)
+            plane_material = (0.5, 1.0, 1.0, 0.0)  # roughness, checkerboard, checker_scale, metallic
+            self.add_shape_instance(name, shape, body, pos, rot, material=plane_material)
         return shape
 
     def render_ground(self, size: float = 1000.0, plane=None):
@@ -3368,8 +3427,8 @@ Instances: {len(self._instances)}"""
             color: The color of the sphere
         """
         geo_hash = hash(("sphere", radius))
-        if geo_hash in self._shape_geo_hash:
-            shape = self._shape_geo_hash[geo_hash]
+        shape = self.lookup_shape(geo_hash)
+        if shape is not None:
             if self.update_shape_instance(name, pos, rot, color1=color, color2=color):
                 return shape
         else:
@@ -3404,8 +3463,8 @@ Instances: {len(self._instances)}"""
             color: The color of the capsule
         """
         geo_hash = hash(("capsule", radius, half_height, up_axis))
-        if geo_hash in self._shape_geo_hash:
-            shape = self._shape_geo_hash[geo_hash]
+        shape = self.lookup_shape(geo_hash)
+        if shape is not None:
             if self.update_shape_instance(name, pos, rot):
                 return shape
         else:
@@ -3440,8 +3499,8 @@ Instances: {len(self._instances)}"""
             color: The color of the capsule
         """
         geo_hash = hash(("cylinder", radius, half_height, up_axis))
-        if geo_hash in self._shape_geo_hash:
-            shape = self._shape_geo_hash[geo_hash]
+        shape = self.lookup_shape(geo_hash)
+        if shape is not None:
             if self.update_shape_instance(name, pos, rot):
                 return shape
         else:
@@ -3476,8 +3535,8 @@ Instances: {len(self._instances)}"""
             color: The color of the cone
         """
         geo_hash = hash(("cone", radius, half_height, up_axis))
-        if geo_hash in self._shape_geo_hash:
-            shape = self._shape_geo_hash[geo_hash]
+        shape = self.lookup_shape(geo_hash)
+        if shape is not None:
             if self.update_shape_instance(name, pos, rot):
                 return shape
         else:
@@ -3508,8 +3567,8 @@ Instances: {len(self._instances)}"""
             color: The color of the box
         """
         geo_hash = hash(("box", tuple(extents)))
-        if geo_hash in self._shape_geo_hash:
-            shape = self._shape_geo_hash[geo_hash]
+        shape = self.lookup_shape(geo_hash)
+        if shape is not None:
             if self.update_shape_instance(name, pos, rot):
                 return shape
         else:
@@ -3562,9 +3621,9 @@ Instances: {len(self._instances)}"""
             # We've already registered this mesh instance and its associated shape.
             shape = self._instances[name][2]
         else:
-            if geo_hash in self._shape_geo_hash:
+            if geo_hash in self._shape_lookup:
                 # We've only registered the shape, which can happen when `is_template` is `True`.
-                shape = self._shape_geo_hash[geo_hash]
+                shape = geo_hash
             else:
                 shape = None
 
@@ -3663,8 +3722,8 @@ Instances: {len(self._instances)}"""
             up_axis: The axis of the arrow that points up (0: x, 1: y, 2: z)
         """
         geo_hash = hash(("arrow", base_radius, base_height, cap_radius, cap_height, up_axis))
-        if geo_hash in self._shape_geo_hash:
-            shape = self._shape_geo_hash[geo_hash]
+        shape = self.lookup_shape(geo_hash)
+        if shape is not None:
             if self.update_shape_instance(name, pos, rot, color1=color, color2=color):
                 return shape
         else:
@@ -3724,7 +3783,7 @@ Instances: {len(self._instances)}"""
             else:
                 vertices, indices = self._create_sphere_mesh(1.0)
             if colors is None:
-                color = tab10_color_map(len(self._shape_geo_hash))
+                color = tab10_color_map(len(self._shape_lookup))
             elif len(colors) == 3:
                 color = colors
             else:
@@ -3756,7 +3815,7 @@ Instances: {len(self._instances)}"""
             instancer = ShapeInstancer(self._shape_shader, self._device)
             vertices, indices = self._create_capsule_mesh(radius, 0.5)
             if color is None or (isinstance(color, list) and len(color) > 0 and isinstance(color[0], list)):
-                color = tab10_color_map(len(self._shape_geo_hash))
+                color = tab10_color_map(len(self._shape_lookup))
             instancer.register_shape(vertices, indices, color, color)
             instancer.allocate_instances(np.zeros((len(lines), 3)))
             self._shape_instancers[name] = instancer
@@ -3826,19 +3885,13 @@ Instances: {len(self._instances)}"""
         else:
             wp_points = wp.array(points, dtype=wp.vec3, device=self._device)
 
-        cuda_buffer = self._shape_gl_buffers[shape][4]
-        vertices_shape = self._shapes[shape][0].shape
-        vbo_vertices = cuda_buffer.map(dtype=wp.float32, shape=vertices_shape)
+        # Handle both ShapeMeshData objects and geo_hash values
+        if isinstance(shape, ShapeMeshData):
+            mesh_data = shape
+        else:
+            mesh_data = self._shape_lookup[shape]
 
-        wp.launch(
-            update_vbo_vertices,
-            dim=vertices_shape[0],
-            inputs=[wp_points, scale],
-            outputs=[vbo_vertices],
-            device=self._device,
-        )
-
-        cuda_buffer.unmap()
+        mesh_data.update_positions(wp_points, scale)
 
     @staticmethod
     def _create_sphere_mesh(
@@ -4090,6 +4143,175 @@ Instances: {len(self._instances)}"""
             # The window could be in the process of being closed, in which case
             # its corresponding context might have been destroyed and set to `None`.
             pass
+
+    def update_instance_materials(self):
+        gl = OpenGLRenderer.gl
+
+        self._switch_context()
+
+        materials = []
+        all_instances = list(self._instances.values())
+        for _shape, instances in self._shape_instances.items():
+            for i in instances:
+                if i >= len(all_instances):
+                    continue
+                instance = all_instances[i]
+                materials.append(instance[7])
+        materials = np.array(materials, dtype=np.float32)
+
+        if self._instance_material_buffer is None:
+            self._instance_material_buffer = gl.GLuint()
+            gl.glGenBuffers(1, self._instance_material_buffer)
+
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self._instance_material_buffer)
+        gl.glBufferData(gl.GL_ARRAY_BUFFER, materials.nbytes, materials.ctypes.data, gl.GL_STATIC_DRAW)
+
+
+class ShapeMeshData:
+    """Encapsulates mesh data and OpenGL buffers for a shape."""
+
+    def __init__(self, vertices, indices, device, color1=None, color2=None, geo_hash=None):
+        """Initialize mesh data with vertices and indices.
+
+        Args:
+            vertices: Numpy array of vertex data in format
+                     [pos.x, pos.y, pos.z, normal.x, normal.y, normal.z, u, v]
+            indices: Numpy array of triangle indices
+            device: Warp device for CUDA operations
+            color1: Primary color for rendering
+            color2: Secondary color for rendering
+            geo_hash: Geometry hash for identifying this shape
+        """
+        self._device = device
+        gl = OpenGLRenderer.gl
+
+        # Store references to input buffers and rendering data
+        self._vertices = vertices
+        self._indices = indices
+        self._vertex_count = len(vertices)
+        self._index_count = len(indices)
+        self.color1 = color1
+        self.color2 = color2
+        self.geo_hash = geo_hash
+
+        # Create OpenGL buffers
+        self.vao = gl.GLuint()
+        gl.glGenVertexArrays(1, self.vao)
+        gl.glBindVertexArray(self.vao)
+
+        self.vbo = gl.GLuint()
+        gl.glGenBuffers(1, self.vbo)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.vbo)
+        gl.glBufferData(gl.GL_ARRAY_BUFFER, vertices.nbytes, vertices.ctypes.data, gl.GL_STATIC_DRAW)
+
+        # Create CUDA-GL interop buffer for efficient updates
+        self.vertex_cuda_buffer = wp.RegisteredGLBuffer(int(self.vbo.value), self._device)
+
+        self.ebo = gl.GLuint()
+        gl.glGenBuffers(1, self.ebo)
+        gl.glBindBuffer(gl.GL_ELEMENT_ARRAY_BUFFER, self.ebo)
+        gl.glBufferData(gl.GL_ELEMENT_ARRAY_BUFFER, indices.nbytes, indices.ctypes.data, gl.GL_STATIC_DRAW)
+
+        # Set up vertex attributes in the packed format the shaders expect
+        vertex_stride = vertices.shape[1] * vertices.itemsize
+
+        # positions (location 0)
+        gl.glVertexAttribPointer(0, 3, gl.GL_FLOAT, gl.GL_FALSE, vertex_stride, ctypes.c_void_p(0))
+        gl.glEnableVertexAttribArray(0)
+
+        # normals (location 1)
+        gl.glVertexAttribPointer(1, 3, gl.GL_FLOAT, gl.GL_FALSE, vertex_stride, ctypes.c_void_p(3 * vertices.itemsize))
+        gl.glEnableVertexAttribArray(1)
+
+        # uv coordinates (location 2)
+        gl.glVertexAttribPointer(2, 2, gl.GL_FLOAT, gl.GL_FALSE, vertex_stride, ctypes.c_void_p(6 * vertices.itemsize))
+        gl.glEnableVertexAttribArray(2)
+
+        gl.glBindVertexArray(0)
+
+    def update_positions(self, points, scale=(1.0, 1.0, 1.0)):
+        """Update vertex positions in the VBO.
+
+        Args:
+            points: New point positions (warp array or numpy array)
+            scale: Scaling factor for positions
+        """
+        if isinstance(points, wp.array):
+            wp_points = points.to(self._device)
+        else:
+            wp_points = wp.array(points, dtype=wp.vec3, device=self._device)
+
+        # Map the VBO for CUDA access
+        vbo_vertices = self.vertex_cuda_buffer.map(dtype=wp.float32, shape=self._vertices.shape)
+
+        # Update only the position part of the vertices
+        wp.launch(
+            update_vbo_vertices,
+            dim=self._vertex_count,
+            inputs=[wp_points, wp.vec3(scale[0], scale[1], scale[2])],
+            outputs=[vbo_vertices],
+            device=self._device,
+        )
+
+        self.vertex_cuda_buffer.unmap()
+
+    def recompute_normals(self, points, scale=(1.0, 1.0, 1.0)):
+        """Recompute normals and update VBO.
+
+        Args:
+            points: Vertex positions (warp array or numpy array)
+            scale: Scaling factor for positions
+        """
+        if isinstance(points, wp.array):
+            wp_points = points.to(self._device)
+        else:
+            wp_points = wp.array(points, dtype=wp.vec3, device=self._device)
+
+        # Prepare arrays for normal computation
+        normals = wp.zeros(self._vertex_count, dtype=wp.vec3, device=self._device)
+        faces_per_vertex = wp.zeros(self._vertex_count, dtype=int, device=self._device)
+
+        # Compute average normals per vertex
+        wp.launch(
+            compute_average_normals,
+            dim=self._index_count,
+            inputs=[
+                wp.array(self._indices, dtype=int, device=self._device),
+                wp_points,
+                wp.vec3(scale[0], scale[1], scale[2]),
+            ],
+            outputs=[normals, faces_per_vertex],
+            device=self._device,
+        )
+
+        # Map the VBO for updating
+        vbo_vertices = self.vertex_cuda_buffer.map(dtype=wp.float32, shape=self._vertices.shape)
+
+        # Update the complete vertex data with new positions and normals
+        wp.launch(
+            assemble_gfx_vertices,
+            dim=self._vertex_count,
+            inputs=[wp_points, normals, faces_per_vertex, wp.vec3(scale[0], scale[1], scale[2])],
+            outputs=[vbo_vertices],
+            device=self._device,
+        )
+
+        self.vertex_cuda_buffer.unmap()
+
+    @property
+    def triangle_count(self):
+        """Get the number of triangles in this mesh."""
+        return self._index_count
+
+    def cleanup(self):
+        """Clean up OpenGL resources."""
+        gl = OpenGLRenderer.gl
+        if hasattr(self, "vao"):
+            gl.glDeleteVertexArrays(1, self.vao)
+        if hasattr(self, "vbo"):
+            gl.glDeleteBuffers(1, self.vbo)
+        if hasattr(self, "ebo"):
+            gl.glDeleteBuffers(1, self.ebo)
 
 
 if __name__ == "__main__":
