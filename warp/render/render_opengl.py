@@ -1327,7 +1327,7 @@ class OpenGLRenderer:
                 resizable=True,
                 vsync=vsync,
                 visible=not headless,
-                config=config
+                config=config,
             )
             gl.glEnable(gl.GL_MULTISAMPLE)
             # remember sample count for later (e.g., resolving FBO)
@@ -2350,16 +2350,16 @@ class OpenGLRenderer:
         gl = OpenGLRenderer.gl
         gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, fbo)
 
-        if fbo == 0:                            # default window FB
+        if fbo == 0:  # default window FB
             gl.glDrawBuffer(gl.GL_BACK)
             gl.glReadBuffer(gl.GL_BACK)
-        else:                                   # our custom FBOs
+        else:  # our custom FBOs
             gl.glDrawBuffer(gl.GL_COLOR_ATTACHMENT0)
             gl.glReadBuffer(gl.GL_COLOR_ATTACHMENT0)
 
     def _draw(self):
         gl = OpenGLRenderer.gl
-    
+
         self._switch_context()
 
         if not self.headless:
@@ -2381,7 +2381,7 @@ class OpenGLRenderer:
         # select target framebuffer (MSAA or regular) for scene rendering
         target_fbo = self._frame_msaa_fbo if getattr(self, "msaa_samples", 0) > 0 else self._frame_fbo
 
-        #---------------------------------------
+        # ---------------------------------------
         # Set texture as render target
 
         gl.glBindFramebuffer(gl.GL_DRAW_FRAMEBUFFER, target_fbo)
@@ -2461,7 +2461,7 @@ class OpenGLRenderer:
                 0,
                 self.screen_width,
                 self.screen_height,
-                gl.GL_COLOR_BUFFER_BIT,
+                gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT,
                 gl.GL_NEAREST,
             )
 
@@ -2474,7 +2474,6 @@ class OpenGLRenderer:
 
         # render frame buffer texture to screen
         if self._frame_fbo is not None:
-
             with self._frame_shader:
                 gl.glActiveTexture(gl.GL_TEXTURE0)
                 gl.glBindTexture(gl.GL_TEXTURE_2D, self._frame_texture)
@@ -2565,8 +2564,10 @@ Instances: {len(self._instances)}"""
             gl.glBindVertexArray(mesh_data.vao)
             self._apply_instance_offset(mesh_data.vao, start_instance_idx)
             gl.glDrawElementsInstanced(
-                gl.GL_TRIANGLES, mesh_data.triangle_count, gl.GL_UNSIGNED_INT, None, num_instances)
+                gl.GL_TRIANGLES, mesh_data.triangle_count, gl.GL_UNSIGNED_INT, None, num_instances
+            )
 
+            # not supported on < OpenGL 4.2
             # gl.glDrawElementsInstancedBaseInstance(
             #     gl.GL_TRIANGLES, tri_count, gl.GL_UNSIGNED_INT, None, num_instances, start_instance_idx            )
 
@@ -2582,9 +2583,9 @@ Instances: {len(self._instances)}"""
 
     def _apply_instance_offset(self, vao: int, first: int):
         """
-        Shift the instanced‑attribute streams hanging off *vao* so that
-        the logical instance with index *first* becomes instance 0 from
-        the shader’s point of view.
+        Shift the instanced-attribute streams hanging off *vao* so that
+        the logical instance with index *first* becomes instance 0 from
+        the shader's point of view.
 
         Call pattern in the render loop:
 
@@ -2597,67 +2598,54 @@ Instances: {len(self._instances)}"""
         gl = OpenGLRenderer.gl
 
         # --- constants -------------------------------------------------
-        # one mat4  = 16 floats = 64 bytes
-        MAT_STRIDE   = 16 * 4
-        # one vec3   =  3 floats = 12 bytes
+        MAT_STRIDE = 16 * 4
         COLOR_STRIDE = 3 * 4
-        # one vec4   =  4 floats = 16 bytes
-        VEC4_STRIDE  = 4*4
+        VEC4_STRIDE = 4 * 4
 
-        # Make sure the VAO whose attributes we’ll touch is currently bound
+        # Make sure the VAO whose attributes we'll touch is currently bound
         gl.glBindVertexArray(vao)
 
         # -----------------------------------------------
-        # 1. model‑matrix columns  (attributes 3‑6)
+        # 1. model-matrix columns  (attributes 3-6)
         # -----------------------------------------------
         gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self._instance_transform_gl_buffer)
 
         base_byte = first * MAT_STRIDE
-        for col in range(4):                                   # attr‑locs 3‑6
+        for col in range(4):  # attr-locs 3-6
             gl.glEnableVertexAttribArray(3 + col)
             gl.glVertexAttribDivisor(3 + col, 1)
             gl.glVertexAttribPointer(
-                3 + col,                      # location
-                4,                            # vec4
-                gl.GL_FLOAT, gl.GL_FALSE,
-                MAT_STRIDE,                   # bytes between *instances*
-                ctypes.c_void_p(base_byte + col * 16)  # 16 B per column
+                3 + col,  # location
+                4,  # vec4
+                gl.GL_FLOAT,
+                gl.GL_FALSE,
+                MAT_STRIDE,  # bytes between *instances*
+                ctypes.c_void_p(base_byte + col * 16),  # 16B per column
             )
 
         # -----------------------------------------------
-        # 2. checkerboard colours    (attributes 7‑8)
+        # 2. checkerboard colours    (attributes 7-8)
         # -----------------------------------------------
         byte_offset = first * COLOR_STRIDE
 
         gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self._instance_color1_buffer)
         gl.glEnableVertexAttribArray(7)
         gl.glVertexAttribDivisor(7, 1)
-        gl.glVertexAttribPointer(
-            7, 3, gl.GL_FLOAT, gl.GL_FALSE,
-            COLOR_STRIDE, ctypes.c_void_p(byte_offset)
-        )
+        gl.glVertexAttribPointer(7, 3, gl.GL_FLOAT, gl.GL_FALSE, COLOR_STRIDE, ctypes.c_void_p(byte_offset))
 
         gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self._instance_color2_buffer)
         gl.glEnableVertexAttribArray(8)
         gl.glVertexAttribDivisor(8, 1)
-        gl.glVertexAttribPointer(
-            8, 3, gl.GL_FLOAT, gl.GL_FALSE,
-            COLOR_STRIDE, ctypes.c_void_p(byte_offset)
-        )
+        gl.glVertexAttribPointer(8, 3, gl.GL_FLOAT, gl.GL_FALSE, COLOR_STRIDE, ctypes.c_void_p(byte_offset))
 
         gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self._instance_material_buffer)
         gl.glEnableVertexAttribArray(9)
         gl.glVertexAttribDivisor(9, 1)
-        gl.glVertexAttribPointer(
-            9, 4, gl.GL_FLOAT, gl.GL_FALSE,
-            VEC4_STRIDE, ctypes.c_void_p(first*VEC4_STRIDE)
-        )
+        gl.glVertexAttribPointer(9, 4, gl.GL_FLOAT, gl.GL_FALSE, VEC4_STRIDE, ctypes.c_void_p(first * VEC4_STRIDE))
 
-
-        # Optional: restore binding to zero so later client code doesn’t
+        # Optional: restore binding to zero so later client code doesn't
         #           assume anything about GL_ARRAY_BUFFER.
         gl.glBindBuffer(gl.GL_ARRAY_BUFFER, 0)
-
 
     def _render_scene_tiled(self):
         gl = OpenGLRenderer.gl
