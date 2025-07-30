@@ -1319,7 +1319,7 @@ class OpenGLRenderer:
 
         try:
             # try to enable MSAA
-            config = pyglet.gl.Config(sample_buffers=1, samples=4)
+            config = pyglet.gl.Config(sample_buffers=1, samples=4, double_buffer=True)
             self.window = pyglet.window.Window(
                 width=screen_width,
                 height=screen_height,
@@ -1327,7 +1327,7 @@ class OpenGLRenderer:
                 resizable=True,
                 vsync=vsync,
                 visible=not headless,
-                config=config,
+                config=config
             )
             gl.glEnable(gl.GL_MULTISAMPLE)
             # remember sample count for later (e.g., resolving FBO)
@@ -2345,9 +2345,21 @@ class OpenGLRenderer:
 
         gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
 
+    def _bind_for_drawing(self, fbo: int):
+        """Bind *fbo* and make sure draw / read buffers are valid."""
+        gl = OpenGLRenderer.gl
+        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, fbo)
+
+        if fbo == 0:                            # default window FB
+            gl.glDrawBuffer(gl.GL_BACK)
+            gl.glReadBuffer(gl.GL_BACK)
+        else:                                   # our custom FBOs
+            gl.glDrawBuffer(gl.GL_COLOR_ATTACHMENT0)
+            gl.glReadBuffer(gl.GL_COLOR_ATTACHMENT0)
+
     def _draw(self):
         gl = OpenGLRenderer.gl
-
+    
         self._switch_context()
 
         if not self.headless:
@@ -2368,8 +2380,12 @@ class OpenGLRenderer:
 
         # select target framebuffer (MSAA or regular) for scene rendering
         target_fbo = self._frame_msaa_fbo if getattr(self, "msaa_samples", 0) > 0 else self._frame_fbo
-        if target_fbo is not None:
-            gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, target_fbo)
+
+        #---------------------------------------
+        # Set texture as render target
+
+        gl.glBindFramebuffer(gl.GL_DRAW_FRAMEBUFFER, target_fbo)
+        gl.glDrawBuffer(gl.GL_COLOR_ATTACHMENT0)
 
         gl.glClearColor(*self.sky_upper, 1)
         gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
@@ -2426,39 +2442,48 @@ class OpenGLRenderer:
 
         gl.glPolygonMode(gl.GL_FRONT_AND_BACK, gl.GL_FILL)
 
-        gl.glBindBuffer(gl.GL_PIXEL_UNPACK_BUFFER, 0)
+        # ------------------------------------------------------------------
+        # If MSAA is enabled, resolve the multi-sample buffer into texture FBO
+        # ------------------------------------------------------------------
+        if getattr(self, "msaa_samples", 0) > 0 and self._frame_msaa_fbo is not None:
+            gl.glBindFramebuffer(gl.GL_READ_FRAMEBUFFER, self._frame_msaa_fbo)
+            gl.glReadBuffer(gl.GL_COLOR_ATTACHMENT0)
+
+            gl.glBindFramebuffer(gl.GL_DRAW_FRAMEBUFFER, self._frame_fbo)
+            gl.glDrawBuffer(gl.GL_COLOR_ATTACHMENT0)
+
+            gl.glBlitFramebuffer(
+                0,
+                0,
+                self.screen_width,
+                self.screen_height,
+                0,
+                0,
+                self.screen_width,
+                self.screen_height,
+                gl.GL_COLOR_BUFFER_BIT,
+                gl.GL_NEAREST,
+            )
+
+        # ------------------------------------------------------------------
+        # Draw resolved texture to the screen
+        # ------------------------------------------------------------------
         gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
         gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
         gl.glViewport(0, 0, self.screen_width, self.screen_height)
 
         # render frame buffer texture to screen
         if self._frame_fbo is not None:
-            if self.render_depth or self.render_shadow_map_debug:
-                with self._frame_depth_shader:
-                    gl.glActiveTexture(gl.GL_TEXTURE0)
-                    gl.glBindTexture(
-                        gl.GL_TEXTURE_2D,
-                        self._shadow_texture if self.render_shadow_map_debug else self._frame_depth_texture,
-                    )
-                    gl.glUniform1i(self._frame_loc_depth_texture, 0)
 
-                    gl.glBindVertexArray(self._frame_vao)
-                    gl.glDrawElements(gl.GL_TRIANGLES, len(self._frame_indices), gl.GL_UNSIGNED_INT, None)
-                    gl.glBindVertexArray(0)
-                    gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
-            else:
-                with self._frame_shader:
-                    gl.glActiveTexture(gl.GL_TEXTURE0)
-                    gl.glBindTexture(gl.GL_TEXTURE_2D, self._frame_texture)
-                    gl.glUniform1i(self._frame_loc_texture, 0)
+            with self._frame_shader:
+                gl.glActiveTexture(gl.GL_TEXTURE0)
+                gl.glBindTexture(gl.GL_TEXTURE_2D, self._frame_texture)
+                gl.glUniform1i(self._frame_loc_texture, 0)
 
-                    gl.glBindVertexArray(self._frame_vao)
-                    gl.glDrawElements(gl.GL_TRIANGLES, len(self._frame_indices), gl.GL_UNSIGNED_INT, None)
-                    gl.glBindVertexArray(0)
-                    gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
-
-        # check for OpenGL errors
-        # check_gl_error()
+                gl.glBindVertexArray(self._frame_vao)
+                gl.glDrawElements(gl.GL_TRIANGLES, len(self._frame_indices), gl.GL_UNSIGNED_INT, None)
+                gl.glBindVertexArray(0)
+                gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
 
         if self.show_info:
             gl.glClear(gl.GL_DEPTH_BUFFER_BIT)
@@ -2487,27 +2512,8 @@ Instances: {len(self._instances)}"""
         for cb in self.render_2d_callbacks:
             cb()
 
-        # ------------------------------------------------------------------
-        # If MSAA is enabled, resolve the multi-sample buffer into texture FBO
-        # ------------------------------------------------------------------
-        if getattr(self, "msaa_samples", 0) > 0 and self._frame_msaa_fbo is not None:
-            gl.glBindFramebuffer(gl.GL_READ_FRAMEBUFFER, self._frame_msaa_fbo)
-            gl.glBindFramebuffer(gl.GL_DRAW_FRAMEBUFFER, self._frame_fbo)
-            gl.glBlitFramebuffer(
-                0,
-                0,
-                self.screen_width,
-                self.screen_height,
-                0,
-                0,
-                self.screen_width,
-                self.screen_height,
-                gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT,
-                gl.GL_NEAREST,
-            )
-            gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
-        else:
-            gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
+        err = gl.glGetError()
+        assert err == gl.GL_NO_ERROR, hex(err)
 
     def _draw_grid(self, is_tiled=False):
         gl = OpenGLRenderer.gl
@@ -2557,9 +2563,12 @@ Instances: {len(self._instances)}"""
             num_instances = len(self._shape_instances[shape])
 
             gl.glBindVertexArray(mesh_data.vao)
-            gl.glDrawElementsInstancedBaseInstance(
-                gl.GL_TRIANGLES, mesh_data.triangle_count, gl.GL_UNSIGNED_INT, None, num_instances, start_instance_idx
-            )
+            self._apply_instance_offset(mesh_data.vao, start_instance_idx)
+            gl.glDrawElementsInstanced(
+                gl.GL_TRIANGLES, mesh_data.triangle_count, gl.GL_UNSIGNED_INT, None, num_instances)
+
+            # gl.glDrawElementsInstancedBaseInstance(
+            #     gl.GL_TRIANGLES, tri_count, gl.GL_UNSIGNED_INT, None, num_instances, start_instance_idx            )
 
             start_instance_idx += num_instances
 
@@ -2570,6 +2579,85 @@ Instances: {len(self._instances)}"""
             instancer.render()
 
         gl.glBindVertexArray(0)
+
+    def _apply_instance_offset(self, vao: int, first: int):
+        """
+        Shift the instanced‑attribute streams hanging off *vao* so that
+        the logical instance with index *first* becomes instance 0 from
+        the shader’s point of view.
+
+        Call pattern in the render loop:
+
+            gl.glBindVertexArray(vao)
+            self._apply_instance_offset(vao, start_instance_idx)
+            gl.glDrawElementsInstanced(GL_TRIANGLES, tri_count,
+                                       GL_UNSIGNED_INT, None,
+                                       num_instances)
+        """
+        gl = OpenGLRenderer.gl
+
+        # --- constants -------------------------------------------------
+        # one mat4  = 16 floats = 64 bytes
+        MAT_STRIDE   = 16 * 4
+        # one vec3   =  3 floats = 12 bytes
+        COLOR_STRIDE = 3 * 4
+        # one vec4   =  4 floats = 16 bytes
+        VEC4_STRIDE  = 4*4
+
+        # Make sure the VAO whose attributes we’ll touch is currently bound
+        gl.glBindVertexArray(vao)
+
+        # -----------------------------------------------
+        # 1. model‑matrix columns  (attributes 3‑6)
+        # -----------------------------------------------
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self._instance_transform_gl_buffer)
+
+        base_byte = first * MAT_STRIDE
+        for col in range(4):                                   # attr‑locs 3‑6
+            gl.glEnableVertexAttribArray(3 + col)
+            gl.glVertexAttribDivisor(3 + col, 1)
+            gl.glVertexAttribPointer(
+                3 + col,                      # location
+                4,                            # vec4
+                gl.GL_FLOAT, gl.GL_FALSE,
+                MAT_STRIDE,                   # bytes between *instances*
+                ctypes.c_void_p(base_byte + col * 16)  # 16 B per column
+            )
+
+        # -----------------------------------------------
+        # 2. checkerboard colours    (attributes 7‑8)
+        # -----------------------------------------------
+        byte_offset = first * COLOR_STRIDE
+
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self._instance_color1_buffer)
+        gl.glEnableVertexAttribArray(7)
+        gl.glVertexAttribDivisor(7, 1)
+        gl.glVertexAttribPointer(
+            7, 3, gl.GL_FLOAT, gl.GL_FALSE,
+            COLOR_STRIDE, ctypes.c_void_p(byte_offset)
+        )
+
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self._instance_color2_buffer)
+        gl.glEnableVertexAttribArray(8)
+        gl.glVertexAttribDivisor(8, 1)
+        gl.glVertexAttribPointer(
+            8, 3, gl.GL_FLOAT, gl.GL_FALSE,
+            COLOR_STRIDE, ctypes.c_void_p(byte_offset)
+        )
+
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self._instance_material_buffer)
+        gl.glEnableVertexAttribArray(9)
+        gl.glVertexAttribDivisor(9, 1)
+        gl.glVertexAttribPointer(
+            9, 4, gl.GL_FLOAT, gl.GL_FALSE,
+            VEC4_STRIDE, ctypes.c_void_p(first*VEC4_STRIDE)
+        )
+
+
+        # Optional: restore binding to zero so later client code doesn’t
+        #           assume anything about GL_ARRAY_BUFFER.
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, 0)
+
 
     def _render_scene_tiled(self):
         gl = OpenGLRenderer.gl
