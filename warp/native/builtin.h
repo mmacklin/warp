@@ -197,19 +197,19 @@ CUDA_CALLABLE inline float half_to_float(half h)
 
 #else  // Native C++ for Warp builtins outside of kernels
 
-extern "C" WP_API uint16_t float_to_half_bits(float x);
-extern "C" WP_API float half_bits_to_float(uint16_t u);
+extern "C" WP_API uint16_t wp_float_to_half_bits(float x);
+extern "C" WP_API float wp_half_bits_to_float(uint16_t u);
 
 inline half float_to_half(float x)
 {
     half h;
-    h.u = float_to_half_bits(x);
+    h.u = wp_float_to_half_bits(x);
     return h;
 }
 
 inline float half_to_float(half h)
 {
-   return half_bits_to_float(h.u);
+   return wp_half_bits_to_float(h.u);
 }
 
 #endif
@@ -268,16 +268,20 @@ inline CUDA_CALLABLE half operator / (half a,half b)
 
 
 template <typename T>
-CUDA_CALLABLE float cast_float(T x) { return (float)(x); }
+CUDA_CALLABLE inline float cast_float(T x) { return (float)(x); }
 
 template <typename T>
-CUDA_CALLABLE int cast_int(T x) { return (int)(x); }
+CUDA_CALLABLE inline int cast_int(T x) { return (int)(x); }
 
 template <typename T>
-CUDA_CALLABLE void adj_cast_float(T x, T& adj_x, float adj_ret) { adj_x += T(adj_ret); }
+CUDA_CALLABLE inline void adj_cast_float(T x, T& adj_x, float adj_ret) {}
+
+CUDA_CALLABLE inline void adj_cast_float(float16 x, float16& adj_x, float adj_ret) { adj_x += float16(adj_ret); }
+CUDA_CALLABLE inline void adj_cast_float(float32 x, float32& adj_x, float adj_ret) { adj_x += float32(adj_ret); }
+CUDA_CALLABLE inline void adj_cast_float(float64 x, float64& adj_x, float adj_ret) { adj_x += float64(adj_ret); }
 
 template <typename T>
-CUDA_CALLABLE void adj_cast_int(T x, T& adj_x, int adj_ret) { adj_x += adj_ret; }
+CUDA_CALLABLE inline void adj_cast_int(T x, T& adj_x, int adj_ret) {}
 
 template <typename T>
 CUDA_CALLABLE inline void adj_int8(T, T&, int8) {}
@@ -1271,6 +1275,83 @@ inline CUDA_CALLABLE_DEVICE void tid(int& i, int& j, int& k, int& l, size_t inde
     j = c.j;
     k = c.k;
     l = c.l;
+}
+
+// should match types.py
+constexpr int SLICE_BEGIN = (1U << (sizeof(int) - 1)) - 1; // std::numeric_limits<int>::max()
+constexpr int SLICE_END = -(1U << (sizeof(int) - 1)); // std::numeric_limits<int>::min()
+
+struct slice_t
+{
+    int start;
+    int stop;
+    int step;
+
+    CUDA_CALLABLE inline slice_t()
+        : start(SLICE_BEGIN), stop(SLICE_END), step(1)
+    {}
+
+    CUDA_CALLABLE inline slice_t(int start, int stop, int step)
+        : start(start), stop(stop), step(step)
+    {}
+};
+
+CUDA_CALLABLE inline slice_t slice_adjust_indices(const slice_t& slice, int length)
+{
+#ifndef NDEBUG
+    if (slice.step == 0)
+    {
+        printf("%s:%d slice step cannot be 0\n", __FILE__, __LINE__);
+        assert(0);
+    }
+#endif
+
+    int start, stop;
+
+    if (slice.start == SLICE_BEGIN)
+    {
+        start = slice.step < 0 ? length - 1 : 0;
+    }
+    else
+    {
+        start = min(max(slice.start, -length), length);
+        start = start < 0 ? start + length : start;
+    }
+
+    if (slice.stop == SLICE_END)
+    {
+        stop = slice.step < 0 ? -1 : length;
+    }
+    else
+    {
+        stop = min(max(slice.stop, -length), length);
+        stop = stop < 0 ? stop + length : stop;
+    }
+
+    return {start, stop, slice.step};
+}
+
+CUDA_CALLABLE inline int slice_get_length(const slice_t& slice)
+{
+#ifndef NDEBUG
+    if (slice.step == 0)
+    {
+        printf("%s:%d slice step cannot be 0\n", __FILE__, __LINE__);
+        assert(0);
+    }
+#endif
+
+    if (slice.step > 0 && slice.start < slice.stop)
+    {
+        return 1 + (slice.stop - slice.start - 1) / slice.step;
+    }
+
+    if (slice.step < 0 && slice.start > slice.stop)
+    {
+        return 1 + (slice.start - slice.stop - 1) / (-slice.step);
+    }
+
+    return 0;
 }
 
 template<typename T>

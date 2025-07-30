@@ -131,16 +131,16 @@ def array_scan(in_array, out_array, inclusive=True):
 
     if in_array.device.is_cpu:
         if in_array.dtype == wp.int32:
-            runtime.core.array_scan_int_host(in_array.ptr, out_array.ptr, in_array.size, inclusive)
+            runtime.core.wp_array_scan_int_host(in_array.ptr, out_array.ptr, in_array.size, inclusive)
         elif in_array.dtype == wp.float32:
-            runtime.core.array_scan_float_host(in_array.ptr, out_array.ptr, in_array.size, inclusive)
+            runtime.core.wp_array_scan_float_host(in_array.ptr, out_array.ptr, in_array.size, inclusive)
         else:
             raise RuntimeError(f"Unsupported data type: {type_repr(in_array.dtype)}")
     elif in_array.device.is_cuda:
         if in_array.dtype == wp.int32:
-            runtime.core.array_scan_int_device(in_array.ptr, out_array.ptr, in_array.size, inclusive)
+            runtime.core.wp_array_scan_int_device(in_array.ptr, out_array.ptr, in_array.size, inclusive)
         elif in_array.dtype == wp.float32:
-            runtime.core.array_scan_float_device(in_array.ptr, out_array.ptr, in_array.size, inclusive)
+            runtime.core.wp_array_scan_float_device(in_array.ptr, out_array.ptr, in_array.size, inclusive)
         else:
             raise RuntimeError(f"Unsupported data type: {type_repr(in_array.dtype)}")
 
@@ -173,22 +173,22 @@ def radix_sort_pairs(keys, values, count: int):
 
     if keys.device.is_cpu:
         if keys.dtype == wp.int32 and values.dtype == wp.int32:
-            runtime.core.radix_sort_pairs_int_host(keys.ptr, values.ptr, count)
+            runtime.core.wp_radix_sort_pairs_int_host(keys.ptr, values.ptr, count)
         elif keys.dtype == wp.float32 and values.dtype == wp.int32:
-            runtime.core.radix_sort_pairs_float_host(keys.ptr, values.ptr, count)
+            runtime.core.wp_radix_sort_pairs_float_host(keys.ptr, values.ptr, count)
         elif keys.dtype == wp.int64 and values.dtype == wp.int32:
-            runtime.core.radix_sort_pairs_int64_host(keys.ptr, values.ptr, count)
+            runtime.core.wp_radix_sort_pairs_int64_host(keys.ptr, values.ptr, count)
         else:
             raise RuntimeError(
                 f"Unsupported keys and values data types: {type_repr(keys.dtype)}, {type_repr(values.dtype)}"
             )
     elif keys.device.is_cuda:
         if keys.dtype == wp.int32 and values.dtype == wp.int32:
-            runtime.core.radix_sort_pairs_int_device(keys.ptr, values.ptr, count)
+            runtime.core.wp_radix_sort_pairs_int_device(keys.ptr, values.ptr, count)
         elif keys.dtype == wp.float32 and values.dtype == wp.int32:
-            runtime.core.radix_sort_pairs_float_device(keys.ptr, values.ptr, count)
+            runtime.core.wp_radix_sort_pairs_float_device(keys.ptr, values.ptr, count)
         elif keys.dtype == wp.int64 and values.dtype == wp.int32:
-            runtime.core.radix_sort_pairs_int64_device(keys.ptr, values.ptr, count)
+            runtime.core.wp_radix_sort_pairs_int64_device(keys.ptr, values.ptr, count)
         else:
             raise RuntimeError(
                 f"Unsupported keys and values data types: {type_repr(keys.dtype)}, {type_repr(values.dtype)}"
@@ -256,7 +256,7 @@ def segmented_sort_pairs(
 
     if keys.device.is_cpu:
         if keys.dtype == wp.int32 and values.dtype == wp.int32:
-            runtime.core.segmented_sort_pairs_int_host(
+            runtime.core.wp_segmented_sort_pairs_int_host(
                 keys.ptr,
                 values.ptr,
                 count,
@@ -265,7 +265,7 @@ def segmented_sort_pairs(
                 num_segments,
             )
         elif keys.dtype == wp.float32 and values.dtype == wp.int32:
-            runtime.core.segmented_sort_pairs_float_host(
+            runtime.core.wp_segmented_sort_pairs_float_host(
                 keys.ptr,
                 values.ptr,
                 count,
@@ -277,7 +277,7 @@ def segmented_sort_pairs(
             raise RuntimeError(f"Unsupported data type: {type_repr(keys.dtype)}")
     elif keys.device.is_cuda:
         if keys.dtype == wp.int32 and values.dtype == wp.int32:
-            runtime.core.segmented_sort_pairs_int_device(
+            runtime.core.wp_segmented_sort_pairs_int_device(
                 keys.ptr,
                 values.ptr,
                 count,
@@ -286,7 +286,7 @@ def segmented_sort_pairs(
                 num_segments,
             )
         elif keys.dtype == wp.float32 and values.dtype == wp.int32:
-            runtime.core.segmented_sort_pairs_float_device(
+            runtime.core.wp_segmented_sort_pairs_float_device(
                 keys.ptr,
                 values.ptr,
                 count,
@@ -356,14 +356,14 @@ def runlength_encode(values, run_values, run_lengths, run_count=None, value_coun
 
     if values.device.is_cpu:
         if values.dtype == wp.int32:
-            runtime.core.runlength_encode_int_host(
+            runtime.core.wp_runlength_encode_int_host(
                 values.ptr, run_values.ptr, run_lengths.ptr, run_count.ptr, value_count
             )
         else:
             raise RuntimeError(f"Unsupported data type: {type_repr(values.dtype)}")
     elif values.device.is_cuda:
         if values.dtype == wp.int32:
-            runtime.core.runlength_encode_int_device(
+            runtime.core.wp_runlength_encode_int_device(
                 values.ptr, run_values.ptr, run_lengths.ptr, run_count.ptr, value_count
             )
         else:
@@ -435,16 +435,16 @@ def array_sum(values, out=None, value_count=None, axis=None):
 
     if values.device.is_cpu:
         if scalar_type == wp.float32:
-            native_func = runtime.core.array_sum_float_host
+            native_func = runtime.core.wp_array_sum_float_host
         elif scalar_type == wp.float64:
-            native_func = runtime.core.array_sum_double_host
+            native_func = runtime.core.wp_array_sum_double_host
         else:
             raise RuntimeError(f"Unsupported data type: {type_repr(values.dtype)}")
     elif values.device.is_cuda:
         if scalar_type == wp.float32:
-            native_func = runtime.core.array_sum_float_device
+            native_func = runtime.core.wp_array_sum_float_device
         elif scalar_type == wp.float64:
-            native_func = runtime.core.array_sum_double_device
+            native_func = runtime.core.wp_array_sum_double_device
         else:
             raise RuntimeError(f"Unsupported data type: {type_repr(values.dtype)}")
 
@@ -543,16 +543,16 @@ def array_inner(a, b, out=None, count=None, axis=None):
 
     if a.device.is_cpu:
         if scalar_type == wp.float32:
-            native_func = runtime.core.array_inner_float_host
+            native_func = runtime.core.wp_array_inner_float_host
         elif scalar_type == wp.float64:
-            native_func = runtime.core.array_inner_double_host
+            native_func = runtime.core.wp_array_inner_double_host
         else:
             raise RuntimeError(f"Unsupported data type: {type_repr(a.dtype)}")
     elif a.device.is_cuda:
         if scalar_type == wp.float32:
-            native_func = runtime.core.array_inner_float_device
+            native_func = runtime.core.wp_array_inner_float_device
         elif scalar_type == wp.float64:
-            native_func = runtime.core.array_inner_double_device
+            native_func = runtime.core.wp_array_inner_double_device
         else:
             raise RuntimeError(f"Unsupported data type: {type_repr(a.dtype)}")
 
@@ -914,7 +914,6 @@ def map(
 
     module = None
     out_dtypes = None
-    skip_arg_type_checks = False
     if isinstance(func, wp.Function):
         func_name = func.key
         wp_func = func
@@ -924,72 +923,50 @@ def map(
             raise TypeError("func must be a callable function or a warp.Function")
         wp_func, module = create_warp_function(func)
         func_name = wp_func.key
-        # we created a generic function here (arg types are all Any)
-        skip_arg_type_checks = True
     if module is None:
         module = warp.context.get_module(f"map_{func_name}")
 
     arg_names = list(wp_func.input_types.keys())
-    # determine output dtype
-    if wp_func.value_func is not None or wp_func.value_type is not None:
-        arg_types = {}
-        arg_values = {}
-        for i, arg_name in enumerate(arg_names):
-            if is_array(inputs[i]):
-                # we will pass an element of the array to the function
-                arg_types[arg_name] = inputs[i].dtype
-                if device is None:
-                    device = inputs[i].device
-            else:
-                # we pass the input value directly to the function
-                arg_types[arg_name] = get_warp_type(inputs[i])
-        func_or_none = wp_func.get_overload(list(arg_types.values()), {})
-        if func_or_none is None:
-            raise TypeError(
-                f"Function {func_name} does not support the provided argument types {', '.join(type_repr(t) for t in arg_types.values())}"
-            )
-        func = func_or_none
-        if func.value_func is not None:
-            out_dtype = func.value_func(arg_types, arg_values)
-        else:
-            out_dtype = func.value_type
-        if isinstance(out_dtype, tuple) or isinstance(out_dtype, list):
-            out_dtypes = out_dtype
-        else:
-            out_dtypes = (out_dtype,)
-    else:
-        # try to evaluate the function to determine the output type
-        args = []
-        arg_types = wp_func.input_types
-        if len(inputs) != len(arg_types):
-            raise TypeError(
-                f"Number of input arguments ({len(inputs)}) does not match expected number of function arguments ({len(arg_types)})"
-            )
-        for (arg_name, arg_type), input in zip(arg_types.items(), inputs):
-            if is_array(input):
-                if not skip_arg_type_checks and not types_equal(input.dtype, arg_type):
-                    raise TypeError(
-                        f'Incorrect input provided for argument "{arg_name}": received array of dtype {type_repr(input.dtype)}, expected {type_repr(arg_type)}'
-                    )
-                args.append(input.dtype())
-                if device is None:
-                    device = input.device
-            else:
-                if not skip_arg_type_checks and not types_equal(type(input), arg_type):
-                    raise TypeError(
-                        f'Incorrect input provided for argument "{arg_name}": received {type_repr(type(input))}, expected {type_repr(arg_type)}'
-                    )
-                args.append(input)
-        result = wp_func(*args)
-        if result is None:
-            raise TypeError("The provided function must return a value")
-        if isinstance(result, tuple) or isinstance(result, list):
-            out_dtypes = tuple(get_warp_type(r) for r in result)
-        else:
-            out_dtypes = (get_warp_type(result),)
 
-    if out_dtypes is None:
-        raise TypeError("Could not determine the output type of the function, make sure it returns a value")
+    if len(inputs) != len(arg_names):
+        raise TypeError(
+            f"Number of input arguments ({len(inputs)}) does not match expected number of function arguments ({len(arg_names)})"
+        )
+
+    # determine output dtype
+    arg_types = {}
+    arg_values = {}
+    for i, arg_name in enumerate(arg_names):
+        if is_array(inputs[i]):
+            # we will pass an element of the array to the function
+            arg_types[arg_name] = inputs[i].dtype
+            if device is None:
+                device = inputs[i].device
+        else:
+            # we pass the input value directly to the function
+            arg_types[arg_name] = get_warp_type(inputs[i])
+    func_or_none = wp_func.get_overload(list(arg_types.values()), {})
+    if func_or_none is None:
+        raise TypeError(
+            f"Function {func_name} does not support the provided argument types {', '.join(type_repr(t) for t in arg_types.values())}"
+        )
+    func = func_or_none
+
+    if func.value_type is not None:
+        out_dtype = func.value_type
+    elif func.value_func is not None:
+        out_dtype = func.value_func(arg_types, arg_values)
+    else:
+        func.build(None)
+        out_dtype = func.value_func(arg_types, arg_values)
+
+    if out_dtype is None:
+        raise TypeError("The provided function must return a value")
+
+    if isinstance(out_dtype, tuple) or isinstance(out_dtype, list):
+        out_dtypes = out_dtype
+    else:
+        out_dtypes = (out_dtype,)
 
     if out is None:
         requires_grad = any(getattr(a, "requires_grad", False) for a in inputs if is_array(a))
@@ -1583,7 +1560,7 @@ def timing_begin(cuda_filter: int = TIMING_ALL, synchronize: bool = True) -> Non
     if synchronize:
         warp.synchronize()
 
-    warp.context.runtime.core.cuda_timing_begin(cuda_filter)
+    warp.context.runtime.core.wp_cuda_timing_begin(cuda_filter)
 
 
 def timing_end(synchronize: bool = True) -> list[TimingResult]:
@@ -1600,11 +1577,11 @@ def timing_end(synchronize: bool = True) -> list[TimingResult]:
         warp.synchronize()
 
     # get result count
-    count = warp.context.runtime.core.cuda_timing_get_result_count()
+    count = warp.context.runtime.core.wp_cuda_timing_get_result_count()
 
     # get result array from C++
     result_buffer = (timing_result_t * count)()
-    warp.context.runtime.core.cuda_timing_end(ctypes.byref(result_buffer), count)
+    warp.context.runtime.core.wp_cuda_timing_end(ctypes.byref(result_buffer), count)
 
     # prepare Python result list
     results = []

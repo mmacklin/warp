@@ -2416,7 +2416,7 @@ Tile Primitives
 
     :param op: A callable function that accepts one argument and returns one argument, may be a user function or builtin
     :param a: The input tile, the operator (or one of its overloads) must be able to accept the tile's data type
-    :returns: A tile with the same dimensions and data type as the input tile.
+    :returns: A tile with the same dimensions as the input tile. Its datatype is specified by the return type of op
 
     Example:
 
@@ -2453,12 +2453,12 @@ Tile Primitives
     Apply a binary function onto the tile.
 
     This function cooperatively applies a binary function to each element of the tiles using all threads in the block.
-    Both input tiles must have the same dimensions and datatype.
+    Both input tiles must have the same dimensions, and if using a builtin op, the same datatypes.
 
     :param op: A callable function that accepts two arguments and returns one argument, all of the same type, may be a user function or builtin
     :param a: The first input tile, the operator (or one of its overloads) must be able to accept the tile's dtype
     :param b: The second input tile, the operator (or one of its overloads) must be able to accept the tile's dtype
-    :returns: A tile with the same dimensions and datatype as the input tiles.
+    :returns: A tile with the same dimensions as the input tiles. Its datatype is specified by the return type of op
 
     Example:
 
@@ -2593,13 +2593,16 @@ Tile Primitives
     Compute the Cholesky factorization L of a matrix A.
     L is lower triangular and satisfies LL^T = A.
 
+    Only the lower triangular portion of A is used for the decomposition;
+    the upper triangular part may be left unspecified.
+
     Note that computing the adjoint is not yet supported.
 
     Supported datatypes are:
         * float32
         * float64
 
-    :param A: A square, symmetric positive-definite, matrix.
+    :param A: A square, symmetric positive-definite, matrix. Only the lower triangular part of A is needed; the upper part is ignored.
     :returns L: A square, lower triangular, matrix, such that LL^T = A
 
 
@@ -5509,6 +5512,30 @@ Operators
        * Differentiable
 
 
+.. py:function:: add(a: Vector[Any,Scalar], b: Scalar) -> Vector[Any,Scalar]
+    :noindex:
+    :nocontentsentry:
+
+    .. hlist::
+       :columns: 8
+
+       * Kernel
+       * Python
+       * Differentiable
+
+
+.. py:function:: add(a: Scalar, b: Vector[Any,Scalar]) -> Vector[Any,Scalar]
+    :noindex:
+    :nocontentsentry:
+
+    .. hlist::
+       :columns: 8
+
+       * Kernel
+       * Python
+       * Differentiable
+
+
 .. py:function:: add(a: Quaternion[Scalar], b: Quaternion[Scalar]) -> Quaternion[Scalar]
     :noindex:
     :nocontentsentry:
@@ -5522,6 +5549,30 @@ Operators
 
 
 .. py:function:: add(a: Matrix[Any,Any,Scalar], b: Matrix[Any,Any,Scalar]) -> Matrix[Any,Any,Scalar]
+    :noindex:
+    :nocontentsentry:
+
+    .. hlist::
+       :columns: 8
+
+       * Kernel
+       * Python
+       * Differentiable
+
+
+.. py:function:: add(a: Matrix[Any,Any,Scalar], b: Scalar) -> Matrix[Any,Any,Scalar]
+    :noindex:
+    :nocontentsentry:
+
+    .. hlist::
+       :columns: 8
+
+       * Kernel
+       * Python
+       * Differentiable
+
+
+.. py:function:: add(a: Scalar, b: Matrix[Any,Any,Scalar]) -> Matrix[Any,Any,Scalar]
     :noindex:
     :nocontentsentry:
 
@@ -5581,7 +5632,55 @@ Operators
        * Differentiable
 
 
+.. py:function:: sub(a: Vector[Any,Scalar], b: Scalar) -> Vector[Any,Scalar]
+    :noindex:
+    :nocontentsentry:
+
+    .. hlist::
+       :columns: 8
+
+       * Kernel
+       * Python
+       * Differentiable
+
+
+.. py:function:: sub(a: Scalar, b: Vector[Any,Scalar]) -> Vector[Any,Scalar]
+    :noindex:
+    :nocontentsentry:
+
+    .. hlist::
+       :columns: 8
+
+       * Kernel
+       * Python
+       * Differentiable
+
+
 .. py:function:: sub(a: Matrix[Any,Any,Scalar], b: Matrix[Any,Any,Scalar]) -> Matrix[Any,Any,Scalar]
+    :noindex:
+    :nocontentsentry:
+
+    .. hlist::
+       :columns: 8
+
+       * Kernel
+       * Python
+       * Differentiable
+
+
+.. py:function:: sub(a: Matrix[Any,Any,Scalar], b: Scalar) -> Matrix[Any,Any,Scalar]
+    :noindex:
+    :nocontentsentry:
+
+    .. hlist::
+       :columns: 8
+
+       * Kernel
+       * Python
+       * Differentiable
+
+
+.. py:function:: sub(a: Scalar, b: Matrix[Any,Any,Scalar]) -> Matrix[Any,Any,Scalar]
     :noindex:
     :nocontentsentry:
 
@@ -5837,7 +5936,7 @@ Operators
     Modulo operation using truncated division.
 
 
-.. py:function:: mod(a: Vector[Any,Scalar], b: Vector[Any,Scalar]) -> Scalar
+.. py:function:: mod(a: Vector[Any,Scalar], b: Vector[Any,Scalar]) -> Vector[Any,Scalar]
     :noindex:
     :nocontentsentry:
 
@@ -5849,6 +5948,30 @@ Operators
        * Differentiable
 
     Modulo operation using truncated division.
+
+
+.. py:function:: mod(a: Vector[Any,Scalar], b: Scalar) -> Vector[Any,Scalar]
+    :noindex:
+    :nocontentsentry:
+
+    .. hlist::
+       :columns: 8
+
+       * Kernel
+       * Python
+       * Differentiable
+
+
+.. py:function:: mod(a: Matrix[Any,Any,Scalar], b: Scalar) -> Matrix[Any,Any,Scalar]
+    :noindex:
+    :nocontentsentry:
+
+    .. hlist::
+       :columns: 8
+
+       * Kernel
+       * Python
+       * Differentiable
 
 
 .. py:function:: div(a: Scalar, b: Scalar) -> Scalar

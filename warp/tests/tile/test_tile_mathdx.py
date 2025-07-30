@@ -21,7 +21,7 @@ import numpy as np
 import warp as wp
 from warp.tests.unittest_utils import *
 
-wp.init()  # For wp.context.runtime.core.is_mathdx_enabled()
+wp.init()  # For wp.context.runtime.core.wp_is_mathdx_enabled()
 
 TILE_M = wp.constant(8)
 TILE_N = wp.constant(4)
@@ -45,7 +45,9 @@ def tile_math_matmul_kernel(
     wp.tile_store(gc, c, offset=(i * TILE_M, j * TILE_N))
 
 
-@unittest.skipUnless(wp.context.runtime.core.cuda_toolkit_version() >= 12060, "CUDA toolkit version is less than 12.6")
+@unittest.skipUnless(
+    wp.context.runtime.core.wp_cuda_toolkit_version() >= 12060, "CUDA toolkit version is less than 12.6"
+)
 def test_tile_math_matmul(test, device):
     rng = np.random.default_rng(42)
 
@@ -93,7 +95,7 @@ def tile_math_fft_kernel_vec2d(gx: wp.array2d(dtype=wp.vec2d), gy: wp.array2d(dt
     wp.tile_store(gy, xy)
 
 
-@unittest.skipUnless(wp.context.runtime.core.is_mathdx_enabled(), "Warp was not built with MathDx support")
+@unittest.skipUnless(wp.context.runtime.core.wp_is_mathdx_enabled(), "Warp was not built with MathDx support")
 def test_tile_math_fft(test, device, wp_dtype):
     np_real_dtype = {wp.vec2f: np.float32, wp.vec2d: np.float64}[wp_dtype]
     np_cplx_dtype = {wp.vec2f: np.complex64, wp.vec2d: np.complex128}[wp_dtype]
@@ -149,7 +151,9 @@ def tile_math_cholesky(
     wp.tile_store(gx, x)
 
 
-@unittest.skipUnless(wp.context.runtime.core.cuda_toolkit_version() >= 12060, "CUDA toolkit version is less than 12.6")
+@unittest.skipUnless(
+    wp.context.runtime.core.wp_cuda_toolkit_version() >= 12060, "CUDA toolkit version is less than 12.6"
+)
 def test_tile_math_cholesky(test, device):
     A_h = np.ones((TILE_M, TILE_M), dtype=np.float64)
     D_h = 8.0 * np.ones(TILE_M, dtype=np.float64)
@@ -208,7 +212,9 @@ def tile_math_cholesky_multiple_rhs(
     wp.tile_store(gz, z)
 
 
-@unittest.skipUnless(wp.context.runtime.core.cuda_toolkit_version() >= 12060, "CUDA toolkit version is less than 12.6")
+@unittest.skipUnless(
+    wp.context.runtime.core.wp_cuda_toolkit_version() >= 12060, "CUDA toolkit version is less than 12.6"
+)
 def test_tile_math_cholesky_multiple_rhs(test, device):
     A_h = np.ones((TILE_M, TILE_M), dtype=np.float64)
     D_h = 8.0 * np.ones(TILE_M, dtype=np.float64)
@@ -260,10 +266,12 @@ def tile_math_forward_substitution(
     wp.tile_store(gz, z)
 
 
-@unittest.skipUnless(wp.context.runtime.core.cuda_toolkit_version() >= 12060, "CUDA toolkit version is less than 12.6")
+@unittest.skipUnless(
+    wp.context.runtime.core.wp_cuda_toolkit_version() >= 12060, "CUDA toolkit version is less than 12.6"
+)
 def test_tile_math_forward_substitution(test, device):
     # Create test data
-    rng = np.random.default_rng()
+    rng = np.random.default_rng(42)
     L_h = np.triu(rng.random((TILE_M, TILE_M)))  # Upper triangular matrix
     x_h = rng.random(TILE_M)
     z_h = np.zeros_like(x_h)
@@ -303,10 +311,12 @@ def tile_math_back_substitution(
     wp.tile_store(gz, z)
 
 
-@unittest.skipUnless(wp.context.runtime.core.cuda_toolkit_version() >= 12060, "CUDA toolkit version is less than 12.6")
+@unittest.skipUnless(
+    wp.context.runtime.core.wp_cuda_toolkit_version() >= 12060, "CUDA toolkit version is less than 12.6"
+)
 def test_tile_math_back_substitution(test, device):
     # Create test data
-    rng = np.random.default_rng()
+    rng = np.random.default_rng(42)
     L_h = np.tril(rng.random((TILE_M, TILE_M)))  # Lower triangular matrix
     x_h = rng.random(TILE_M)
     z_h = np.zeros_like(x_h)
@@ -352,10 +362,12 @@ def tile_math_forward_substitution_multiple_rhs(
     wp.tile_store(gc, c)
 
 
-@unittest.skipUnless(wp.context.runtime.core.cuda_toolkit_version() >= 12060, "CUDA toolkit version is less than 12.6")
+@unittest.skipUnless(
+    wp.context.runtime.core.wp_cuda_toolkit_version() >= 12060, "CUDA toolkit version is less than 12.6"
+)
 def test_tile_math_forward_substitution_multiple_rhs(test, device):
     # Create test data
-    rng = np.random.default_rng()
+    rng = np.random.default_rng(42)
     L_h = np.tril(rng.random((TILE_M, TILE_M)))  # Lower triangular matrix
     x_h = rng.random((TILE_M, TILE_M))  # Multiple right-hand sides
     z_h = np.zeros_like(x_h)
@@ -409,10 +421,12 @@ def tile_math_back_substitution_multiple_rhs(
     wp.tile_store(gc, c)
 
 
-@unittest.skipUnless(wp.context.runtime.core.cuda_toolkit_version() >= 12060, "CUDA toolkit version is less than 12.6")
+@unittest.skipUnless(
+    wp.context.runtime.core.wp_cuda_toolkit_version() >= 12060, "CUDA toolkit version is less than 12.6"
+)
 def test_tile_math_back_substitution_multiple_rhs(test, device):
     # Create test data
-    rng = np.random.default_rng()
+    rng = np.random.default_rng(42)
     L_h = np.tril(rng.random((TILE_M, TILE_M)))  # Lower triangular matrix
     x_h = rng.random((TILE_M, TILE_M))  # Multiple right-hand sides
     z_h = np.zeros_like(x_h)
@@ -446,11 +460,13 @@ def test_tile_math_back_substitution_multiple_rhs(test, device):
 
 
 # tests a complex composition of most libmathdx calls
-@unittest.skipUnless(wp.context.runtime.core.cuda_toolkit_version() >= 12060, "CUDA toolkit version is less than 12.6")
+@unittest.skipUnless(
+    wp.context.runtime.core.wp_cuda_toolkit_version() >= 12060, "CUDA toolkit version is less than 12.6"
+)
 def test_tile_math_block_cholesky(test, device):
     BLOCK_SIZE = wp.constant(TILE_M // 2)
 
-    @wp.kernel
+    @wp.kernel(module="unique")
     def block_cholesky_kernel(
         A: wp.array2d(dtype=float),
         L: wp.array2d(dtype=float),
@@ -496,7 +512,7 @@ def test_tile_math_block_cholesky(test, device):
 
                 wp.tile_store(L, sol_tile, offset=(i, k))
 
-    @wp.kernel
+    @wp.kernel(module="unique")
     def block_cholesky_solve_kernel(
         L: wp.array2d(dtype=float),
         b: wp.array2d(dtype=float),
@@ -590,9 +606,11 @@ def test_tile_upper_solve(L: wp.array2d(dtype=float), y: wp.array(dtype=float), 
     wp.tile_store(x, sol)
 
 
-@unittest.skipUnless(wp.context.runtime.core.cuda_toolkit_version() >= 12060, "CUDA toolkit version is less than 12.6")
+@unittest.skipUnless(
+    wp.context.runtime.core.wp_cuda_toolkit_version() >= 12060, "CUDA toolkit version is less than 12.6"
+)
 def test_tile_math_singular_matrices(test, device):
-    rng = np.random.default_rng()
+    rng = np.random.default_rng(42)
     L_np = np.tril(rng.random((TILE_M, TILE_M)))  # Lower triangular matrix
     L_np[-1, -1] = 0.0  # Make it singular
     y_np = rng.random(TILE_M)

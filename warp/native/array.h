@@ -161,7 +161,7 @@ inline CUDA_CALLABLE void print(shape_t s)
     // should probably store ndim with shape
     printf("(%d, %d, %d, %d)\n", s.dims[0], s.dims[1], s.dims[2], s.dims[3]);
 }
-inline CUDA_CALLABLE void adj_print(shape_t s, shape_t& shape_t) {}
+inline CUDA_CALLABLE void adj_print(shape_t s, shape_t& adj_s) {}
 
 
 template <typename T>
@@ -250,6 +250,89 @@ struct array_t
 
     CUDA_CALLABLE inline operator T*() const { return data; }
 };
+
+
+// Required when compiling adjoints.
+template <typename T>
+inline CUDA_CALLABLE array_t<T> add(
+    const array_t<T>& a, const array_t<T>& b
+)
+{
+    return array_t<T>();
+}
+
+
+// Stack‑allocated counterpart to `array_t<T>`.
+// Useful for small buffers that have their shape known at compile-time,
+// and that gain from having array semantics instead of vectors.
+template <int Size, typename T>
+struct fixedarray_t : array_t<T>
+{
+    using Base = array_t<T>;
+
+    static_assert(Size > 0, "Expected Size > 0");
+
+    CUDA_CALLABLE inline fixedarray_t()
+        : Base(storage, Size), storage()
+    {}
+
+    CUDA_CALLABLE fixedarray_t(int dim0, T* grad=nullptr)
+        : Base(storage, dim0, grad), storage()
+    {
+        assert(Size == dim0);
+    }
+
+    CUDA_CALLABLE fixedarray_t(int dim0, int dim1, T* grad=nullptr)
+        : Base(storage, dim0, dim1, grad), storage()
+    {
+        assert(Size == dim0 * dim1);
+    }
+
+    CUDA_CALLABLE fixedarray_t(int dim0, int dim1, int dim2, T* grad=nullptr)
+        : Base(storage, dim0, dim1, dim2, grad), storage()
+    {
+        assert(Size == dim0 * dim1 * dim2);
+    }
+
+    CUDA_CALLABLE fixedarray_t(int dim0, int dim1, int dim2, int dim3, T* grad=nullptr)
+        : Base(storage, dim0, dim1, dim2, dim3, grad), storage()
+    {
+        assert(Size == dim0 * dim1 * dim2 * dim3);
+    }
+
+    CUDA_CALLABLE fixedarray_t<Size, T>& operator=(const fixedarray_t<Size, T>& other)
+    {
+        for (unsigned int i = 0; i < Size; ++i)
+        {
+            this->storage[i] = other.storage[i];
+        }
+
+        this->data = this->storage;
+        this->grad = nullptr;
+        this->shape = other.shape;
+
+        for (unsigned int i = 0; i < ARRAY_MAX_DIMS; ++i)
+        {
+            this->strides[i] = other.strides[i];
+        }
+
+        this->ndim = other.ndim;
+
+        return *this;
+    }
+
+    T storage[Size];
+};
+
+
+// Required when compiling adjoints.
+template <int Size, typename T>
+inline CUDA_CALLABLE fixedarray_t<Size, T> add(
+    const fixedarray_t<Size, T>& a, const fixedarray_t<Size, T>& b
+)
+{
+    return fixedarray_t<Size, T>();
+}
 
 
 // TODO:
@@ -665,11 +748,11 @@ CUDA_CALLABLE inline indexedarray_t<T> view(indexedarray_t<T>& src, int i, int j
 }
 
 template<template<typename> class A1, template<typename> class A2, template<typename> class A3, typename T>
-inline CUDA_CALLABLE void adj_view(A1<T>& src, int i, A2<T>& adj_src, int adj_i, A3<T> adj_ret) {}
+inline CUDA_CALLABLE void adj_view(A1<T>& src, int i, A2<T>& adj_src, int adj_i, A3<T>& adj_ret) {}
 template<template<typename> class A1, template<typename> class A2, template<typename> class A3, typename T>
-inline CUDA_CALLABLE void adj_view(A1<T>& src, int i, int j, A2<T>& adj_src, int adj_i, int adj_j, A3<T> adj_ret) {}
+inline CUDA_CALLABLE void adj_view(A1<T>& src, int i, int j, A2<T>& adj_src, int adj_i, int adj_j, A3<T>& adj_ret) {}
 template<template<typename> class A1, template<typename> class A2, template<typename> class A3, typename T>
-inline CUDA_CALLABLE void adj_view(A1<T>& src, int i, int j, int k, A2<T>& adj_src, int adj_i, int adj_j, int adj_k, A3<T> adj_ret) {}
+inline CUDA_CALLABLE void adj_view(A1<T>& src, int i, int j, int k, A2<T>& adj_src, int adj_i, int adj_j, int adj_k, A3<T>& adj_ret) {}
 
 // TODO: lower_bound() for indexed arrays?
 

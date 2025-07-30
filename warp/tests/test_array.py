@@ -2902,10 +2902,8 @@ def test_direct_from_numpy(test, device):
 
 
 @wp.kernel
-def kernel_array_from_ptr(
-    ptr: wp.uint64,
-):
-    arr = wp.array(ptr=ptr, shape=(2, 3), dtype=wp.float32)
+def kernel_array_from_ptr(arr_orig: wp.array2d(dtype=wp.float32)):
+    arr = wp.array(ptr=arr_orig.ptr, shape=(2, 3), dtype=wp.float32)
     arr[0, 0] = 1.0
     arr[0, 1] = 2.0
     arr[0, 2] = 3.0
@@ -2913,7 +2911,56 @@ def kernel_array_from_ptr(
 
 def test_kernel_array_from_ptr(test, device):
     arr = wp.zeros(shape=(2, 3), dtype=wp.float32, device=device)
-    wp.launch(kernel_array_from_ptr, dim=(1,), inputs=(arr.ptr,), device=device)
+    wp.launch(kernel_array_from_ptr, dim=(1,), inputs=(arr,), device=device)
+    assert_np_equal(arr.numpy(), np.array(((1.0, 2.0, 3.0), (0.0, 0.0, 0.0))))
+
+
+@wp.struct
+class MyStruct:
+    a: wp.float32
+    b: wp.float32
+    c: wp.float32
+
+
+@wp.kernel
+def kernel_array_from_ptr_struct(arr_orig: wp.array(dtype=MyStruct)):
+    arr = wp.array(ptr=arr_orig.ptr, shape=(2,), dtype=MyStruct)
+    arr[0].a = 1.0
+    arr[0].b = 2.0
+    arr[0].c = 3.0
+    arr[1].a = 4.0
+    arr[1].b = 5.0
+    arr[1].c = 6.0
+
+
+def test_kernel_array_from_ptr_struct(test, device):
+    arr = wp.zeros(shape=(2,), dtype=MyStruct, device=device)
+    wp.launch(kernel_array_from_ptr_struct, dim=(1,), inputs=(arr,), device=device)
+    arr_np = arr.numpy()
+    expected = np.zeros_like(arr_np)
+    expected[0] = (1.0, 2.0, 3.0)
+    expected[1] = (4.0, 5.0, 6.0)
+    assert_np_equal(arr_np, expected)
+
+
+@wp.kernel
+def kernel_array_from_ptr_variable_shape(
+    ptr: wp.uint64,
+    shape_x: int,
+    shape_y: int,
+):
+    arr = wp.array(ptr=ptr, shape=(shape_x, shape_y), dtype=wp.float32)
+    arr[0, 0] = 1.0
+    arr[0, 1] = 2.0
+    if shape_y > 2:
+        arr[0, 2] = 3.0
+
+
+def test_kernel_array_from_ptr_variable_shape(test, device):
+    arr = wp.zeros(shape=(2, 3), dtype=wp.float32, device=device)
+    wp.launch(kernel_array_from_ptr_variable_shape, dim=(1,), inputs=(arr.ptr, 2, 2), device=device)
+    assert_np_equal(arr.numpy(), np.array(((1.0, 2.0, 0.0), (0.0, 0.0, 0.0))))
+    wp.launch(kernel_array_from_ptr_variable_shape, dim=(1,), inputs=(arr.ptr, 2, 3), device=device)
     assert_np_equal(arr.numpy(), np.array(((1.0, 2.0, 3.0), (0.0, 0.0, 0.0))))
 
 
@@ -3185,6 +3232,10 @@ add_function_test(TestArray, "test_array_inplace_diff_ops", test_array_inplace_d
 add_function_test(TestArray, "test_array_inplace_non_diff_ops", test_array_inplace_non_diff_ops, devices=devices)
 add_function_test(TestArray, "test_direct_from_numpy", test_direct_from_numpy, devices=["cpu"])
 add_function_test(TestArray, "test_kernel_array_from_ptr", test_kernel_array_from_ptr, devices=devices)
+add_function_test(TestArray, "test_kernel_array_from_ptr_struct", test_kernel_array_from_ptr_struct, devices=devices)
+add_function_test(
+    TestArray, "test_kernel_array_from_ptr_variable_shape", test_kernel_array_from_ptr_variable_shape, devices=devices
+)
 
 add_function_test(TestArray, "test_array_from_int32_domain", test_array_from_int32_domain, devices=devices)
 add_function_test(TestArray, "test_array_from_int64_domain", test_array_from_int64_domain, devices=devices)

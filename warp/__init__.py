@@ -19,6 +19,7 @@
 # from warp.stubs import *
 
 from warp.types import array, array1d, array2d, array3d, array4d, constant, from_ptr
+from warp.types import fixedarray
 from warp.types import indexedarray, indexedarray1d, indexedarray2d, indexedarray3d, indexedarray4d
 from warp.fabric import fabricarray, fabricarrayarray, indexedfabricarray, indexedfabricarrayarray
 from warp.types import tile
@@ -39,7 +40,7 @@ from warp.types import spatial_matrix, spatial_matrixh, spatial_matrixf, spatial
 from warp.types import Int, Float, Scalar
 
 # geometry types
-from warp.types import Bvh, Mesh, HashGrid, Volume, MarchingCubes
+from warp.types import Bvh, Mesh, HashGrid, Volume
 from warp.types import BvhQuery, HashGridQuery, MeshQueryAABB, MeshQueryPoint, MeshQueryRay
 
 # device-wide gemms
@@ -48,6 +49,8 @@ from warp.types import matmul, adj_matmul, batched_matmul, adj_batched_matmul
 # discouraged, users should use wp.types.vector, wp.types.matrix
 from warp.types import vector as vec
 from warp.types import matrix as mat
+
+from warp.types import matrix_from_cols, matrix_from_rows
 
 # numpy interop
 from warp.types import dtype_from_numpy, dtype_to_numpy
@@ -109,6 +112,8 @@ from warp.utils import (
     TIMING_ALL,
 )
 from warp.utils import map
+
+from warp.marching_cubes import MarchingCubes
 
 from warp.torch import from_torch, to_torch
 from warp.torch import dtype_from_torch, dtype_to_torch

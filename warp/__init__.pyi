@@ -37,6 +37,7 @@ IndexedFabricArray = Generic[DType]
 Tile = Generic[DType, Shape]
 
 from warp.types import array, array1d, array2d, array3d, array4d, constant, from_ptr
+from warp.types import fixedarray
 from warp.types import indexedarray, indexedarray1d, indexedarray2d, indexedarray3d, indexedarray4d
 from warp.fabric import fabricarray, fabricarrayarray, indexedfabricarray, indexedfabricarrayarray
 from warp.types import tile
@@ -55,13 +56,15 @@ from warp.types import spatial_matrix, spatial_matrixh, spatial_matrixf, spatial
 
 from warp.types import Int, Float, Scalar
 
-from warp.types import Bvh, Mesh, HashGrid, Volume, MarchingCubes
+from warp.types import Bvh, Mesh, HashGrid, Volume
 from warp.types import BvhQuery, HashGridQuery, MeshQueryAABB, MeshQueryPoint, MeshQueryRay
 
 from warp.types import matmul, adj_matmul, batched_matmul, adj_batched_matmul
 
 from warp.types import vector as vec
 from warp.types import matrix as mat
+
+from warp.types import matrix_from_cols, matrix_from_rows
 
 from warp.types import dtype_from_numpy, dtype_to_numpy
 
@@ -122,6 +125,8 @@ from warp.utils import (
     TIMING_ALL,
 )
 from warp.utils import map
+
+from warp.marching_cubes import MarchingCubes
 
 from warp.torch import from_torch, to_torch
 from warp.torch import dtype_from_torch, dtype_to_torch
@@ -1370,7 +1375,7 @@ def tile_map(op: Callable, a: Tile[Scalar, Tuple[int, ...]]) -> Tile[Scalar, Tup
 
     :param op: A callable function that accepts one argument and returns one argument, may be a user function or builtin
     :param a: The input tile, the operator (or one of its overloads) must be able to accept the tile's data type
-    :returns: A tile with the same dimensions and data type as the input tile.
+    :returns: A tile with the same dimensions as the input tile. Its datatype is specified by the return type of op
 
     Example:
 
@@ -1401,12 +1406,12 @@ def tile_map(
     """Apply a binary function onto the tile.
 
     This function cooperatively applies a binary function to each element of the tiles using all threads in the block.
-    Both input tiles must have the same dimensions and datatype.
+    Both input tiles must have the same dimensions, and if using a builtin op, the same datatypes.
 
     :param op: A callable function that accepts two arguments and returns one argument, all of the same type, may be a user function or builtin
     :param a: The first input tile, the operator (or one of its overloads) must be able to accept the tile's dtype
     :param b: The second input tile, the operator (or one of its overloads) must be able to accept the tile's dtype
-    :returns: A tile with the same dimensions and datatype as the input tiles.
+    :returns: A tile with the same dimensions as the input tiles. Its datatype is specified by the return type of op
 
     Example:
 
@@ -2806,12 +2811,32 @@ def add(a: Vector[Any, Scalar], b: Vector[Any, Scalar]) -> Vector[Any, Scalar]:
     ...
 
 @over
+def add(a: Vector[Any, Scalar], b: Scalar) -> Vector[Any, Scalar]:
+    """ """
+    ...
+
+@over
+def add(a: Scalar, b: Vector[Any, Scalar]) -> Vector[Any, Scalar]:
+    """ """
+    ...
+
+@over
 def add(a: Quaternion[Scalar], b: Quaternion[Scalar]) -> Quaternion[Scalar]:
     """ """
     ...
 
 @over
 def add(a: Matrix[Any, Any, Scalar], b: Matrix[Any, Any, Scalar]) -> Matrix[Any, Any, Scalar]:
+    """ """
+    ...
+
+@over
+def add(a: Matrix[Any, Any, Scalar], b: Scalar) -> Matrix[Any, Any, Scalar]:
+    """ """
+    ...
+
+@over
+def add(a: Scalar, b: Matrix[Any, Any, Scalar]) -> Matrix[Any, Any, Scalar]:
     """ """
     ...
 
@@ -2836,7 +2861,27 @@ def sub(a: Vector[Any, Scalar], b: Vector[Any, Scalar]) -> Vector[Any, Scalar]:
     ...
 
 @over
+def sub(a: Vector[Any, Scalar], b: Scalar) -> Vector[Any, Scalar]:
+    """ """
+    ...
+
+@over
+def sub(a: Scalar, b: Vector[Any, Scalar]) -> Vector[Any, Scalar]:
+    """ """
+    ...
+
+@over
 def sub(a: Matrix[Any, Any, Scalar], b: Matrix[Any, Any, Scalar]) -> Matrix[Any, Any, Scalar]:
+    """ """
+    ...
+
+@over
+def sub(a: Matrix[Any, Any, Scalar], b: Scalar) -> Matrix[Any, Any, Scalar]:
+    """ """
+    ...
+
+@over
+def sub(a: Scalar, b: Matrix[Any, Any, Scalar]) -> Matrix[Any, Any, Scalar]:
     """ """
     ...
 
@@ -2971,8 +3016,18 @@ def mod(a: Scalar, b: Scalar) -> Scalar:
     ...
 
 @over
-def mod(a: Vector[Any, Scalar], b: Vector[Any, Scalar]) -> Scalar:
+def mod(a: Vector[Any, Scalar], b: Vector[Any, Scalar]) -> Vector[Any, Scalar]:
     """Modulo operation using truncated division."""
+    ...
+
+@over
+def mod(a: Vector[Any, Scalar], b: Scalar) -> Vector[Any, Scalar]:
+    """ """
+    ...
+
+@over
+def mod(a: Matrix[Any, Any, Scalar], b: Scalar) -> Matrix[Any, Any, Scalar]:
+    """ """
     ...
 
 @over
@@ -3186,13 +3241,16 @@ def tile_cholesky(A: Tile[Float, Tuple[int, int]]) -> Tile[Float, Tuple[int, int
     """Compute the Cholesky factorization L of a matrix A.
     L is lower triangular and satisfies LL^T = A.
 
+    Only the lower triangular portion of A is used for the decomposition;
+    the upper triangular part may be left unspecified.
+
     Note that computing the adjoint is not yet supported.
 
     Supported datatypes are:
         * float32
         * float64
 
-    :param A: A square, symmetric positive-definite, matrix.
+    :param A: A square, symmetric positive-definite, matrix. Only the lower triangular part of A is needed; the upper part is ignored.
     :returns L: A square, lower triangular, matrix, such that LL^T = A
     """
     ...

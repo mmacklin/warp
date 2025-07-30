@@ -176,11 +176,11 @@ def constant(x):
 
 
 def float_to_half_bits(value):
-    return warp.context.runtime.core.float_to_half_bits(value)
+    return warp.context.runtime.core.wp_float_to_half_bits(value)
 
 
 def half_bits_to_float(value):
-    return warp.context.runtime.core.half_bits_to_float(value)
+    return warp.context.runtime.core.wp_half_bits_to_float(value)
 
 
 def safe_len(obj):
@@ -190,8 +190,78 @@ def safe_len(obj):
         return -1
 
 
+def flatten(value: Sequence) -> tuple[list, tuple[int, ...]]:
+    """Flatten an arbitrarily-nested, rectangular iterable."""
+    arr = []
+    shape = []
+
+    depth = 0
+    stack = [(depth, value)]
+
+    while stack:
+        depth, elem = stack.pop(0)
+
+        if isinstance(elem, (str, bytes, bytearray, memoryview)):
+            raise TypeError(f"Got an invalid element of type `{type(elem).__name__}`")
+
+        try:
+            # If `elem` is a sequence, then it should be possible
+            # to add its elements to the stack for later processing.
+            stack.extend((depth + 1, x) for x in elem)
+        except TypeError:
+            # Since `elem` doesn't seem to be a sequence, we must have
+            # a leaf value that we need to add to our resulting array.
+            if depth != len(shape):
+                raise ValueError("Ragged array: scalar found before deepest level.") from None
+
+            arr.append(elem)
+        else:
+            dim = len(elem)
+            if depth == len(shape):
+                # First sequence seen at this depth, record its length.
+                shape.append(dim)
+            elif shape[depth] != dim:
+                # Later sequences must have the same length.
+                raise ValueError(f"Ragged array: expected length {shape[depth]} at depth {depth}, got {dim}.") from None
+
+    return (arr, tuple(shape))
+
+
 # ----------------------
 # built-in types
+
+
+def _unary_op(self, op, t):
+    try:
+        return op(self)
+    except RuntimeError:
+        return t(*(op(a) for a in self))
+
+
+def _binary_op(self, op, x, t, cw=True):
+    try:
+        return op(self, x)
+    except RuntimeError:
+        if is_scalar(x):
+            return t(*(op(a, x) for a in self))
+
+        if cw and types_equal(x, t):
+            return t(*(op(a, b) for a, b in zip(self, x)))
+
+        raise
+
+
+def _rbinary_op(self, op, x, t, cw=True):
+    try:
+        return op(x, self)
+    except RuntimeError:
+        if is_scalar(x):
+            return t(*(op(x, a) for a in self))
+
+        if cw and types_equal(x, t):
+            return t(*(op(b, a) for a, b in zip(self, x)))
+
+        raise
 
 
 def vector(length, dtype):
@@ -260,9 +330,10 @@ def vector(length, dtype):
                 return vec_t.scalar_export(super().__getitem__(key))
             elif isinstance(key, slice):
                 if self._wp_scalar_type_ == float16:
-                    return [vec_t.scalar_export(x) for x in super().__getitem__(key)]
+                    values = tuple(vec_t.scalar_export(x) for x in super().__getitem__(key))
                 else:
-                    return super().__getitem__(key)
+                    values = super().__getitem__(key)
+                return vector(len(values), self._wp_scalar_type_)(*values)
             else:
                 raise KeyError(f"Invalid key {key}, expected int or slice")
 
@@ -276,6 +347,13 @@ def vector(length, dtype):
                         f"but got `{type(value).__name__}` instead"
                     ) from None
             elif isinstance(key, slice):
+                if is_scalar(value):
+                    indices = range(*key.indices(self._length_))
+                    for idx in indices:
+                        super().__setitem__(idx, vec_t.scalar_import(value))
+
+                    return
+
                 try:
                     iter(value)
                 except TypeError:
@@ -325,40 +403,40 @@ def vector(length, dtype):
             return super().__setattr__(name, value)
 
         def __add__(self, y):
-            return warp.add(self, y)
+            return _binary_op(self, warp.add, y, vec_t)
 
         def __radd__(self, y):
-            return warp.add(y, self)
+            return _rbinary_op(self, warp.add, y, vec_t)
 
         def __sub__(self, y):
-            return warp.sub(self, y)
+            return _binary_op(self, warp.sub, y, vec_t)
 
         def __rsub__(self, y):
-            return warp.sub(y, self)
+            return _rbinary_op(self, warp.sub, y, vec_t)
 
         def __mul__(self, y):
-            return warp.mul(self, y)
+            return _binary_op(self, warp.mul, y, vec_t, cw=False)
 
         def __rmul__(self, x):
-            return warp.mul(x, self)
+            return _rbinary_op(self, warp.mul, x, vec_t, cw=False)
 
         def __truediv__(self, y):
-            return warp.div(self, y)
+            return _binary_op(self, warp.div, y, vec_t, cw=False)
 
         def __rtruediv__(self, x):
-            return warp.div(x, self)
+            return _rbinary_op(self, warp.div, x, vec_t, cw=False)
 
         def __mod__(self, x):
-            return warp.mod(self, x)
+            return _binary_op(self, warp.mod, x, vec_t)
 
         def __rmod__(self, x):
-            return warp.mod(x, self)
+            return _rbinary_op(self, warp.mod, x, vec_t)
 
         def __pos__(self):
-            return warp.pos(self)
+            return _unary_op(self, warp.pos, vec_t)
 
         def __neg__(self):
-            return warp.neg(self)
+            return _unary_op(self, warp.neg, vec_t)
 
         def __str__(self):
             return f"[{', '.join(map(str, self))}]"
@@ -422,6 +500,7 @@ def matrix(shape, dtype):
         _wp_constructor_ = "matrix"
 
         _wp_row_type_ = vector(0 if shape[1] == Any else shape[1], dtype)
+        _wp_col_type_ = vector(0 if shape[0] == Any else shape[0], dtype)
 
         # special handling for float16 type: in this case, data is stored
         # as uint16 but it's actually half precision floating point
@@ -467,22 +546,22 @@ def matrix(shape, dtype):
             return self._shape_[0]
 
         def __add__(self, y):
-            return warp.add(self, y)
+            return _binary_op(self, warp.add, y, mat_t)
 
         def __radd__(self, y):
-            return warp.add(y, self)
+            return _rbinary_op(self, warp.add, y, mat_t)
 
         def __sub__(self, y):
-            return warp.sub(self, y)
+            return _binary_op(self, warp.sub, y, mat_t)
 
         def __rsub__(self, y):
-            return warp.sub(y, self)
+            return _rbinary_op(self, warp.sub, y, mat_t)
 
         def __mul__(self, y):
-            return warp.mul(self, y)
+            return _binary_op(self, warp.mul, y, mat_t, cw=False)
 
         def __rmul__(self, x):
-            return warp.mul(x, self)
+            return _rbinary_op(self, warp.mul, x, mat_t, cw=False)
 
         def __matmul__(self, y):
             return warp.mul(self, y)
@@ -491,16 +570,22 @@ def matrix(shape, dtype):
             return warp.mul(x, self)
 
         def __truediv__(self, y):
-            return warp.div(self, y)
+            return _binary_op(self, warp.div, y, mat_t, cw=False)
 
         def __rtruediv__(self, x):
-            return warp.div(x, self)
+            return _rbinary_op(self, warp.div, x, mat_t, cw=False)
+
+        def __mod__(self, x):
+            return _binary_op(self, warp.mod, x, mat_t)
+
+        def __rmod__(self, x):
+            return _rbinary_op(self, warp.mod, x, mat_t)
 
         def __pos__(self):
-            return warp.pos(self)
+            return _unary_op(self, warp.pos, mat_t)
 
         def __neg__(self):
-            return warp.neg(self)
+            return _unary_op(self, warp.neg, mat_t)
 
         def __str__(self):
             row_str = []
@@ -522,8 +607,10 @@ def matrix(shape, dtype):
             return True
 
         def get_row(self, r):
-            if r < 0 or r >= self._shape_[0]:
+            if r < -self._shape_[0] or r >= self._shape_[0]:
                 raise IndexError("Invalid row index")
+            if r < 0:
+                r += self._shape_[0]
             row_start = r * self._shape_[1]
             row_end = row_start + self._shape_[1]
             row_data = super().__getitem__(slice(row_start, row_end))
@@ -532,9 +619,35 @@ def matrix(shape, dtype):
             else:
                 return self._wp_row_type_(row_data)
 
+        def get_col(self, c):
+            if c < -self._shape_[1] or c >= self._shape_[1]:
+                raise IndexError("Invalid column index")
+            if c < 0:
+                c += self._shape_[1]
+            col_start = c
+            col_end = col_start + self._shape_[0] * self._shape_[1]
+            col_step = self._shape_[1]
+            col_data = super().__getitem__(slice(col_start, col_end, col_step))
+            if self._wp_scalar_type_ == float16:
+                return self._wp_col_type_(*[mat_t.scalar_export(x) for x in col_data])
+            else:
+                return self._wp_col_type_(col_data)
+
         def set_row(self, r, v):
-            if r < 0 or r >= self._shape_[0]:
+            if r < -self._shape_[0] or r >= self._shape_[0]:
                 raise IndexError("Invalid row index")
+            if r < 0:
+                r += self._shape_[0]
+
+            row_start = r * self._shape_[1]
+            row_end = row_start + self._shape_[1]
+
+            if is_scalar(v):
+                for i in range(row_start, row_end):
+                    super().__setitem__(i, mat_t.scalar_import(v))
+
+                return
+
             try:
                 iter(v)
             except TypeError:
@@ -542,8 +655,6 @@ def matrix(shape, dtype):
                     f"Expected to assign a slice from a sequence of values but got `{type(v).__name__}` instead"
                 ) from None
 
-            row_start = r * self._shape_[1]
-            row_end = row_start + self._shape_[1]
             if self._wp_scalar_type_ == float16:
                 converted = []
                 try:
@@ -558,17 +669,86 @@ def matrix(shape, dtype):
                 v = converted
             super().__setitem__(slice(row_start, row_end), v)
 
+        def set_col(self, c, v):
+            if c < -self._shape_[1] or c >= self._shape_[1]:
+                raise IndexError("Invalid col index")
+            if c < 0:
+                c += self._shape_[1]
+
+            col_start = c
+            col_end = col_start + self._shape_[0] * self._shape_[1]
+            col_step = self._shape_[1]
+
+            if is_scalar(v):
+                for i in range(col_start, col_end, col_step):
+                    super().__setitem__(i, mat_t.scalar_import(v))
+
+                return
+
+            try:
+                iter(v)
+            except TypeError:
+                raise TypeError(
+                    f"Expected to assign a slice from a sequence of values but got `{type(v).__name__}` instead"
+                ) from None
+
+            if self._wp_scalar_type_ == float16:
+                converted = []
+                try:
+                    for x in v:
+                        converted.append(mat_t.scalar_import(x))
+                except ctypes.ArgumentError:
+                    raise TypeError(
+                        f"Expected to assign a slice from a sequence of `float16` values "
+                        f"but got `{type(x).__name__}` instead"
+                    ) from None
+
+                v = converted
+            super().__setitem__(slice(col_start, col_end, col_step), v)
+
         def __getitem__(self, key):
             if isinstance(key, Tuple):
                 # element indexing m[i,j]
                 if len(key) != 2:
                     raise KeyError(f"Invalid key, expected one or two indices, got {len(key)}")
-                if any(isinstance(x, slice) for x in key):
-                    raise KeyError("Slices are not supported when indexing matrices using the `m[i, j]` notation")
-                return mat_t.scalar_export(super().__getitem__(key[0] * self._shape_[1] + key[1]))
+
+                # Count how many dimensions the output value will have.
+                ndim = sum(1 for x in key if isinstance(x, slice))
+
+                if ndim == 0:
+                    row = key[0] + self._shape_[0] if key[0] < 0 else key[0]
+                    col = key[1] + self._shape_[1] if key[1] < 0 else key[1]
+                    return mat_t.scalar_export(super().__getitem__(row * self._shape_[1] + col))
+
+                if ndim == 1:
+                    if isinstance(key[1], slice):
+                        # Row vector.
+                        cols = range(*key[1].indices(self._shape_[0]))
+                        row_vec = self.get_row(key[0])
+                        values = tuple(row_vec[x] for x in cols)
+                        return vector(len(values), self._wp_scalar_type_)(*values)
+                    else:
+                        # Column vector.
+                        rows = range(*key[0].indices(self._shape_[1]))
+                        col_vec = self.get_col(key[1])
+                        values = tuple(col_vec[x] for x in rows)
+                        return vector(len(values), self._wp_scalar_type_)(*values)
+
+                assert ndim == 2
+                rows = range(*key[0].indices(self._shape_[1]))
+                cols = range(*key[1].indices(self._shape_[0]))
+                row_vecs = tuple(self.get_row(i) for i in rows)
+                values = tuple(x[j] for x in row_vecs for j in cols)
+                shape = (len(rows), len(cols))
+                return matrix(shape, self._wp_scalar_type_)(*values)
             elif isinstance(key, int):
                 # row vector indexing m[r]
                 return self.get_row(key)
+            elif isinstance(key, slice):
+                indices = range(*key.indices(self._shape_[0]))
+                row_vecs = tuple(self.get_row(x) for x in indices)
+                shape = (len(row_vecs), self._shape_[1])
+                return matrix(shape, self._wp_scalar_type_)(*row_vecs)
             else:
                 raise KeyError(f"Invalid key {key}, expected int or pair of ints")
 
@@ -577,20 +757,104 @@ def matrix(shape, dtype):
                 # element indexing m[i,j] = x
                 if len(key) != 2:
                     raise KeyError(f"Invalid key, expected one or two indices, got {len(key)}")
-                if any(isinstance(x, slice) for x in key):
-                    raise KeyError("Slices are not supported when indexing matrices using the `m[i, j]` notation")
-                try:
-                    return super().__setitem__(key[0] * self._shape_[1] + key[1], mat_t.scalar_import(value))
-                except (TypeError, ctypes.ArgumentError):
-                    raise TypeError(
-                        f"Expected to assign a `{self._wp_scalar_type_.__name__}` value "
-                        f"but got `{type(value).__name__}` instead"
-                    ) from None
+
+                # Count how many dimensions the output value is expected to have.
+                ndim = sum(1 for x in key if isinstance(x, slice))
+
+                if ndim == 0:
+                    try:
+                        _, v_shape = flatten(value)
+                    except TypeError:
+                        raise TypeError(
+                            f"Expected to assign a `{type_repr(self._wp_scalar_type_)}` value but got `{type(value).__name__}` instead"
+                        ) from None
+
+                    if v_shape:
+                        raise RuntimeError(
+                            f"The provided value is expected to be a scalar but got an object of shape {v_shape} instead"
+                        )
+
+                    row = key[0] + self._shape_[0] if key[0] < 0 else key[0]
+                    col = key[1] + self._shape_[1] if key[1] < 0 else key[1]
+                    idx = row * self._shape_[1] + col
+                    super().__setitem__(idx, mat_t.scalar_import(value))
+                    return
+
+                if ndim == 1:
+                    _, v_shape = flatten(value)
+
+                    if v_shape and len(v_shape) != 1:
+                        raise RuntimeError(
+                            f"The provided value is expected to be a 1D vector but got an object of shape {v_shape} instead"
+                        )
+
+                    if isinstance(key[1], slice):
+                        # Row vector.
+                        cols = range(*key[1].indices(self._shape_[0]))
+                        if v_shape and v_shape[0] != len(cols):
+                            raise RuntimeError(
+                                f"The length of the provided vector ({v_shape[0]}) isn't compatible with the given slice (expected {len(cols)})"
+                            )
+
+                        row = key[0] + self._shape_[0] if key[0] < 0 else key[0]
+                        for i, col in enumerate(cols):
+                            idx = row * self._shape_[1] + col
+                            super().__setitem__(idx, mat_t.scalar_import(value[i] if v_shape else value))
+
+                        return
+                    else:
+                        # Column vector.
+                        rows = range(*key[0].indices(self._shape_[1]))
+                        if v_shape and v_shape[0] != len(rows):
+                            raise RuntimeError(
+                                f"The length of the provided vector ({v_shape[0]}) isn't compatible with the given slice (expected {len(rows)})"
+                            )
+
+                        col = key[1] + self._shape_[1] if key[1] < 0 else key[1]
+                        for i, row in enumerate(rows):
+                            idx = row * self._shape_[1] + col
+                            super().__setitem__(idx, mat_t.scalar_import(value[i] if v_shape else value))
+
+                        return
+
+                assert ndim == 2
+
+                _, v_shape = flatten(value)
+
+                if v_shape and len(v_shape) != 2:
+                    raise RuntimeError(
+                        f"The provided value is expected to be a 2D matrix but got an object of shape {v_shape} instead"
+                    )
+
+                rows = range(*key[0].indices(self._shape_[1]))
+                cols = range(*key[1].indices(self._shape_[0]))
+
+                if v_shape and v_shape != (len(rows), len(cols)):
+                    raise RuntimeError(
+                        f"The shape of the provided matrix ({v_shape}) isn't compatible with the given slice (expected ({len(rows)}, {len(cols)}))"
+                    )
+
+                for i, row in enumerate(rows):
+                    for j, col in enumerate(cols):
+                        idx = row * self._shape_[1] + col
+                        super().__setitem__(idx, mat_t.scalar_import(value[i, j] if v_shape else value))
             elif isinstance(key, int):
                 # row vector indexing m[r] = v
                 return self.set_row(key, value)
             elif isinstance(key, slice):
-                raise KeyError("Slices are not supported when indexing matrices using the `m[start:end]` notation")
+                v_arr, v_shape = flatten(value)
+                indices = range(*key.indices(self._shape_[0]))
+
+                if v_shape and (len(v_shape) != 2 or v_shape[0] != len(indices) or v_shape[1] != self._shape_[1]):
+                    raise RuntimeError(
+                        f"The shape of the provided matrix ({v_shape}) isn't compatible with the given slice (expected ({len(indices)}, {self._shape_[1]}))"
+                    )
+
+                for i, row in enumerate(indices):
+                    offset = i * self._shape_[1]
+                    self.set_row(
+                        row, v_arr[offset : offset + self._shape_[1]] if v_shape else (value,) * self._shape_[1]
+                    )
             else:
                 raise KeyError(f"Invalid key {key}, expected int or pair of ints")
 
@@ -606,6 +870,60 @@ def matrix(shape, dtype):
                 raise RuntimeError("NULL pointer exception")
 
     return mat_t
+
+
+def matrix_from_cols(*args: Sequence[Vector]):
+    if not all(type_is_vector(x) for x in args):
+        raise RuntimeError("all arguments are expected to be vectors")
+
+    length = args[0]._length_
+    if any(x._length_ != length for x in args):
+        raise RuntimeError("all vectors are expected to have the same length")
+
+    dtype = args[0]._wp_scalar_type_
+    if any(x._wp_scalar_type_ != dtype for x in args):
+        raise RuntimeError("all vectors are expected to have the same dtype")
+
+    row_count = length
+    col_count = len(args)
+    out = matrix(shape=(row_count, col_count), dtype=dtype)()
+    mat_t = type(out)
+
+    for col in range(col_count):
+        v = args[col]
+        for row in range(row_count):
+            idx = col_count * row + col
+            value = mat_t.scalar_import(v[row])
+            super(mat_t, out).__setitem__(idx, value)
+
+    return out
+
+
+def matrix_from_rows(*args: Sequence[Vector]):
+    if not all(type_is_vector(x) for x in args):
+        raise RuntimeError("all arguments are expected to be vectors")
+
+    length = args[0]._length_
+    if any(x._length_ != length for x in args):
+        raise RuntimeError("all vectors are expected to have the same length")
+
+    dtype = args[0]._wp_scalar_type_
+    if any(x._wp_scalar_type_ != dtype for x in args):
+        raise RuntimeError("all vectors are expected to have the same dtype")
+
+    row_count = len(args)
+    col_count = length
+    out = matrix(shape=(row_count, col_count), dtype=dtype)()
+    mat_t = type(out)
+
+    for row in range(row_count):
+        v = args[row]
+        for col in range(col_count):
+            idx = col_count * row + col
+            value = mat_t.scalar_import(v[col])
+            super(mat_t, out).__setitem__(idx, value)
+
+    return out
 
 
 class void:
@@ -1308,6 +1626,49 @@ class launch_bounds_t(ctypes.Structure):
             self.shape[i] = 1
 
 
+INT_WIDTH = ctypes.sizeof(ctypes.c_int) * 8
+SLICE_BEGIN = (1 << (INT_WIDTH - 1)) - 1
+SLICE_END = -(1 << (INT_WIDTH - 1))
+
+
+class slice_t:
+    _wp_native_name_ = "slice_t"
+
+    def __init__(self, start, stop, step):
+        self.start = start
+        self.stop = stop
+        self.step = step
+
+    def get_length(self, parent_length, wrap=False):
+        if any(isinstance(x, warp.codegen.Var) for x in (self.start, self.stop, self.step)):
+            raise RuntimeError("Vector slice indices must be constant values.")
+
+        if self.step == 0:
+            raise RuntimeError(f"Vector slice step {self.step} is invalid.")
+
+        if self.start == SLICE_BEGIN:
+            start = parent_length - 1 if self.step < 0 else 0
+        else:
+            start = min(max(self.start, -parent_length), parent_length)
+            if wrap:
+                start = start + parent_length if start < 0 else start
+
+        if self.stop == SLICE_END:
+            stop = -1 if self.step < 0 else parent_length
+        else:
+            stop = min(max(self.stop, -parent_length), parent_length)
+            if wrap:
+                stop = stop + parent_length if stop < 0 else stop
+
+        if self.step > 0 and start < stop:
+            return 1 + (stop - start - 1) // self.step
+
+        if self.step < 0 and start > stop:
+            return 1 + (start - stop - 1) // (-self.step)
+
+        return 0
+
+
 class shape_t(ctypes.Structure):
     _fields_ = (("dims", ctypes.c_int32 * ARRAY_MAX_DIMS),)
 
@@ -1386,6 +1747,13 @@ class tuple_t:
     def __init__(self, types, values):
         self.types = types
         self.values = values
+
+
+class pointer_t:
+    """Used during codegen to represent pointer types."""
+
+    def __init__(self, dtype):
+        self.dtype = dtype
 
 
 def type_ctype(dtype):
@@ -1525,10 +1893,10 @@ def scalar_short_name(t):
 # converts any known type to a human readable string, good for error messages, reporting etc
 def type_repr(t) -> str:
     if is_array(t):
-        if t.device is None:
+        if hasattr(t, "device") and t.device is None:
             # array is used as a type annotation - display ndim instead of shape
-            return f"array(ndim={t.ndim}, dtype={type_repr(t.dtype)})"
-        return f"array(shape={t.shape}, dtype={type_repr(t.dtype)})"
+            return f"{type(t).__name__}(ndim={t.ndim}, dtype={type_repr(t.dtype)})"
+        return f"{type(t).__name__}(shape={t.shape}, dtype={type_repr(t.dtype)})"
     if is_tuple(t):
         return f"tuple({', '.join(type_repr(x) for x in t.types)})"
     if is_tile(t):
@@ -1584,6 +1952,11 @@ def type_is_float(t):
     return t in float_types
 
 
+# returns True if the passed *type* is a scalar
+def type_is_scalar(t):
+    return type_is_int(t) or type_is_float(t)
+
+
 # returns True if the passed *type* is a vector
 def type_is_vector(t):
     return getattr(t, "_wp_generic_type_hint_", None) is Vector
@@ -1619,6 +1992,10 @@ def is_int(x: Any) -> builtins.bool:
 
 def is_float(x: Any) -> builtins.bool:
     return type_is_float(type(x))
+
+
+def is_scalar(x: Any) -> builtins.bool:
+    return type_is_scalar(type(x))
 
 
 def is_value(x: Any) -> builtins.bool:
@@ -1750,7 +2127,11 @@ def types_equal(a, b, match_generic=False):
 
         return True
 
-    if is_array(a) and type(a) is type(b) and types_equal(a.dtype, b.dtype, match_generic=match_generic):
+    if (
+        is_array(a)
+        and (issubclass(type(a), type(b)) or issubclass(type(b), type(a)))
+        and types_equal(a.dtype, b.dtype, match_generic=match_generic)
+    ):
         return True
 
     # match NewStructInstance and Struct dtype
@@ -1862,10 +2243,6 @@ class array(Array[DType]):
         deleter (Callable[[int, int], None]): A function to be called when the array is deleted,
             taking two arguments: pointer and size. If ``None``, then no function is called.
     """
-
-    # member attributes available during code-gen (e.g.: d = array.shape[0])
-    # (initialized when needed)
-    _vars = None
 
     def __new__(cls, *args, **kwargs):
         instance = super().__new__(cls)
@@ -2483,7 +2860,7 @@ class array(Array[DType]):
 
                 # Performance note: avoid wrapping the external stream in a temporary Stream object
                 if stream != array_stream.cuda_stream:
-                    warp.context.runtime.core.cuda_stream_wait_stream(
+                    warp.context.runtime.core.wp_cuda_stream_wait_stream(
                         stream, array_stream.cuda_stream, array_stream.cached_event.cuda_event
                     )
             elif self.device.is_cpu:
@@ -2722,10 +3099,10 @@ class array(Array[DType]):
     @property
     def vars(self):
         # member attributes available during code-gen (e.g.: d = array.shape[0])
-        # Note: we use a shared dict for all array instances
-        if array._vars is None:
-            array._vars = {"shape": warp.codegen.Var("shape", shape_t)}
-        return array._vars
+        return {
+            "shape": warp.codegen.Var("shape", shape_t),
+            "ptr": warp.codegen.Var("data", pointer_t(self.dtype)),
+        }
 
     def mark_init(self):
         """Resets this array's read flag"""
@@ -2830,11 +3207,11 @@ class array(Array[DType]):
             carr_ptr = ctypes.pointer(carr)
 
             if self.device.is_cuda:
-                warp.context.runtime.core.array_fill_device(
+                warp.context.runtime.core.wp_array_fill_device(
                     self.device.context, carr_ptr, ARRAY_TYPE_REGULAR, cvalue_ptr, cvalue_size
                 )
             else:
-                warp.context.runtime.core.array_fill_host(carr_ptr, ARRAY_TYPE_REGULAR, cvalue_ptr, cvalue_size)
+                warp.context.runtime.core.wp_array_fill_host(carr_ptr, ARRAY_TYPE_REGULAR, cvalue_ptr, cvalue_size)
 
         self.mark_init()
 
@@ -3138,7 +3515,7 @@ class array(Array[DType]):
         # Allocate a buffer for the data (64-element char array)
         ipc_handle_buffer = (ctypes.c_char * 64)()
 
-        warp.context.runtime.core.cuda_ipc_get_mem_handle(self.ptr, ipc_handle_buffer)
+        warp.context.runtime.core.wp_cuda_ipc_get_mem_handle(self.ptr, ipc_handle_buffer)
 
         return ipc_handle_buffer.raw
 
@@ -3191,7 +3568,7 @@ def from_ptr(ptr, length, dtype=None, shape=None, device=None):
 
 
 def _close_cuda_ipc_handle(ptr, size):
-    warp.context.runtime.core.cuda_ipc_close_mem_handle(ptr)
+    warp.context.runtime.core.wp_cuda_ipc_close_mem_handle(ptr)
 
 
 def from_ipc_handle(
@@ -3230,9 +3607,57 @@ def from_ipc_handle(
     if device.is_ipc_supported is False:
         raise RuntimeError(f"IPC is not supported on device {device}.")
 
-    ptr = warp.context.runtime.core.cuda_ipc_open_mem_handle(device.context, handle)
+    ptr = warp.context.runtime.core.wp_cuda_ipc_open_mem_handle(device.context, handle)
 
     return array(ptr=ptr, dtype=dtype, shape=shape, strides=strides, device=device, deleter=_close_cuda_ipc_handle)
+
+
+class fixedarray(array):
+    """A fixed-size, stack allocated, array containing values of the same type.
+
+    Only used during codegen, and for type hints, but otherwise not intended to be used
+    at the Python scope.
+
+    Attributes:
+        dtype (DType): The data type of the array.
+        shape (tuple[int]): Dimensions of the array.
+    """
+
+    def __init__(
+        self,
+        dtype: Any = Any,
+        shape: int | tuple[int, ...] | list[int] | None = None,
+    ):
+        # canonicalize dtype
+        if dtype == int:
+            dtype = int32
+        elif dtype == float:
+            dtype = float32
+        elif dtype == builtins.bool:
+            dtype = bool
+
+        if shape is None:
+            self.dtype = dtype
+            self.ndim = 1
+            self.size = 0
+            self.shape = (0,)
+            self.strides = (0,)
+        else:
+            if isinstance(shape, int):
+                shape = (shape,)
+
+            check_array_shape(shape)
+
+            self.dtype = dtype
+            self.ndim = len(shape)
+            self.size = math.prod(shape)
+            self.shape = shape
+            self.strides = strides_from_shape(shape, dtype)
+
+    @property
+    def vars(self):
+        # member attributes available during code-gen (e.g.: d = array.shape[0])
+        return {"shape": warp.codegen.Var("shape", shape_t)}
 
 
 # A base class for non-contiguous arrays, providing the implementation of common methods like
@@ -3315,11 +3740,11 @@ class noncontiguous_array_base(Array[T]):
         ctype_ptr = ctypes.pointer(ctype)
 
         if self.device.is_cuda:
-            warp.context.runtime.core.array_fill_device(
+            warp.context.runtime.core.wp_array_fill_device(
                 self.device.context, ctype_ptr, self.type_id, cvalue_ptr, cvalue_size
             )
         else:
-            warp.context.runtime.core.array_fill_host(ctype_ptr, self.type_id, cvalue_ptr, cvalue_size)
+            warp.context.runtime.core.wp_array_fill_host(ctype_ptr, self.type_id, cvalue_ptr, cvalue_size)
 
 
 # helper to check index array properties
@@ -3462,7 +3887,7 @@ def indexedarray4d(*args, **kwargs):
 
 from warp.fabric import fabricarray, indexedfabricarray  # noqa: E402
 
-array_types = (array, indexedarray, fabricarray, indexedfabricarray)
+array_types = (array, indexedarray, fabricarray, indexedfabricarray, fixedarray)
 
 
 def array_type_id(a):
@@ -3663,11 +4088,11 @@ class Bvh:
                 )
                 constructor = "sah"
 
-            self.id = self.runtime.core.bvh_create_host(
+            self.id = self.runtime.core.wp_bvh_create_host(
                 get_data(lowers), get_data(uppers), len(lowers), bvh_constructor_values[constructor]
             )
         else:
-            self.id = self.runtime.core.bvh_create_device(
+            self.id = self.runtime.core.wp_bvh_create_device(
                 self.device.context,
                 get_data(lowers),
                 get_data(uppers),
@@ -3680,11 +4105,11 @@ class Bvh:
             return
 
         if self.device.is_cpu:
-            self.runtime.core.bvh_destroy_host(self.id)
+            self.runtime.core.wp_bvh_destroy_host(self.id)
         else:
             # use CUDA context guard to avoid side effects during garbage collection
             with self.device.context_guard:
-                self.runtime.core.bvh_destroy_device(self.id)
+                self.runtime.core.wp_bvh_destroy_device(self.id)
 
     def refit(self):
         """Refit the BVH.
@@ -3693,9 +4118,9 @@ class Bvh:
         """
 
         if self.device.is_cpu:
-            self.runtime.core.bvh_refit_host(self.id)
+            self.runtime.core.wp_bvh_refit_host(self.id)
         else:
-            self.runtime.core.bvh_refit_device(self.id)
+            self.runtime.core.wp_bvh_refit_device(self.id)
             self.runtime.verify_cuda_device(self.device)
 
 
@@ -3777,7 +4202,7 @@ class Mesh:
                 )
                 bvh_constructor = "sah"
 
-            self.id = self.runtime.core.mesh_create_host(
+            self.id = self.runtime.core.wp_mesh_create_host(
                 points.__ctype__(),
                 velocities.__ctype__() if velocities else array().__ctype__(),
                 indices.__ctype__(),
@@ -3787,7 +4212,7 @@ class Mesh:
                 bvh_constructor_values[bvh_constructor],
             )
         else:
-            self.id = self.runtime.core.mesh_create_device(
+            self.id = self.runtime.core.wp_mesh_create_device(
                 self.device.context,
                 points.__ctype__(),
                 velocities.__ctype__() if velocities else array().__ctype__(),
@@ -3803,11 +4228,11 @@ class Mesh:
             return
 
         if self.device.is_cpu:
-            self.runtime.core.mesh_destroy_host(self.id)
+            self.runtime.core.wp_mesh_destroy_host(self.id)
         else:
             # use CUDA context guard to avoid side effects during garbage collection
             with self.device.context_guard:
-                self.runtime.core.mesh_destroy_device(self.id)
+                self.runtime.core.wp_mesh_destroy_device(self.id)
 
     def refit(self):
         """Refit the BVH to points.
@@ -3816,9 +4241,9 @@ class Mesh:
         """
 
         if self.device.is_cpu:
-            self.runtime.core.mesh_refit_host(self.id)
+            self.runtime.core.wp_mesh_refit_host(self.id)
         else:
-            self.runtime.core.mesh_refit_device(self.id)
+            self.runtime.core.wp_mesh_refit_device(self.id)
             self.runtime.verify_cuda_device(self.device)
 
     @property
@@ -3848,9 +4273,9 @@ class Mesh:
 
         self._points = points_new
         if self.device.is_cpu:
-            self.runtime.core.mesh_set_points_host(self.id, points_new.__ctype__())
+            self.runtime.core.wp_mesh_set_points_host(self.id, points_new.__ctype__())
         else:
-            self.runtime.core.mesh_set_points_device(self.id, points_new.__ctype__())
+            self.runtime.core.wp_mesh_set_points_device(self.id, points_new.__ctype__())
             self.runtime.verify_cuda_device(self.device)
 
     @property
@@ -3878,9 +4303,9 @@ class Mesh:
 
         self._velocities = velocities_new
         if self.device.is_cpu:
-            self.runtime.core.mesh_set_velocities_host(self.id, velocities_new.__ctype__())
+            self.runtime.core.wp_mesh_set_velocities_host(self.id, velocities_new.__ctype__())
         else:
-            self.runtime.core.mesh_set_velocities_device(self.id, velocities_new.__ctype__())
+            self.runtime.core.wp_mesh_set_velocities_device(self.id, velocities_new.__ctype__())
             self.runtime.verify_cuda_device(self.device)
 
 
@@ -3912,11 +4337,11 @@ class Volume:
 
         owner = False
         if self.device.is_cpu:
-            self.id = self.runtime.core.volume_create_host(
+            self.id = self.runtime.core.wp_volume_create_host(
                 ctypes.cast(data.ptr, ctypes.c_void_p), data.size, copy, owner
             )
         else:
-            self.id = self.runtime.core.volume_create_device(
+            self.id = self.runtime.core.wp_volume_create_device(
                 self.device.context, ctypes.cast(data.ptr, ctypes.c_void_p), data.size, copy, owner
             )
 
@@ -3928,18 +4353,18 @@ class Volume:
             return
 
         if self.device.is_cpu:
-            self.runtime.core.volume_destroy_host(self.id)
+            self.runtime.core.wp_volume_destroy_host(self.id)
         else:
             # use CUDA context guard to avoid side effects during garbage collection
             with self.device.context_guard:
-                self.runtime.core.volume_destroy_device(self.id)
+                self.runtime.core.wp_volume_destroy_device(self.id)
 
     def array(self) -> array:
         """Return the raw memory buffer of the :class:`Volume` as an array."""
 
         buf = ctypes.c_void_p(0)
         size = ctypes.c_uint64(0)
-        self.runtime.core.volume_get_buffer_info(self.id, ctypes.byref(buf), ctypes.byref(size))
+        self.runtime.core.wp_volume_get_buffer_info(self.id, ctypes.byref(buf), ctypes.byref(size))
         return array(ptr=buf.value, dtype=uint8, shape=size.value, device=self.device)
 
     def get_tile_count(self) -> int:
@@ -3949,7 +4374,9 @@ class Volume:
             ctypes.c_uint64(0),
             ctypes.c_uint32(0),
         )
-        self.runtime.core.volume_get_tile_and_voxel_count(self.id, ctypes.byref(tile_count), ctypes.byref(voxel_count))
+        self.runtime.core.wp_volume_get_tile_and_voxel_count(
+            self.id, ctypes.byref(tile_count), ctypes.byref(voxel_count)
+        )
         return tile_count.value
 
     def get_tiles(self, out: array | None = None) -> array:
@@ -3976,9 +4403,9 @@ class Volume:
             )
 
         if self.device.is_cpu:
-            self.runtime.core.volume_get_tiles_host(self.id, out.ptr)
+            self.runtime.core.wp_volume_get_tiles_host(self.id, out.ptr)
         else:
-            self.runtime.core.volume_get_tiles_device(self.id, out.ptr)
+            self.runtime.core.wp_volume_get_tiles_device(self.id, out.ptr)
 
         return out
 
@@ -3989,7 +4416,9 @@ class Volume:
             ctypes.c_uint64(0),
             ctypes.c_uint32(0),
         )
-        self.runtime.core.volume_get_tile_and_voxel_count(self.id, ctypes.byref(tile_count), ctypes.byref(voxel_count))
+        self.runtime.core.wp_volume_get_tile_and_voxel_count(
+            self.id, ctypes.byref(tile_count), ctypes.byref(voxel_count)
+        )
         return voxel_count.value
 
     def get_voxels(self, out: array | None = None) -> array:
@@ -4015,9 +4444,9 @@ class Volume:
             )
 
         if self.device.is_cpu:
-            self.runtime.core.volume_get_voxels_host(self.id, out.ptr)
+            self.runtime.core.wp_volume_get_voxels_host(self.id, out.ptr)
         else:
-            self.runtime.core.volume_get_voxels_device(self.id, out.ptr)
+            self.runtime.core.wp_volume_get_voxels_device(self.id, out.ptr)
 
         return out
 
@@ -4028,7 +4457,7 @@ class Volume:
             raise RuntimeError("Invalid Volume")
 
         dx, dy, dz = ctypes.c_float(0), ctypes.c_float(0), ctypes.c_float(0)
-        self.runtime.core.volume_get_voxel_size(self.id, ctypes.byref(dx), ctypes.byref(dy), ctypes.byref(dz))
+        self.runtime.core.wp_volume_get_voxel_size(self.id, ctypes.byref(dx), ctypes.byref(dy), ctypes.byref(dz))
         return (dx.value, dy.value, dz.value)
 
     class GridInfo(NamedTuple):
@@ -4061,7 +4490,7 @@ class Volume:
         transform_buffer = (ctypes.c_float * 9)()
         type_str_buffer = (ctypes.c_char * 16)()
 
-        name = self.runtime.core.volume_get_grid_info(
+        name = self.runtime.core.wp_volume_get_grid_info(
             self.id,
             ctypes.byref(grid_size),
             ctypes.byref(grid_index),
@@ -4124,7 +4553,7 @@ class Volume:
     def get_feature_array_count(self) -> int:
         """Return the number of supplemental data arrays stored alongside the grid"""
 
-        return self.runtime.core.volume_get_blind_data_count(self.id)
+        return self.runtime.core.wp_volume_get_blind_data_count(self.id)
 
     class FeatureArrayInfo(NamedTuple):
         """Metadata for a supplemental data array"""
@@ -4149,7 +4578,7 @@ class Volume:
         value_size = ctypes.c_uint32(0)
         type_str_buffer = (ctypes.c_char * 16)()
 
-        name = self.runtime.core.volume_get_blind_data_info(
+        name = self.runtime.core.wp_volume_get_blind_data_info(
             self.id,
             feature_index,
             ctypes.byref(buf),
@@ -4425,7 +4854,7 @@ class Volume:
         # (to allow this we would need to ref-count the volume descriptor)
         existing_buf = ctypes.c_void_p(0)
         existing_size = ctypes.c_uint64(0)
-        warp.context.runtime.core.volume_get_buffer_info(
+        warp.context.runtime.core.wp_volume_get_buffer_info(
             grid_ptr, ctypes.byref(existing_buf), ctypes.byref(existing_size)
         )
 
@@ -4678,7 +5107,7 @@ class Volume:
         transform_buf, translation_buf = Volume._fill_transform_buffers(voxel_size, translation, transform)
 
         if bg_value is None:
-            volume.id = volume.runtime.core.volume_index_from_tiles_device(
+            volume.id = volume.runtime.core.wp_volume_index_from_tiles_device(
                 volume.device.context,
                 ctypes.c_void_p(tile_points.ptr),
                 tile_points.shape[0],
@@ -4717,7 +5146,7 @@ class Volume:
             cvalue_size = ctypes.sizeof(cvalue)
             cvalue_type = nvdb_type.encode("ascii")
 
-            volume.id = volume.runtime.core.volume_from_tiles_device(
+            volume.id = volume.runtime.core.wp_volume_from_tiles_device(
                 volume.device.context,
                 ctypes.c_void_p(tile_points.ptr),
                 tile_points.shape[0],
@@ -4779,7 +5208,7 @@ class Volume:
 
         transform_buf, translation_buf = Volume._fill_transform_buffers(voxel_size, translation, transform)
 
-        volume.id = volume.runtime.core.volume_from_active_voxels_device(
+        volume.id = volume.runtime.core.wp_volume_from_active_voxels_device(
             volume.device.context,
             ctypes.c_void_p(voxel_points.ptr),
             voxel_points.shape[0],
@@ -5019,9 +5448,9 @@ class HashGrid:
         self.device = self.runtime.get_device(device)
 
         if self.device.is_cpu:
-            self.id = self.runtime.core.hash_grid_create_host(dim_x, dim_y, dim_z)
+            self.id = self.runtime.core.wp_hash_grid_create_host(dim_x, dim_y, dim_z)
         else:
-            self.id = self.runtime.core.hash_grid_create_device(self.device.context, dim_x, dim_y, dim_z)
+            self.id = self.runtime.core.wp_hash_grid_create_device(self.device.context, dim_x, dim_y, dim_z)
 
         # indicates whether the grid data has been reserved for use by a kernel
         self.reserved = False
@@ -5046,16 +5475,16 @@ class HashGrid:
             points = points.contiguous().flatten()
 
         if self.device.is_cpu:
-            self.runtime.core.hash_grid_update_host(self.id, radius, ctypes.byref(points.__ctype__()))
+            self.runtime.core.wp_hash_grid_update_host(self.id, radius, ctypes.byref(points.__ctype__()))
         else:
-            self.runtime.core.hash_grid_update_device(self.id, radius, ctypes.byref(points.__ctype__()))
+            self.runtime.core.wp_hash_grid_update_device(self.id, radius, ctypes.byref(points.__ctype__()))
         self.reserved = True
 
     def reserve(self, num_points):
         if self.device.is_cpu:
-            self.runtime.core.hash_grid_reserve_host(self.id, num_points)
+            self.runtime.core.wp_hash_grid_reserve_host(self.id, num_points)
         else:
-            self.runtime.core.hash_grid_reserve_device(self.id, num_points)
+            self.runtime.core.wp_hash_grid_reserve_device(self.id, num_points)
         self.reserved = True
 
     def __del__(self):
@@ -5063,166 +5492,11 @@ class HashGrid:
             return
 
         if self.device.is_cpu:
-            self.runtime.core.hash_grid_destroy_host(self.id)
+            self.runtime.core.wp_hash_grid_destroy_host(self.id)
         else:
             # use CUDA context guard to avoid side effects during garbage collection
             with self.device.context_guard:
-                self.runtime.core.hash_grid_destroy_device(self.id)
-
-
-class MarchingCubes:
-    def __new__(cls, *args, **kwargs):
-        instance = super().__new__(cls)
-        instance.id = None
-        return instance
-
-    def __init__(self, nx: int, ny: int, nz: int, max_verts: int, max_tris: int, device=None):
-        """CUDA-based Marching Cubes algorithm to extract a 2D surface mesh from a 3D volume.
-
-        Attributes:
-            id: Unique identifier for this object.
-            verts (:class:`warp.array`): Array of vertex positions of type :class:`warp.vec3f`
-              for the output surface mesh.
-              This is populated after running :func:`surface`.
-            indices (:class:`warp.array`): Array containing indices of type :class:`warp.int32`
-              defining triangles for the output surface mesh.
-              This is populated after running :func:`surface`.
-
-              Each set of three consecutive integers in the array represents a single triangle,
-              in which each integer is an index referring to a vertex in the :attr:`verts` array.
-
-        Args:
-            nx: Number of cubes in the x-direction.
-            ny: Number of cubes in the y-direction.
-            nz: Number of cubes in the z-direction.
-            max_verts: Maximum expected number of vertices (used for array preallocation).
-            max_tris: Maximum expected number of triangles (used for array preallocation).
-            device (Devicelike): CUDA device on which to run marching cubes and allocate memory.
-
-        Raises:
-            RuntimeError: ``device`` not a CUDA device.
-
-        .. note::
-            The shape of the marching cubes should match the shape of the scalar field being surfaced.
-
-        """
-
-        self.id = 0
-
-        self.runtime = warp.context.runtime
-
-        self.device = self.runtime.get_device(device)
-
-        if not self.device.is_cuda:
-            raise RuntimeError("Only CUDA devices are supported for marching cubes")
-
-        self.nx = nx
-        self.ny = ny
-        self.nz = nz
-
-        self.max_verts = max_verts
-        self.max_tris = max_tris
-
-        # bindings to warp.so
-        self.alloc = self.runtime.core.marching_cubes_create_device
-        self.alloc.argtypes = [ctypes.c_void_p]
-        self.alloc.restype = ctypes.c_uint64
-        self.free = self.runtime.core.marching_cubes_destroy_device
-
-        from warp.context import zeros
-
-        self.verts = zeros(max_verts, dtype=vec3, device=self.device)
-        self.indices = zeros(max_tris * 3, dtype=warp.int32, device=self.device)
-
-        # alloc surfacer
-        self.id = ctypes.c_uint64(self.alloc(self.device.context))
-
-    def __del__(self):
-        if not self.id:
-            return
-
-        # use CUDA context guard to avoid side effects during garbage collection
-        with self.device.context_guard:
-            # destroy surfacer
-            self.free(self.id)
-
-    def resize(self, nx: int, ny: int, nz: int, max_verts: int, max_tris: int) -> None:
-        """Update the expected input and maximum output sizes for the marching cubes calculation.
-
-        This function has no immediate effect on the underlying buffers.
-        The new values take effect on the next :func:`surface` call.
-
-        Args:
-          nx: Number of cubes in the x-direction.
-          ny: Number of cubes in the y-direction.
-          nz: Number of cubes in the z-direction.
-          max_verts: Maximum expected number of vertices (used for array preallocation).
-          max_tris: Maximum expected number of triangles (used for array preallocation).
-        """
-        # actual allocations will be resized on next call to surface()
-        self.nx = nx
-        self.ny = ny
-        self.nz = nz
-        self.max_verts = max_verts
-        self.max_tris = max_tris
-
-    def surface(self, field: array(dtype=float, ndim=3), threshold: float) -> None:
-        """Compute a 2D surface mesh of a given isosurface from a 3D scalar field.
-
-        The triangles and vertices defining the output mesh are written to the
-        :attr:`indices` and :attr:`verts` arrays.
-
-        Args:
-          field: Scalar field from which to generate a mesh.
-          threshold: Target isosurface value.
-
-        Raises:
-          ValueError: ``field`` is not a 3D array.
-          ValueError: Marching cubes shape does not match the shape of ``field``.
-          RuntimeError: :attr:`max_verts` and/or :attr:`max_tris` might be too small to hold the surface mesh.
-        """
-
-        # WP_API int marching_cubes_surface_host(const float* field, int nx, int ny, int nz, float threshold, wp::vec3* verts, int* triangles, int max_verts, int max_tris, int* out_num_verts, int* out_num_tris);
-        num_verts = ctypes.c_int(0)
-        num_tris = ctypes.c_int(0)
-
-        self.runtime.core.marching_cubes_surface_device.restype = ctypes.c_int
-
-        # For now we require that input field shape matches nx, ny, nz
-        if field.ndim != 3:
-            raise ValueError(f"Input field must be a three-dimensional array (got {field.ndim}).")
-        if field.shape[0] != self.nx or field.shape[1] != self.ny or field.shape[2] != self.nz:
-            raise ValueError(
-                f"Marching cubes shape ({self.nx}, {self.ny}, {self.nz}) does not match the "
-                f"input array shape {field.shape}."
-            )
-
-        error = self.runtime.core.marching_cubes_surface_device(
-            self.id,
-            ctypes.cast(field.ptr, ctypes.c_void_p),
-            self.nx,
-            self.ny,
-            self.nz,
-            ctypes.c_float(threshold),
-            ctypes.cast(self.verts.ptr, ctypes.c_void_p),
-            ctypes.cast(self.indices.ptr, ctypes.c_void_p),
-            self.max_verts,
-            self.max_tris,
-            ctypes.c_void_p(ctypes.addressof(num_verts)),
-            ctypes.c_void_p(ctypes.addressof(num_tris)),
-        )
-
-        if error:
-            raise RuntimeError(
-                f"Buffers may not be large enough, marching cubes required at least {num_verts} vertices, and {num_tris} triangles."
-            )
-
-        # resize the geometry arrays
-        self.verts.shape = (num_verts.value,)
-        self.indices.shape = (num_tris.value * 3,)
-
-        self.verts.size = num_verts.value
-        self.indices.size = num_tris.value * 3
+                self.runtime.core.wp_hash_grid_destroy_device(self.id)
 
 
 generic_types = (Any, Scalar, Float, Int)

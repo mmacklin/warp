@@ -21,6 +21,7 @@ import ctypes
 import functools
 import hashlib
 import inspect
+import itertools
 import math
 import re
 import sys
@@ -616,6 +617,8 @@ def compute_type_str(base_name, template_params):
     def param2str(p):
         if isinstance(p, int):
             return str(p)
+        elif hasattr(p, "_wp_generic_type_str_"):
+            return compute_type_str(f"wp::{p._wp_generic_type_str_}", p._wp_type_params_)
         elif hasattr(p, "_type_"):
             if p.__name__ == "bool":
                 return "bool"
@@ -623,6 +626,8 @@ def compute_type_str(base_name, template_params):
                 return f"wp::{p.__name__}"
         elif is_tile(p):
             return p.ctype()
+        elif isinstance(p, Struct):
+            return p.native_name
 
         return p.__name__
 
@@ -682,7 +687,12 @@ class Var:
 
     @staticmethod
     def type_to_ctype(t: type, value_type: builtins.bool = False) -> str:
-        if is_array(t):
+        if isinstance(t, fixedarray):
+            template_args = (str(t.size), Var.dtype_to_ctype(t.dtype))
+            dtypestr = ", ".join(template_args)
+            classstr = f"wp::{type(t).__name__}"
+            return f"{classstr}_t<{dtypestr}>"
+        elif is_array(t):
             dtypestr = Var.dtype_to_ctype(t.dtype)
             classstr = f"wp::{type(t).__name__}"
             return f"{classstr}_t<{dtypestr}>"
@@ -835,6 +845,9 @@ def get_arg_type(arg: Var | Any) -> type:
     if isinstance(arg, Sequence):
         return tuple(get_arg_type(x) for x in arg)
 
+    if is_array(arg):
+        return arg
+
     if get_origin(arg) is tuple:
         return tuple(get_arg_type(x) for x in get_args(arg))
 
@@ -966,6 +979,11 @@ class Adjoint:
             # pre-populate symbol dictionary with function argument names
             # this is to avoid registering false references to overshadowed modules
             adj.symbols[name] = arg
+
+        # Indicates whether there are unresolved static expressions in the function.
+        # These stem from wp.static() expressions that could not be evaluated at declaration time.
+        # This will signal to the module builder that this module needs to be rebuilt even if the module hash is unchanged.
+        adj.has_unresolved_static_expressions = False
 
         # try to replace static expressions by their constant result if the
         # expression can be evaluated at declaration time
@@ -1341,7 +1359,7 @@ class Adjoint:
         # unresolved function, report error
         arg_type_reprs = []
 
-        for x in arg_types:
+        for x in itertools.chain(arg_types, kwarg_types.values()):
             if isinstance(x, warp.context.Function):
                 arg_type_reprs.append("function")
             else:
@@ -1371,7 +1389,7 @@ class Adjoint:
         # in order to process them as Python does it.
         bound_args: inspect.BoundArguments = func.signature.bind(*args, **kwargs)
 
-        # Type args are the “compile time” argument values we get from codegen.
+        # Type args are the "compile time" argument values we get from codegen.
         # For example, when calling `wp.vec3f(...)` from within a kernel,
         # this translates in fact to calling the `vector()` built-in augmented
         # with the type args `length=3, dtype=float`.
@@ -1409,20 +1427,25 @@ class Adjoint:
         bound_args = bound_args.arguments
 
         # if it is a user-function then build it recursively
-        if not func.is_builtin() and func not in adj.builder.functions:
-            adj.builder.build_function(func)
-            # add custom grad, replay functions to the list of functions
-            # to be built later (invalid code could be generated if we built them now)
-            # so that they are not missed when only the forward function is imported
-            # from another module
-            if func.custom_grad_func:
-                adj.builder.deferred_functions.append(func.custom_grad_func)
-            if func.custom_replay_func:
-                adj.builder.deferred_functions.append(func.custom_replay_func)
+        if not func.is_builtin():
+            if adj.builder is None:
+                func.build(None)
+
+            elif func not in adj.builder.functions:
+                adj.builder.build_function(func)
+                # add custom grad, replay functions to the list of functions
+                # to be built later (invalid code could be generated if we built them now)
+                # so that they are not missed when only the forward function is imported
+                # from another module
+                if func.custom_grad_func:
+                    adj.builder.deferred_functions.append(func.custom_grad_func)
+                if func.custom_replay_func:
+                    adj.builder.deferred_functions.append(func.custom_replay_func)
 
         # Resolve the return value based on the types and values of the given arguments.
         bound_arg_types = {k: get_arg_type(v) for k, v in bound_args.items()}
         bound_arg_values = {k: get_arg_value(v) for k, v in bound_args.items()}
+
         return_type = func.value_func(
             {k: strip_reference(v) for k, v in bound_arg_types.items()},
             bound_arg_values,
@@ -1879,6 +1902,9 @@ class Adjoint:
             return obj
         if isinstance(obj, type):
             return obj
+        if isinstance(obj, Struct):
+            adj.builder.build_struct_recursive(obj)
+            return obj
         if isinstance(obj, types.ModuleType):
             return obj
 
@@ -1963,18 +1989,29 @@ class Adjoint:
                     return adj.add_builtin_call("transform_get_rotation", [aggregate])
 
             else:
-                attr_type = Reference(aggregate_type.vars[node.attr].type)
+                attr_var = aggregate_type.vars[node.attr]
+
+                # represent pointer types as uint64
+                if isinstance(attr_var.type, pointer_t):
+                    cast = f"({Var.dtype_to_ctype(uint64)}*)"
+                    adj_cast = f"({Var.dtype_to_ctype(attr_var.type.dtype)}*)"
+                    attr_type = Reference(uint64)
+                else:
+                    cast = ""
+                    adj_cast = ""
+                    attr_type = Reference(attr_var.type)
+
                 attr = adj.add_var(attr_type)
 
                 if is_reference(aggregate.type):
-                    adj.add_forward(f"{attr.emit()} = &({aggregate.emit()}->{node.attr});")
+                    adj.add_forward(f"{attr.emit()} = {cast}&({aggregate.emit()}->{attr_var.label});")
                 else:
-                    adj.add_forward(f"{attr.emit()} = &({aggregate.emit()}.{node.attr});")
+                    adj.add_forward(f"{attr.emit()} = {cast}&({aggregate.emit()}.{attr_var.label});")
 
                 if adj.is_differentiable_value_type(strip_reference(attr_type)):
-                    adj.add_reverse(f"{aggregate.emit_adj()}.{node.attr} += {attr.emit_adj()};")
+                    adj.add_reverse(f"{aggregate.emit_adj()}.{attr_var.label} += {adj_cast}{attr.emit_adj()};")
                 else:
-                    adj.add_reverse(f"{aggregate.emit_adj()}.{node.attr} = {attr.emit_adj()};")
+                    adj.add_reverse(f"{aggregate.emit_adj()}.{attr_var.label} = {adj_cast}{attr.emit_adj()};")
 
                 return attr
 
@@ -2302,7 +2339,7 @@ class Adjoint:
 
             return var
 
-        if isinstance(expr, (type, Var, warp.context.Function)):
+        if isinstance(expr, (type, Struct, Var, warp.context.Function)):
             return expr
 
         return adj.add_constant(expr)
@@ -2322,8 +2359,9 @@ class Adjoint:
 
         if adj.is_static_expression(func):
             # try to evaluate wp.static() expressions
-            obj, _ = adj.evaluate_static_expression(node)
+            obj, code = adj.evaluate_static_expression(node)
             if obj is not None:
+                adj.static_expressions[code] = obj
                 if isinstance(obj, warp.context.Function):
                     # special handling for wp.static() evaluating to a function
                     return obj
@@ -2352,7 +2390,8 @@ class Adjoint:
 
             # struct constructor
             if func is None and isinstance(caller, Struct):
-                adj.builder.build_struct_recursive(caller)
+                if adj.builder is not None:
+                    adj.builder.build_struct_recursive(caller)
                 if node.args or node.keywords:
                     func = caller.value_constructor
                 else:
@@ -2444,21 +2483,59 @@ class Adjoint:
         if not array or (count > array.type.ndim):
             count = 1
 
-        indices = []
+        nodes = ()
         root = node
-        while len(indices) < count:
+        while len(nodes) < count:
             if isinstance(root.slice, ast.Tuple):
-                ij = [adj.eval(arg) for arg in root.slice.elts]
+                ij = tuple(arg for arg in root.slice.elts)
             elif isinstance(root.slice, ast.Index) and isinstance(root.slice.value, ast.Tuple):
-                ij = [adj.eval(arg) for arg in root.slice.value.elts]
+                # The node `ast.Index` is deprecated in Python 3.9.
+                ij = tuple(arg for arg in root.slice.value.elts)
+            elif isinstance(root.slice, ast.ExtSlice):
+                # The node `ast.ExtSlice` is deprecated in Python 3.9.
+                ij = tuple(arg for arg in root.slice.dims)
             else:
-                ij = [adj.eval(root.slice)]
+                ij = (root.slice,)
 
-            indices = ij + indices  # prepend
+            nodes = ij + nodes  # prepend
 
             root = root.value
 
         target = adj.eval(root)
+        target_type = strip_reference(target.type)
+
+        if hasattr(target_type, "_wp_generic_type_hint_"):
+            indices = []
+            for dim, node in enumerate(nodes):
+                if isinstance(node, ast.Slice):
+                    # In the context of slicing a vec/mat type, indices are expected
+                    # to be compile-time constants, hence we can infer the actual slice
+                    # bounds also at compile-time.
+                    length = target_type._shape_[dim]
+                    step = 1 if node.step is None else adj.eval(node.step).constant
+
+                    if node.lower is None:
+                        start = length - 1 if step < 0 else 0
+                    else:
+                        start = adj.eval(node.lower).constant
+                        start = min(max(start, -length), length)
+                        start = start + length if start < 0 else start
+
+                    if node.upper is None:
+                        stop = -1 if step < 0 else length
+                    else:
+                        stop = adj.eval(node.upper).constant
+                        stop = min(max(stop, -length), length)
+                        stop = stop + length if stop < 0 else stop
+
+                    slice = adj.add_builtin_call("slice", (start, stop, step))
+                    indices.append(slice)
+                else:
+                    indices.append(adj.eval(node))
+
+            indices = tuple(indices)
+        else:
+            indices = tuple(adj.eval(x) for x in nodes)
 
         return target, indices
 
@@ -3109,6 +3186,7 @@ class Adjoint:
 
         # Since this is an expression, we can enforce it to be defined on a single line.
         static_code = static_code.replace("\n", "")
+        code_to_eval = static_code  # code to be evaluated
 
         vars_dict = adj.get_static_evaluation_context()
         # add constant variables to the static call context
@@ -3150,10 +3228,10 @@ class Adjoint:
                     loc = end
 
                 new_static_code += static_code[len_value_locs[-1][2] :]
-                static_code = new_static_code
+                code_to_eval = new_static_code
 
         try:
-            value = eval(static_code, vars_dict)
+            value = eval(code_to_eval, vars_dict)
             if warp.config.verbose:
                 print(f"Evaluated static command: {static_code} = {value}")
         except NameError as e:
@@ -3206,6 +3284,9 @@ class Adjoint:
                         #      (and is therefore not executable and raises this exception), in which
                         #      case changing the constant, or the code affecting this constant, would lead to
                         #      a different module hash anyway.
+                        # In any case, we mark this Adjoint to have unresolvable static expressions.
+                        # This will trigger a code generation step even if the module hash is unchanged.
+                        adj.has_unresolved_static_expressions = True
                         pass
 
                 return self.generic_visit(node)
@@ -3398,6 +3479,12 @@ static CUDA_CALLABLE void adj_{name}({reverse_args})
 {{
 {reverse_body}}}
 
+// Required when compiling adjoints.
+CUDA_CALLABLE {name} add(const {name}& a, const {name}& b)
+{{
+    return {name}();
+}}
+
 CUDA_CALLABLE void adj_atomic_add({name}* p, {name} t)
 {{
 {atomic_add_body}}}
@@ -3563,7 +3650,7 @@ def constant_str(value):
             # special case for float16, which is stored as uint16 in the ctypes.Array
             from warp.context import runtime
 
-            scalar_value = runtime.core.half_bits_to_float
+            scalar_value = runtime.core.wp_half_bits_to_float
         else:
 
             def scalar_value(x):
@@ -3836,6 +3923,19 @@ def codegen_func(adj, c_func_name: str, device="cpu", options=None):
                 f"The function `{adj.fun_name}` has its return type "
                 f"annotated as `{warp.context.type_str(adj.arg_types['return'])}` "
                 f"but the code returns a value of type `{warp.context.type_str(adj.return_var[0].type)}`."
+            )
+        elif (
+            isinstance(adj.return_var[0].type, warp.types.fixedarray)
+            and type(adj.arg_types["return"]) is warp.types.array
+        ):
+            # If the return statement yields a `fixedarray` while the function is annotated
+            # to return a standard `array`, then raise an error since the `fixedarray` storage
+            # allocated on the stack will be freed once the function exits, meaning that the
+            # resulting `array` instance will point to an invalid data.
+            raise WarpCodegenError(
+                f"The function `{adj.fun_name}` returns a fixed-size array "
+                f"whereas it has its return type annotated as "
+                f"`{warp.context.type_str(adj.arg_types['return'])}`."
             )
 
     # Build line directive for function definition (subtract 1 to account for 1-indexing of AST line numbers)
