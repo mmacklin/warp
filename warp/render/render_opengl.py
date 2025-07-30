@@ -2566,9 +2566,8 @@ Instances: {len(self._instances)}"""
         if self.draw_axis:
             self._axis_instancer.render()
 
-        # with self._shape_shader:
-        #     for instancer in self._shape_instancers.values():
-        #         instancer.render()
+        for instancer in self._shape_instancers.values():
+            instancer.render()
 
         gl.glBindVertexArray(0)
 
