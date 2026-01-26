@@ -430,6 +430,139 @@ def test_apic_load_execute_multiple_kernels(test, device):
         np.testing.assert_array_almost_equal(new_d.numpy(), np.ones(n) * 24.0)
 
 
+def test_apic_with_memory_ops(test, device):
+    """Test APIC with memory operations (wp.copy) in addition to kernel launches."""
+    n = 256
+
+    # Create arrays
+    src = wp.array(np.arange(n, dtype=np.float32) + 1.0, device=device)  # [1, 2, 3, ...]
+    tmp = wp.zeros(n, dtype=float, device=device)
+    dst = wp.zeros(n, dtype=float, device=device)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        graph_path = os.path.join(tmpdir, "memop_graph")
+
+        # Capture a graph that:
+        # 1. Copies src to tmp (D2D copy)
+        # 2. Scales tmp and writes to dst (kernel)
+        with wp.ScopedCapture(device=device, apic=True) as capture:
+            wp.copy(tmp, src)
+            wp.launch(scale_kernel, dim=n, inputs=[tmp, dst, 2.0], device=device)
+
+        # Verify memory op was recorded
+        apic = capture.graph.apic_capture
+        test.assertEqual(len(apic.memory_ops), 1)
+        test.assertEqual(len(apic.launches), 1)
+        test.assertEqual(apic.memory_ops[0].kind, "D2D")
+
+        # Execute original graph to verify it works
+        wp.capture_launch(capture.graph)
+        wp.synchronize_device(device)
+
+        # dst should be (src * 2) = [2, 4, 6, ...]
+        expected = (np.arange(n, dtype=np.float32) + 1.0) * 2.0
+        np.testing.assert_array_almost_equal(dst.numpy(), expected)
+
+        # Save the graph
+        wp.capture_save(
+            capture.graph,
+            graph_path,
+            inputs={"src": src},
+            outputs={"dst": dst},
+        )
+
+        # Load the graph
+        loaded_graph = wp.capture_load(graph_path, device=device)
+
+        # Create new arrays for execution
+        new_src = wp.array(np.ones(n, dtype=np.float32) * 10.0, device=device)
+        new_dst = wp.zeros(n, dtype=float, device=device)
+
+        # Bind the new arrays
+        loaded_graph.bind_input("src", new_src)
+        loaded_graph.bind_output("dst", new_dst)
+
+        # Execute
+        loaded_graph.execute()
+        wp.synchronize_device(device)
+
+        # new_dst should be (10.0 * 2.0) = 20.0
+        expected = np.ones(n, dtype=np.float32) * 20.0
+        np.testing.assert_array_almost_equal(new_dst.numpy(), expected)
+
+
+def test_apic_complex_pipeline(test, device):
+    """Test a more complex pipeline with multiple kernels and memory operations."""
+    n = 128
+
+    # Create arrays for a multi-stage pipeline:
+    # Stage 1: a + b -> c (add_kernel)
+    # Stage 2: copy c -> d
+    # Stage 3: d * 2 -> e (scale_kernel)
+    # Stage 4: copy e -> f
+    # Stage 5: f + c -> g (add_kernel)
+    a = wp.array(np.ones(n, dtype=np.float32) * 2.0, device=device)
+    b = wp.array(np.ones(n, dtype=np.float32) * 3.0, device=device)
+    c = wp.zeros(n, dtype=float, device=device)
+    d = wp.zeros(n, dtype=float, device=device)
+    e = wp.zeros(n, dtype=float, device=device)
+    f = wp.zeros(n, dtype=float, device=device)
+    g = wp.zeros(n, dtype=float, device=device)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        graph_path = os.path.join(tmpdir, "complex_pipeline")
+
+        with wp.ScopedCapture(device=device, apic=True) as capture:
+            wp.launch(add_kernel, dim=n, inputs=[a, b, c], device=device)  # c = 2 + 3 = 5
+            wp.copy(d, c)  # d = 5
+            wp.launch(scale_kernel, dim=n, inputs=[d, e, 2.0], device=device)  # e = 5 * 2 = 10
+            wp.copy(f, e)  # f = 10
+            wp.launch(add_kernel, dim=n, inputs=[f, c, g], device=device)  # g = 10 + 5 = 15
+
+        apic = capture.graph.apic_capture
+        test.assertEqual(len(apic.launches), 3)
+        test.assertEqual(len(apic.memory_ops), 2)
+
+        # Execute and verify
+        wp.capture_launch(capture.graph)
+        wp.synchronize_device(device)
+
+        np.testing.assert_array_almost_equal(c.numpy(), np.ones(n) * 5.0)
+        np.testing.assert_array_almost_equal(d.numpy(), np.ones(n) * 5.0)
+        np.testing.assert_array_almost_equal(e.numpy(), np.ones(n) * 10.0)
+        np.testing.assert_array_almost_equal(f.numpy(), np.ones(n) * 10.0)
+        np.testing.assert_array_almost_equal(g.numpy(), np.ones(n) * 15.0)
+
+        # Save
+        wp.capture_save(
+            capture.graph,
+            graph_path,
+            inputs={"a": a, "b": b},
+            outputs={"g": g},
+        )
+
+        # Load
+        loaded_graph = wp.capture_load(graph_path, device=device)
+
+        # Create new input/output arrays
+        new_a = wp.array(np.ones(n, dtype=np.float32) * 10.0, device=device)
+        new_b = wp.array(np.ones(n, dtype=np.float32) * 5.0, device=device)
+        new_g = wp.zeros(n, dtype=float, device=device)
+
+        # Bind
+        loaded_graph.bind_input("a", new_a)
+        loaded_graph.bind_input("b", new_b)
+        loaded_graph.bind_output("g", new_g)
+
+        # Execute
+        loaded_graph.execute()
+        wp.synchronize_device(device)
+
+        # Expected: c = 10 + 5 = 15, e = 15 * 2 = 30, g = 30 + 15 = 45
+        expected_g = np.ones(n, dtype=np.float32) * 45.0
+        np.testing.assert_array_almost_equal(new_g.numpy(), expected_g)
+
+
 class TestApic(unittest.TestCase):
     pass
 
@@ -453,6 +586,8 @@ add_function_test(TestApic, "test_apic_save_load_execute", test_apic_save_load_e
 add_function_test(
     TestApic, "test_apic_load_execute_multiple_kernels", test_apic_load_execute_multiple_kernels, devices=devices
 )
+add_function_test(TestApic, "test_apic_with_memory_ops", test_apic_with_memory_ops, devices=devices)
+add_function_test(TestApic, "test_apic_complex_pipeline", test_apic_complex_pipeline, devices=devices)
 
 
 if __name__ == "__main__":

@@ -187,21 +187,20 @@ def _build_memory_section(capture: APICapture) -> bytes:
 
 
 def _build_operations_section(capture: APICapture) -> bytes:
-    """Build the operations section containing launches and memory ops."""
+    """Build the operations section containing launches and memory ops in order."""
     # Format: [num_operations: u32]
     #         [op_type: u8, op_data...]...
 
     chunks = []
-    total_ops = len(capture.launches) + len(capture.memory_ops)
+    total_ops = len(capture.operations)
     chunks.append(struct.pack("<I", total_ops))
 
-    # Write launches
-    for launch in capture.launches:
-        chunks.append(_serialize_launch(launch))
-
-    # Write memory operations
-    for op in capture.memory_ops:
-        chunks.append(_serialize_memory_op(op))
+    # Write operations in the order they were captured
+    for op_type, idx in capture.operations:
+        if op_type == "launch":
+            chunks.append(_serialize_launch(capture.launches[idx]))
+        elif op_type == "memop":
+            chunks.append(_serialize_memory_op(capture.memory_ops[idx]))
 
     return b"".join(chunks)
 
@@ -366,12 +365,13 @@ def load_graph(path: str, device=None):
     _initialize_memory_regions(memory_regions, memory_data, device)
 
     # Parse operations and build execution plan
-    launches, memory_ops = _parse_operations(operations_data, metadata, loaded_modules, memory_regions)
+    launches, memory_ops, operations = _parse_operations(operations_data, metadata, loaded_modules, memory_regions)
 
     # Create and return a LoadedGraph
     return LoadedGraph(
         device=device,
         metadata=metadata,
+        operations=operations,
         loaded_modules=loaded_modules,
         memory_regions=memory_regions,
         launches=launches,
@@ -467,12 +467,13 @@ def _initialize_memory_regions(regions: dict, memory_data: bytes, device):
 
 
 def _parse_operations(operations_data: bytes, metadata: dict, loaded_modules: dict, memory_regions: dict):
-    """Parse the operations section and build execution plan."""
+    """Parse the operations section and build execution plan preserving order."""
     launches = []
     memory_ops = []
+    operations = []  # List of ("launch", idx) or ("memop", idx) in execution order
 
     if not operations_data:
-        return launches, memory_ops
+        return launches, memory_ops, operations
 
     offset = 0
 
@@ -487,17 +488,21 @@ def _parse_operations(operations_data: bytes, metadata: dict, loaded_modules: di
         if op_type == 1:  # KERNEL_LAUNCH
             launch, offset = _parse_launch(operations_data, offset, metadata, loaded_modules, memory_regions)
             launches.append(launch)
+            operations.append(("launch", len(launches) - 1))
         elif op_type == 2:  # MEMCPY_H2D
             op, offset = _parse_memcpy_h2d(operations_data, offset, memory_regions)
             memory_ops.append(op)
+            operations.append(("memop", len(memory_ops) - 1))
         elif op_type == 4:  # MEMCPY_D2D
             op, offset = _parse_memcpy_d2d(operations_data, offset, memory_regions)
             memory_ops.append(op)
+            operations.append(("memop", len(memory_ops) - 1))
         elif op_type == 5:  # MEMSET
             op, offset = _parse_memset(operations_data, offset, memory_regions)
             memory_ops.append(op)
+            operations.append(("memop", len(memory_ops) - 1))
 
-    return launches, memory_ops
+    return launches, memory_ops, operations
 
 
 def _parse_launch(data: bytes, offset: int, metadata: dict, loaded_modules: dict, memory_regions: dict):
@@ -618,6 +623,8 @@ def _parse_memcpy_h2d(data: bytes, offset: int, memory_regions: dict):
 
     return {
         "type": "memcpy_h2d",
+        "dst_region_id": dst_region_id,
+        "dst_offset": dst_offset,
         "dst_ptr": dst_ptr,
         "src_data": src_data,
         "size": size,
@@ -626,8 +633,9 @@ def _parse_memcpy_h2d(data: bytes, offset: int, memory_regions: dict):
 
 def _parse_memcpy_d2d(data: bytes, offset: int, memory_regions: dict):
     """Parse a D2D memcpy operation."""
+    # Format: i=4, Q=8, i=4, Q=8, Q=8 = 32 bytes
     dst_region_id, dst_offset, src_region_id, src_offset, size = struct.unpack_from("<iQiQQ", data, offset)
-    offset += 36
+    offset += 32
 
     dst_ptr = None
     src_ptr = None
@@ -638,6 +646,10 @@ def _parse_memcpy_d2d(data: bytes, offset: int, memory_regions: dict):
 
     return {
         "type": "memcpy_d2d",
+        "dst_region_id": dst_region_id,
+        "dst_offset": dst_offset,
+        "src_region_id": src_region_id,
+        "src_offset": src_offset,
         "dst_ptr": dst_ptr,
         "src_ptr": src_ptr,
         "size": size,
@@ -655,6 +667,8 @@ def _parse_memset(data: bytes, offset: int, memory_regions: dict):
 
     return {
         "type": "memset",
+        "region_id": region_id,
+        "offset": mem_offset,
         "ptr": ptr,
         "value": value,
         "size": size,
@@ -664,9 +678,10 @@ def _parse_memset(data: bytes, offset: int, memory_regions: dict):
 class LoadedGraph:
     """A loaded graph that can be executed."""
 
-    def __init__(self, device, metadata, loaded_modules, memory_regions, launches, memory_ops):
+    def __init__(self, device, metadata, operations, loaded_modules, memory_regions, launches, memory_ops):
         self.device = device
         self.metadata = metadata
+        self.operations = operations  # Ordered list of ("launch", idx) or ("memop", idx)
         self.loaded_modules = loaded_modules
         self.memory_regions = memory_regions
         self.launches = launches
@@ -751,13 +766,28 @@ class LoadedGraph:
         self._update_region_bindings(region_id, arr.ptr)
 
     def _update_region_bindings(self, region_id: int, new_ptr: int):
-        """Update all parameter bindings that reference a region."""
+        """Update all parameter bindings and memory operations that reference a region."""
+        # Update kernel parameter bindings
         for launch in self.launches:
             for binding in launch["param_bindings"]:
                 if binding["type"] == "array" and binding["region_id"] == region_id:
                     # Recalculate pointer using stored byte offset
                     byte_offset = binding.get("byte_offset", 0)
                     binding["ptr"] = new_ptr + byte_offset if new_ptr else None
+
+        # Update memory operations
+        for op in self.memory_ops:
+            if op["type"] == "memcpy_d2d":
+                if op.get("dst_region_id") == region_id:
+                    op["dst_ptr"] = new_ptr + op.get("dst_offset", 0) if new_ptr else None
+                if op.get("src_region_id") == region_id:
+                    op["src_ptr"] = new_ptr + op.get("src_offset", 0) if new_ptr else None
+            elif op["type"] == "memcpy_h2d":
+                if op.get("dst_region_id") == region_id:
+                    op["dst_ptr"] = new_ptr + op.get("dst_offset", 0) if new_ptr else None
+            elif op["type"] == "memset":
+                if op.get("region_id") == region_id:
+                    op["ptr"] = new_ptr + op.get("offset", 0) if new_ptr else None
 
     def execute(self, stream=None):
         """Execute the loaded graph."""
@@ -773,53 +803,53 @@ class LoadedGraph:
 
         runtime = warp._src.context.runtime
 
-        # Execute memory operations first
-        for op in self.memory_ops:
-            if op["type"] == "memcpy_h2d":
-                src_ptr = (ctypes.c_uint8 * len(op["src_data"])).from_buffer_copy(op["src_data"])
-                runtime.core.wp_memcpy_h2d(
+        # Execute operations in the order they were captured
+        for op_type, idx in self.operations:
+            if op_type == "memop":
+                op = self.memory_ops[idx]
+                if op["type"] == "memcpy_h2d":
+                    src_ptr = (ctypes.c_uint8 * len(op["src_data"])).from_buffer_copy(op["src_data"])
+                    runtime.core.wp_memcpy_h2d(
+                        self.device.context,
+                        ctypes.c_void_p(op["dst_ptr"]),
+                        ctypes.cast(src_ptr, ctypes.c_void_p),
+                        op["size"],
+                        cuda_stream,
+                    )
+                elif op["type"] == "memcpy_d2d":
+                    runtime.core.wp_memcpy_d2d(
+                        self.device.context,
+                        ctypes.c_void_p(op["dst_ptr"]),
+                        ctypes.c_void_p(op["src_ptr"]),
+                        op["size"],
+                        cuda_stream,
+                    )
+                elif op["type"] == "memset":
+                    runtime.core.wp_memset_device(
+                        self.device.context,
+                        ctypes.c_void_p(op["ptr"]),
+                        op["value"],
+                        op["size"],
+                    )
+            elif op_type == "launch":
+                launch = self.launches[idx]
+                kernel_func = self.get_kernel_function(launch["kernel_name"], launch["module_hash"])
+
+                # Build argument array (_keep_alive prevents GC during launch)
+                args, _keep_alive = self._build_kernel_args(launch)
+
+                # Launch kernel
+                runtime.core.wp_cuda_launch_kernel(
                     self.device.context,
-                    ctypes.c_void_p(op["dst_ptr"]),
-                    ctypes.cast(src_ptr, ctypes.c_void_p),
-                    op["size"],
+                    kernel_func,
+                    launch["dim"],
+                    launch["max_blocks"],
+                    launch["block_dim"],
+                    launch["smem_bytes"],
+                    args,
                     cuda_stream,
                 )
-            elif op["type"] == "memcpy_d2d":
-                runtime.core.wp_memcpy_d2d(
-                    self.device.context,
-                    ctypes.c_void_p(op["dst_ptr"]),
-                    ctypes.c_void_p(op["src_ptr"]),
-                    op["size"],
-                    cuda_stream,
-                )
-            elif op["type"] == "memset":
-                runtime.core.wp_memset_device(
-                    self.device.context,
-                    ctypes.c_void_p(op["ptr"]),
-                    op["value"],
-                    op["size"],
-                )
-
-        # Execute kernel launches
-        for launch in self.launches:
-            kernel_func = self.get_kernel_function(launch["kernel_name"], launch["module_hash"])
-
-            # Build argument array (_keep_alive prevents GC during launch)
-            args, _keep_alive = self._build_kernel_args(launch)
-
-            # Launch kernel
-            runtime.core.wp_cuda_launch_kernel(
-                self.device.context,
-                kernel_func,
-                launch["dim"],
-                launch["max_blocks"],
-                launch["block_dim"],
-                launch["smem_bytes"],
-                args,
-                cuda_stream,
-            )
-
-            # keep_alive goes out of scope here but kernel has been submitted
+                # _keep_alive goes out of scope here but kernel has been submitted
 
     def _build_kernel_args(self, launch: dict):
         """Build the kernel argument array.

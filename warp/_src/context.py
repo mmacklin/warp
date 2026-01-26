@@ -8432,6 +8432,12 @@ def copy(
                     result = runtime.core.wp_memcpy_d2d(
                         dest.device.context, dst_ptr, src_ptr, bytes_to_copy, stream.cuda_stream
                     )
+                    # Record D2D copy for APIC if capturing
+                    if len(runtime.captures) > 0 and runtime.core.wp_cuda_stream_is_capturing(stream.cuda_stream):
+                        capture_id = runtime.core.wp_cuda_stream_get_capture_id(stream.cuda_stream)
+                        graph = runtime.captures.get(capture_id)
+                        if graph is not None and graph.apic_capture is not None:
+                            graph.apic_capture.record_memcpy_d2d(dest, dest_offset, src, src_offset, count)
                 else:
                     result = runtime.core.wp_memcpy_p2p(
                         dest.device.context, dst_ptr, src.device.context, src_ptr, bytes_to_copy, stream.cuda_stream

@@ -124,6 +124,7 @@ class APICapture:
         # Recorded data
         self.launches: list[LaunchRecord] = []
         self.memory_ops: list = []  # MemcpyRecord or MemsetRecord
+        self.operations: list = []  # All operations in order: ("launch", idx) or ("memop", idx)
         self.memory_regions: dict[int, MemoryRegion] = {}  # base_ptr -> region
         self.modules: dict[str, ModuleInfo] = {}  # module_hash -> ModuleInfo
         self.kernels: dict[str, KernelInfo] = {}  # kernel_key -> KernelInfo
@@ -276,6 +277,7 @@ class APICapture:
         self._record_param_bindings(record, launch, inputs, outputs)
 
         self.launches.append(record)
+        self.operations.append(("launch", len(self.launches) - 1))
 
     def _record_param_bindings(self, record: LaunchRecord, launch, inputs=None, outputs=None):
         """Extract parameter bindings from a Launch object.
@@ -370,7 +372,7 @@ class APICapture:
                     None,  # Use current stream
                 )
                 # Synchronize to ensure copy is complete
-                self.device.synchronize()
+                warp.synchronize_device(self.device)
                 region.initial_data = bytes(data)
 
     def set_input_binding(self, name: str, arr):
@@ -386,3 +388,37 @@ class APICapture:
         if offset != 0:
             raise ValueError(f"Output binding '{name}' must be a base array, not a slice")
         self.output_bindings[name] = region_id
+
+    def record_memcpy_d2d(self, dest, dest_offset: int, src, src_offset: int, count: int):
+        """Record a device-to-device memory copy operation.
+
+        Args:
+            dest: Destination array
+            dest_offset: Element offset in destination
+            src: Source array
+            src_offset: Element offset in source
+            count: Number of elements to copy
+        """
+        import warp
+
+        # Track both arrays
+        dst_region_id, dst_byte_offset = self.track_array(dest)
+        src_region_id, src_byte_offset = self.track_array(src)
+
+        # Calculate byte offsets including element offsets
+        element_size = warp._src.types.type_size_in_bytes(src.dtype)
+        dst_byte_offset += dest_offset * element_size
+        src_byte_offset += src_offset * element_size
+        size = count * element_size
+
+        record = MemcpyRecord(
+            dst_region_id=dst_region_id,
+            dst_offset=dst_byte_offset,
+            src_region_id=src_region_id,
+            src_offset=src_byte_offset,
+            size=size,
+            kind="D2D",
+            src_data=None,
+        )
+        self.memory_ops.append(record)
+        self.operations.append(("memop", len(self.memory_ops) - 1))
