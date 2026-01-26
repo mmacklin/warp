@@ -1,8 +1,9 @@
 # APIC (API Capture) Design Document
 ## CUDA Graph Capture, Serialization, and Replay for Warp
 
-### Version: 1.1
+### Version: 1.2
 ### Date: January 2026
+### Status: Implemented (Phases 1-3)
 
 ---
 
@@ -241,49 +242,11 @@ Cached artifacts location: `{kernel_cache_dir}/wp_{module_name}_{hash[:7]}/`
 
 ### 4.2 Component Design
 
-#### 4.2.1 APIC Layer (C++ and Python)
+#### 4.2.1 APIC Layer (Python-Only Implementation)
 
-The APIC layer intercepts Warp operations during capture. The implementation is split:
-- **C++ (warp.cu/warp.cpp)**: Low-level operation recording, memory tracking
-- **Python (context.py)**: High-level orchestration, serialization
+The APIC layer intercepts Warp operations during capture. **Implementation Note:** The actual implementation is purely Python-based, recording operations via hooks in `context.py` during kernel launches and memory operations. No C++ state management is required.
 
-**C++ APIC State (warp.cu):**
-
-```cpp
-// APIC recording state
-struct APICState {
-    bool recording = false;
-    std::vector<APICOperation> operations;
-    std::unordered_map<uint64_t, APICMemoryRegion> memory_regions;
-    std::unordered_map<std::string, APICKernelInfo> kernels;
-};
-
-struct APICMemoryRegion {
-    uint32_t region_id;
-    uint64_t base_ptr;       // Base allocation pointer
-    uint64_t size;           // Size in bytes
-    uint8_t role;            // input/output/internal
-};
-
-struct APICOperation {
-    uint8_t op_type;         // APIC_OP_KERNEL, APIC_OP_MEMCPY, etc.
-    // Union or variant for operation-specific data
-};
-
-// Thread-local APIC state
-static thread_local APICState* g_apic_state = nullptr;
-
-// APIC API
-void wp_apic_begin(APICState* state);
-void wp_apic_end();
-void wp_apic_record_kernel(void* kernel, size_t dim, int max_blocks,
-                           int block_dim, int smem_bytes, void** args);
-void wp_apic_record_memcpy(void* dst, void* src, size_t size, int kind);
-void wp_apic_record_memset(void* dst, int value, size_t size);
-void wp_apic_track_memory(uint64_t ptr, uint64_t size, uint8_t role);
-```
-
-**Python APICapture Class:**
+**Python APICapture Class (warp/_src/apic/capture.py):**
 
 ```python
 class APICapture:
@@ -292,31 +255,57 @@ class APICapture:
     def __init__(self, device: Device, stream: Stream = None):
         self.device = device
         self.stream = stream or device.stream
-        self.launches: list[Launch] = []  # Reuse existing Launch objects
-        self.memory_ops: list[MemoryOp] = []
-        self.memory_regions: dict[int, MemoryRegion] = {}
-        self.kernels: dict[str, KernelInfo] = {}
-        self.inputs: dict[str, ArrayBinding] = {}
-        self.outputs: dict[str, ArrayBinding] = {}
-        self._c_state = None  # Pointer to C++ APICState
+
+        # Recorded data
+        self.launches: list[LaunchRecord] = []
+        self.memory_ops: list = []  # MemcpyRecord or MemsetRecord
+        self.operations: list = []  # All ops in order: ("launch", idx) or ("memop", idx)
+        self.memory_regions: dict[int, MemoryRegion] = {}  # base_ptr -> region
+        self.modules: dict[str, ModuleInfo] = {}  # module_hash -> ModuleInfo
+        self.kernels: dict[str, KernelInfo] = {}  # kernel_key -> KernelInfo
+
+        # Input/output bindings
+        self.input_bindings: dict[str, int] = {}  # name -> region_id
+        self.output_bindings: dict[str, int] = {}  # name -> region_id
+
+        # Internal tracking
+        self._ptr_to_region_id: dict[int, int] = {}
+        self._next_region_id: int = 0
+        self._recording: bool = False
 
     def begin(self):
-        """Start APIC recording (calls into C++)."""
-        self._c_state = runtime.core.wp_apic_create_state()
-        runtime.core.wp_apic_begin(self._c_state)
+        """Start APIC recording."""
+        self._recording = True
 
     def end(self):
-        """End APIC recording and collect results."""
-        runtime.core.wp_apic_end()
-        # Retrieve recorded operations from C++ state
+        """End APIC recording."""
+        self._recording = False
 
-    def record_launch(self, launch: Launch):
-        """Record a kernel launch (reusing existing Launch object)."""
-        self.launches.append(launch)
-        # Also record kernel info if not seen before
-        if launch.kernel.key not in self.kernels:
-            self.kernels[launch.kernel.key] = self._extract_kernel_info(launch.kernel)
+    def record_launch(self, launch, inputs=None, outputs=None):
+        """Record a kernel launch from a Launch object."""
+        # Records LaunchRecord with kernel info and param bindings
+        # Tracks modules and kernels for serialization
+        ...
+
+    def record_memcpy_d2d(self, dest, dest_offset, src, src_offset, count):
+        """Record a device-to-device memory copy operation."""
+        # Creates MemcpyRecord and adds to operations list
+        ...
 ```
+
+**Operation Ordering:**
+
+The implementation maintains operation order through an `operations` list that tracks both kernel launches and memory operations in their original sequence:
+
+```python
+# After recording a launch
+self.operations.append(("launch", len(self.launches) - 1))
+
+# After recording a memory op
+self.operations.append(("memop", len(self.memory_ops) - 1))
+```
+
+This ensures correct execution order when operations are interleaved (e.g., kernel → memcpy → kernel).
 
 **Memory Operation Recording:**
 

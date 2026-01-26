@@ -333,10 +333,19 @@ def load_graph(path: str, device=None):
     Returns:
         A Graph object that can be executed with capture_launch()
     """
-    import warp
+    from warp._src.context import Graph
 
-    if device is None:
-        device = warp.get_device()
+    return Graph.load(path, device)
+
+
+def load_graph_into(graph, path: str):
+    """
+    Load a serialized graph from disk into an existing Graph object.
+
+    Args:
+        graph: The Graph object to populate
+        path: Path to the .wgf file
+    """
 
     base_path = Path(path)
     if not base_path.suffix:
@@ -348,35 +357,45 @@ def load_graph(path: str, device=None):
     reader = WGFReader(str(base_path))
 
     # Verify architecture
-    if reader.target_arch != device.arch:
-        raise ValueError(f"Graph was captured for arch {reader.target_arch}, but target device has arch {device.arch}")
+    if reader.target_arch != graph.device.arch:
+        raise ValueError(
+            f"Graph was captured for arch {reader.target_arch}, but target device has arch {graph.device.arch}"
+        )
 
     metadata = reader.get_metadata()
     memory_data = reader.get_memory()
     operations_data = reader.get_operations()
 
     # Load cubin modules
-    loaded_modules = _load_modules(metadata["modules"], modules_dir, device)
+    loaded_modules = _load_modules(metadata["modules"], modules_dir, graph.device)
 
     # Allocate memory regions
-    memory_regions = _allocate_memory_regions(metadata["memory_regions"], device)
+    memory_regions = _allocate_memory_regions(metadata["memory_regions"], graph.device)
 
     # Initialize internal regions with saved data
-    _initialize_memory_regions(memory_regions, memory_data, device)
+    _initialize_memory_regions(memory_regions, memory_data, graph.device)
 
     # Parse operations and build execution plan
     launches, memory_ops, operations = _parse_operations(operations_data, metadata, loaded_modules, memory_regions)
 
-    # Create and return a LoadedGraph
-    return LoadedGraph(
-        device=device,
-        metadata=metadata,
-        operations=operations,
-        loaded_modules=loaded_modules,
-        memory_regions=memory_regions,
-        launches=launches,
-        memory_ops=memory_ops,
-    )
+    # Populate the graph object
+    graph._loaded_modules = loaded_modules
+    graph._memory_regions = memory_regions
+    graph._launches = launches
+    graph._memory_ops = memory_ops
+    graph._operations = operations
+    graph._metadata = metadata
+
+    # Build input/output region mappings
+    for name, region_id in metadata.get("input_bindings", {}).items():
+        graph._input_bindings[name] = region_id
+
+    for name, region_id in metadata.get("output_bindings", {}).items():
+        graph._output_bindings[name] = region_id
+
+    # Build the CUDA graph by replaying operations during capture
+    graph._needs_rebuild = True
+    graph._rebuild_cuda_graph()
 
 
 def _load_modules(modules_metadata: dict, modules_dir: Path, device) -> dict:
@@ -673,237 +692,3 @@ def _parse_memset(data: bytes, offset: int, memory_regions: dict):
         "value": value,
         "size": size,
     }, offset
-
-
-class LoadedGraph:
-    """A loaded graph that can be executed."""
-
-    def __init__(self, device, metadata, operations, loaded_modules, memory_regions, launches, memory_ops):
-        self.device = device
-        self.metadata = metadata
-        self.operations = operations  # Ordered list of ("launch", idx) or ("memop", idx)
-        self.loaded_modules = loaded_modules
-        self.memory_regions = memory_regions
-        self.launches = launches
-        self.memory_ops = memory_ops
-
-        # Build input/output region mappings
-        self.input_regions = {}  # name -> region_id
-        self.output_regions = {}  # name -> region_id
-
-        for name, region_id in metadata.get("input_bindings", {}).items():
-            self.input_regions[name] = region_id
-
-        for name, region_id in metadata.get("output_bindings", {}).items():
-            self.output_regions[name] = region_id
-
-        # Cache kernel functions
-        self._kernel_cache = {}
-
-    def get_kernel_function(self, kernel_name: str, module_hash: str):
-        """Get a kernel function pointer from the loaded modules."""
-        import warp
-
-        cache_key = (kernel_name, module_hash)
-        if cache_key in self._kernel_cache:
-            return self._kernel_cache[cache_key]
-
-        if module_hash not in self.loaded_modules:
-            raise ValueError(f"Module {module_hash} not loaded")
-
-        module_info = self.loaded_modules[module_hash]
-        cuda_module = module_info["cuda_module"]
-
-        runtime = warp._src.context.runtime
-        kernel_func = runtime.core.wp_cuda_get_kernel(self.device.context, cuda_module, kernel_name.encode("utf-8"))
-
-        if kernel_func is None:
-            raise ValueError(f"Kernel {kernel_name} not found in module")
-
-        self._kernel_cache[cache_key] = kernel_func
-        return kernel_func
-
-    def bind_input(self, name: str, arr):
-        """Bind an input array."""
-        if name not in self.input_regions:
-            raise ValueError(f"Unknown input binding: {name}")
-
-        region_id = self.input_regions[name]
-        if region_id not in self.memory_regions:
-            raise ValueError(f"Input region {region_id} not allocated")
-
-        region = self.memory_regions[region_id]
-
-        # Verify size matches
-        if arr.capacity != region["size"]:
-            raise ValueError(f"Input array size mismatch: expected {region['size']}, got {arr.capacity}")
-
-        # Update region pointer to point to the provided array
-        region["ptr"] = arr.ptr
-
-        # Update all parameter bindings that reference this region
-        self._update_region_bindings(region_id, arr.ptr)
-
-    def bind_output(self, name: str, arr):
-        """Bind an output array."""
-        if name not in self.output_regions:
-            raise ValueError(f"Unknown output binding: {name}")
-
-        region_id = self.output_regions[name]
-        if region_id not in self.memory_regions:
-            raise ValueError(f"Output region {region_id} not allocated")
-
-        region = self.memory_regions[region_id]
-
-        # Verify size matches
-        if arr.capacity != region["size"]:
-            raise ValueError(f"Output array size mismatch: expected {region['size']}, got {arr.capacity}")
-
-        # Update region pointer
-        region["ptr"] = arr.ptr
-
-        # Update all parameter bindings that reference this region
-        self._update_region_bindings(region_id, arr.ptr)
-
-    def _update_region_bindings(self, region_id: int, new_ptr: int):
-        """Update all parameter bindings and memory operations that reference a region."""
-        # Update kernel parameter bindings
-        for launch in self.launches:
-            for binding in launch["param_bindings"]:
-                if binding["type"] == "array" and binding["region_id"] == region_id:
-                    # Recalculate pointer using stored byte offset
-                    byte_offset = binding.get("byte_offset", 0)
-                    binding["ptr"] = new_ptr + byte_offset if new_ptr else None
-
-        # Update memory operations
-        for op in self.memory_ops:
-            if op["type"] == "memcpy_d2d":
-                if op.get("dst_region_id") == region_id:
-                    op["dst_ptr"] = new_ptr + op.get("dst_offset", 0) if new_ptr else None
-                if op.get("src_region_id") == region_id:
-                    op["src_ptr"] = new_ptr + op.get("src_offset", 0) if new_ptr else None
-            elif op["type"] == "memcpy_h2d":
-                if op.get("dst_region_id") == region_id:
-                    op["dst_ptr"] = new_ptr + op.get("dst_offset", 0) if new_ptr else None
-            elif op["type"] == "memset":
-                if op.get("region_id") == region_id:
-                    op["ptr"] = new_ptr + op.get("offset", 0) if new_ptr else None
-
-    def execute(self, stream=None):
-        """Execute the loaded graph."""
-        import ctypes
-
-        import warp
-
-        if stream is None:
-            stream = self.device.stream
-
-        # Get the CUDA stream handle
-        cuda_stream = stream.cuda_stream
-
-        runtime = warp._src.context.runtime
-
-        # Execute operations in the order they were captured
-        for op_type, idx in self.operations:
-            if op_type == "memop":
-                op = self.memory_ops[idx]
-                if op["type"] == "memcpy_h2d":
-                    src_ptr = (ctypes.c_uint8 * len(op["src_data"])).from_buffer_copy(op["src_data"])
-                    runtime.core.wp_memcpy_h2d(
-                        self.device.context,
-                        ctypes.c_void_p(op["dst_ptr"]),
-                        ctypes.cast(src_ptr, ctypes.c_void_p),
-                        op["size"],
-                        cuda_stream,
-                    )
-                elif op["type"] == "memcpy_d2d":
-                    runtime.core.wp_memcpy_d2d(
-                        self.device.context,
-                        ctypes.c_void_p(op["dst_ptr"]),
-                        ctypes.c_void_p(op["src_ptr"]),
-                        op["size"],
-                        cuda_stream,
-                    )
-                elif op["type"] == "memset":
-                    runtime.core.wp_memset_device(
-                        self.device.context,
-                        ctypes.c_void_p(op["ptr"]),
-                        op["value"],
-                        op["size"],
-                    )
-            elif op_type == "launch":
-                launch = self.launches[idx]
-                kernel_func = self.get_kernel_function(launch["kernel_name"], launch["module_hash"])
-
-                # Build argument array (_keep_alive prevents GC during launch)
-                args, _keep_alive = self._build_kernel_args(launch)
-
-                # Launch kernel
-                runtime.core.wp_cuda_launch_kernel(
-                    self.device.context,
-                    kernel_func,
-                    launch["dim"],
-                    launch["max_blocks"],
-                    launch["block_dim"],
-                    launch["smem_bytes"],
-                    args,
-                    cuda_stream,
-                )
-                # _keep_alive goes out of scope here but kernel has been submitted
-
-    def _build_kernel_args(self, launch: dict):
-        """Build the kernel argument array.
-
-        Returns tuple of (arg_ptrs, keep_alive) where keep_alive contains
-        references that must be kept alive until after kernel execution.
-        """
-        import ctypes
-
-        from warp._src.types import launch_bounds_t
-
-        # Keep references to prevent garbage collection
-        keep_alive = []
-
-        # First argument is always the bounds (using Warp's launch_bounds_t struct)
-        bounds = launch_bounds_t(launch["dim"])
-        keep_alive.append(bounds)
-
-        args = []
-        args.append(ctypes.c_void_p(ctypes.addressof(bounds)))
-
-        for binding in launch["param_bindings"]:
-            if binding["type"] == "array":
-                # Create array descriptor
-                arr_t = self._create_array_struct(binding)
-                keep_alive.append(arr_t)
-                args.append(ctypes.c_void_p(ctypes.addressof(arr_t)))
-            else:
-                # Scalar value
-                value = (ctypes.c_uint8 * binding["size"]).from_buffer_copy(binding["value"])
-                keep_alive.append(value)
-                args.append(ctypes.c_void_p(ctypes.addressof(value)))
-
-        # Convert to void** array
-        arg_ptrs = (ctypes.c_void_p * len(args))(*args)
-        keep_alive.append(arg_ptrs)
-
-        return arg_ptrs, keep_alive
-
-    def _create_array_struct(self, binding: dict):
-        """Create an array_t struct for a parameter binding."""
-        from warp._src.types import ARRAY_MAX_DIMS, array_t
-
-        arr = array_t()
-        arr.data = binding["ptr"] if binding["ptr"] else 0
-        arr.grad = 0
-        arr.ndim = binding["ndim"]
-
-        for i in range(ARRAY_MAX_DIMS):
-            if i < len(binding["shape"]):
-                arr.shape[i] = binding["shape"][i]
-                arr.strides[i] = binding["strides"][i]
-            else:
-                arr.shape[i] = 0
-                arr.strides[i] = 0
-
-        return arr

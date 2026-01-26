@@ -372,8 +372,8 @@ def test_apic_save_load_execute(test, device):
         loaded_graph.bind_input("input", new_input)
         loaded_graph.bind_output("output", new_output)
 
-        # Execute
-        loaded_graph.execute()
+        # Execute using capture_launch (works with both captured and loaded graphs)
+        wp.capture_launch(loaded_graph)
         wp.synchronize_device(device)
 
         # Verify result: 10.0 * 3.0 = 30.0
@@ -421,8 +421,8 @@ def test_apic_load_execute_multiple_kernels(test, device):
         loaded_graph.bind_output("c", new_c)
         loaded_graph.bind_output("d", new_d)
 
-        # Execute
-        loaded_graph.execute()
+        # Execute using capture_launch (works with both captured and loaded graphs)
+        wp.capture_launch(loaded_graph)
         wp.synchronize_device(device)
 
         # Verify: c = 5 + 7 = 12, d = 12 * 2 = 24
@@ -483,7 +483,7 @@ def test_apic_with_memory_ops(test, device):
         loaded_graph.bind_output("dst", new_dst)
 
         # Execute
-        loaded_graph.execute()
+        wp.capture_launch(loaded_graph)
         wp.synchronize_device(device)
 
         # new_dst should be (10.0 * 2.0) = 20.0
@@ -555,7 +555,7 @@ def test_apic_complex_pipeline(test, device):
         loaded_graph.bind_output("g", new_g)
 
         # Execute
-        loaded_graph.execute()
+        wp.capture_launch(loaded_graph)
         wp.synchronize_device(device)
 
         # Expected: c = 10 + 5 = 15, e = 15 * 2 = 30, g = 30 + 15 = 45
@@ -605,7 +605,7 @@ def test_apic_internal_allocation(test, device):
         loaded_graph = wp.capture_load(graph_path, device=device)
 
         # Should have allocated memory for all 3 regions
-        test.assertEqual(len(loaded_graph.memory_regions), 3)
+        test.assertEqual(len(loaded_graph._memory_regions), 3)
 
         # Create new arrays
         new_input = wp.array(np.ones(n, dtype=np.float32) * 10.0, device=device)
@@ -616,7 +616,7 @@ def test_apic_internal_allocation(test, device):
         loaded_graph.bind_output("output", new_output)
 
         # Execute
-        loaded_graph.execute()
+        wp.capture_launch(loaded_graph)
         wp.synchronize_device(device)
 
         # tmp = 10 * 2 = 20, output = tmp + input = 20 + 10 = 30
@@ -666,7 +666,7 @@ def test_apic_multiple_internal_allocations(test, device):
         loaded_graph.bind_input("input", new_input)
         loaded_graph.bind_output("output", new_output)
 
-        loaded_graph.execute()
+        wp.capture_launch(loaded_graph)
         wp.synchronize_device(device)
 
         # t1 = 5 * 2 = 10, t2 = 10 * 3 = 30, t3 = 10 + 30 = 40, output = 40 + 5 = 45
