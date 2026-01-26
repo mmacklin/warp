@@ -563,6 +563,117 @@ def test_apic_complex_pipeline(test, device):
         np.testing.assert_array_almost_equal(new_g.numpy(), expected_g)
 
 
+def test_apic_internal_allocation(test, device):
+    """Test APIC with memory allocation inside graph capture."""
+    n = 128
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        graph_path = os.path.join(tmpdir, "alloc_graph")
+
+        # Create input/output arrays BEFORE capture
+        input_data = wp.array(np.arange(n, dtype=np.float32) + 1.0, device=device)
+        output_data = wp.zeros(n, dtype=float, device=device)
+
+        with wp.ScopedCapture(device=device, apic=True) as capture:
+            # Allocate temporary array INSIDE the capture
+            tmp = wp.zeros(n, dtype=float, device=device)
+            # Pipeline: tmp = input * 2, output = tmp + input
+            wp.launch(scale_kernel, dim=n, inputs=[input_data, tmp, 2.0], device=device)
+            wp.launch(add_kernel, dim=n, inputs=[tmp, input_data, output_data], device=device)
+
+        apic = capture.graph.apic_capture
+        # Should have 3 memory regions: input, output, and internal tmp
+        test.assertEqual(len(apic.memory_regions), 3)
+
+        # Execute original graph to verify it works
+        wp.capture_launch(capture.graph)
+        wp.synchronize_device(device)
+
+        # tmp = [2, 4, 6, ...], output = tmp + input = [3, 6, 9, ...]
+        expected = (np.arange(n, dtype=np.float32) + 1.0) * 3.0
+        np.testing.assert_array_almost_equal(output_data.numpy(), expected)
+
+        # Save
+        wp.capture_save(
+            capture.graph,
+            graph_path,
+            inputs={"input": input_data},
+            outputs={"output": output_data},
+        )
+
+        # Load
+        loaded_graph = wp.capture_load(graph_path, device=device)
+
+        # Should have allocated memory for all 3 regions
+        test.assertEqual(len(loaded_graph.memory_regions), 3)
+
+        # Create new arrays
+        new_input = wp.array(np.ones(n, dtype=np.float32) * 10.0, device=device)
+        new_output = wp.zeros(n, dtype=float, device=device)
+
+        # Bind
+        loaded_graph.bind_input("input", new_input)
+        loaded_graph.bind_output("output", new_output)
+
+        # Execute
+        loaded_graph.execute()
+        wp.synchronize_device(device)
+
+        # tmp = 10 * 2 = 20, output = tmp + input = 20 + 10 = 30
+        expected = np.ones(n, dtype=np.float32) * 30.0
+        np.testing.assert_array_almost_equal(new_output.numpy(), expected)
+
+
+def test_apic_multiple_internal_allocations(test, device):
+    """Test APIC with multiple internal allocations inside graph capture."""
+    n = 64
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        graph_path = os.path.join(tmpdir, "multi_alloc_graph")
+
+        # Only input and final output are bound
+        input_data = wp.array(np.ones(n, dtype=np.float32) * 2.0, device=device)
+        output_data = wp.zeros(n, dtype=float, device=device)
+
+        with wp.ScopedCapture(device=device, apic=True) as capture:
+            # Allocate multiple temporary arrays
+            t1 = wp.zeros(n, dtype=float, device=device)
+            t2 = wp.zeros(n, dtype=float, device=device)
+            t3 = wp.zeros(n, dtype=float, device=device)
+
+            # Multi-stage computation
+            wp.launch(scale_kernel, dim=n, inputs=[input_data, t1, 2.0], device=device)  # t1 = 4
+            wp.launch(scale_kernel, dim=n, inputs=[t1, t2, 3.0], device=device)  # t2 = 12
+            wp.launch(add_kernel, dim=n, inputs=[t1, t2, t3], device=device)  # t3 = 4 + 12 = 16
+            wp.launch(add_kernel, dim=n, inputs=[t3, input_data, output_data], device=device)  # out = 16 + 2 = 18
+
+        # Should have 5 memory regions: input, output, t1, t2, t3
+        test.assertEqual(len(capture.graph.apic_capture.memory_regions), 5)
+
+        # Verify original graph
+        wp.capture_launch(capture.graph)
+        wp.synchronize_device(device)
+        np.testing.assert_array_almost_equal(output_data.numpy(), np.ones(n) * 18.0)
+
+        # Save and load
+        wp.capture_save(capture.graph, graph_path, inputs={"input": input_data}, outputs={"output": output_data})
+        loaded_graph = wp.capture_load(graph_path, device=device)
+
+        # Create new arrays with different values
+        new_input = wp.array(np.ones(n, dtype=np.float32) * 5.0, device=device)
+        new_output = wp.zeros(n, dtype=float, device=device)
+
+        loaded_graph.bind_input("input", new_input)
+        loaded_graph.bind_output("output", new_output)
+
+        loaded_graph.execute()
+        wp.synchronize_device(device)
+
+        # t1 = 5 * 2 = 10, t2 = 10 * 3 = 30, t3 = 10 + 30 = 40, output = 40 + 5 = 45
+        expected = np.ones(n, dtype=np.float32) * 45.0
+        np.testing.assert_array_almost_equal(new_output.numpy(), expected)
+
+
 class TestApic(unittest.TestCase):
     pass
 
@@ -588,6 +699,10 @@ add_function_test(
 )
 add_function_test(TestApic, "test_apic_with_memory_ops", test_apic_with_memory_ops, devices=devices)
 add_function_test(TestApic, "test_apic_complex_pipeline", test_apic_complex_pipeline, devices=devices)
+add_function_test(TestApic, "test_apic_internal_allocation", test_apic_internal_allocation, devices=devices)
+add_function_test(
+    TestApic, "test_apic_multiple_internal_allocations", test_apic_multiple_internal_allocations, devices=devices
+)
 
 
 if __name__ == "__main__":

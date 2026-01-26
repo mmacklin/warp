@@ -357,23 +357,35 @@ class APICapture:
                 )
 
     def finalize_memory_data(self):
-        """Capture initial data for internal memory regions."""
+        """Capture initial data for internal memory regions.
+
+        Note: Memory allocated during graph capture (cudaMallocAsync) may not be
+        valid for D2H copy outside the graph context. Such regions are skipped
+        and will need to be fully written before being read during execution.
+        """
         import warp
 
         for base_ptr, region in self.memory_regions.items():
             if region.role == MemoryRole.INTERNAL:
-                # Copy data from device to host
-                data = (ctypes.c_uint8 * region.size)()
-                warp._src.context.runtime.core.wp_memcpy_d2h(
-                    self.device.context,
-                    ctypes.cast(data, ctypes.c_void_p),
-                    ctypes.c_void_p(base_ptr),
-                    region.size,
-                    None,  # Use current stream
-                )
-                # Synchronize to ensure copy is complete
-                warp.synchronize_device(self.device)
-                region.initial_data = bytes(data)
+                # Try to copy data from device to host
+                # This may fail for memory allocated during graph capture
+                try:
+                    data = (ctypes.c_uint8 * region.size)()
+                    result = warp._src.context.runtime.core.wp_memcpy_d2h(
+                        self.device.context,
+                        ctypes.cast(data, ctypes.c_void_p),
+                        ctypes.c_void_p(base_ptr),
+                        region.size,
+                        None,  # Use current stream
+                    )
+                    if result:
+                        # Synchronize to ensure copy is complete
+                        warp.synchronize_device(self.device)
+                        region.initial_data = bytes(data)
+                    # If result is False, the copy failed (likely async-allocated memory)
+                except Exception:
+                    # Skip regions that can't be copied (e.g., async allocations during capture)
+                    pass
 
     def set_input_binding(self, name: str, arr):
         """Mark an array as an input binding."""
