@@ -1,9 +1,9 @@
 # APIC (API Capture) Design Document
 ## CUDA Graph Capture, Serialization, and Replay for Warp
 
-### Version: 1.2
+### Version: 1.3
 ### Date: January 2026
-### Status: Implemented (Phases 1-3)
+### Status: Implemented (Phases 1-3, Python-only)
 
 ---
 
@@ -22,20 +22,20 @@ This document outlines the design for adding CUDA graph capture, serialization, 
 
 ### 2.1 Functional Requirements
 
-| ID | Requirement | Priority |
-|----|-------------|----------|
-| FR-1 | Capture kernel launches during `wp.capture_begin()` / `wp.capture_end()` | High |
-| FR-2 | Capture memory operations (memcpy, memset, allocations) | High |
-| FR-3 | Serialize captured graph to a custom binary format with `wp.capture_save()` | High |
-| FR-4 | Deserialize and recreate graph with `wp.capture_load()` | High |
-| FR-5 | Execute deserialized graph with `wp.capture_launch()` | High |
-| FR-6 | Support `wp.capture_func(fn)` convenience API for capturing a callable | High |
-| FR-7 | Serialize all referenced `wp.array` memory with proper aliasing handling | High |
-| FR-8 | Serialize compiled CUDA kernels (CUBIN as separate files) | High |
-| FR-9 | Generate C++ header for native application embedding | Medium |
-| FR-10 | Support input/output array designation for graph parameters | High |
-| FR-11 | Support `wp.Mesh`, `wp.Volume`, `wp.BVH` data structures | Medium |
-| FR-12 | Handle array slicing/aliasing (same underlying memory) | High |
+| ID | Requirement | Priority | Status |
+|----|-------------|----------|--------|
+| FR-1 | Capture kernel launches during `wp.capture_begin()` / `wp.capture_end()` | High | Done |
+| FR-2 | Capture memory operations (memcpy, memset, allocations) | High | Done |
+| FR-3 | Serialize captured graph to a custom binary format with `wp.capture_save()` | High | Done |
+| FR-4 | Deserialize and recreate graph with `wp.capture_load()` | High | Done |
+| FR-5 | Execute deserialized graph with `wp.capture_launch()` | High | Done |
+| FR-6 | Support `wp.capture_func(fn)` convenience API for capturing a callable | Medium | Not Implemented |
+| FR-7 | Serialize all referenced `wp.array` memory with proper aliasing handling | High | Done |
+| FR-8 | Serialize compiled CUDA kernels (CUBIN as separate files) | High | Done |
+| FR-9 | Generate C++ header for native application embedding | Medium | Not Implemented |
+| FR-10 | Support input/output array designation for graph parameters | High | Done |
+| FR-11 | Support `wp.Mesh`, `wp.Volume`, `wp.BVH` data structures | Medium | Not Implemented |
+| FR-12 | Handle array slicing/aliasing (same underlying memory) | High | Done |
 
 ### 2.2 Non-Functional Requirements
 
@@ -610,181 +610,177 @@ This approach handles arbitrary vector/matrix types (e.g., `vec(8, float16)` = 1
 
 #### 4.2.4 Extending the Graph Class
 
-Rather than creating a new `LoadedGraph` class, we extend the existing `Graph` class to support serialization and loading. This maintains API consistency and allows seamless use of loaded graphs with existing code.
+Rather than creating a new `LoadedGraph` class, we extend the existing `Graph` class to support serialization and loading. This maintains API consistency and allows seamless use of loaded graphs with existing code (same `wp.capture_launch()` works for both).
 
-**Extended Graph Class:**
+**Actual Implementation:**
 
 ```python
 class Graph:
     """Warp CUDA graph - extended to support serialization."""
 
-    def __init__(self, device: Device, capture_id: int = None):
+    def __init__(self, device: Device, capture_id: int | None = None, apic_capture=None):
         self.device = device
         self.capture_id = capture_id
         self.module_execs: set[ModuleExec] = set()
         self.graph_exec: ctypes.c_void_p | None = None
         self.graph: ctypes.c_void_p | None = None
+        # APIC capture state (for graphs being captured)
+        self.apic_capture = apic_capture
 
-        # APIC extensions (populated when loaded from file)
-        self._apic_state: APICapture | None = None
-        self._loaded_modules: dict[str, ctypes.c_void_p] = {}  # module_hash -> handle
-        self._loaded_kernels: dict[str, LoadedKernel] = {}     # kernel_key -> LoadedKernel
-        self._memory_regions: dict[int, DeviceAllocation] = {}
-        self._input_bindings: dict[str, InputBinding] = {}
-        self._output_bindings: dict[str, OutputBinding] = {}
-        self._source_path: str | None = None  # Path if loaded from file
+        # APIC loaded state (populated when loaded from file)
+        self._loaded_modules: dict = {}  # module_hash -> {cuda_module, info}
+        self._memory_regions: dict = {}  # region_id -> {ptr, size, element_size, role}
+        self._launches: list = []         # parsed launch records
+        self._memory_ops: list = []       # parsed memory operations
+        self._operations: list = []       # ordered ("launch", idx) or ("memop", idx)
+        self._input_bindings: dict = {}   # name -> region_id (simple int mapping)
+        self._output_bindings: dict = {}  # name -> region_id
+        self._source_path: str | None = None
+        self._kernel_cache: dict = {}     # (kernel_name, module_hash) -> kernel func
+        self._metadata: dict = {}
+        self._needs_rebuild: bool = False  # True if bindings changed
 
     @classmethod
     def load(cls, path: str, device: Device = None) -> "Graph":
-        """Load a graph from a .wgf file."""
-        device = device or wp.get_device()
+        """Load a graph from a .wgf file (internal, use wp.capture_load() instead)."""
+        from warp._src.apic.serialize import load_graph_into
+        device = device or warp.get_device()
         graph = cls(device)
         graph._source_path = path
-        graph._load_from_file(path)
+        load_graph_into(graph, path)
         return graph
 
-    def save(self, path: str,
-             inputs: dict[str, array] = None,
-             outputs: dict[str, array] = None,
-             generate_cpp_header: bool = False) -> None:
-        """Save this graph to a .wgf file."""
-        if self._apic_state is None:
-            raise RuntimeError("Graph was not captured with APIC enabled")
-        self._save_to_file(path, inputs, outputs, generate_cpp_header)
-
-    def _load_from_file(self, path: str):
-        """Load and parse the .wgf file, reconstruct CUDA graph."""
-        # Parse header and sections
-        # Load module CUBIN files from modules directory
-        # Get kernel function handles from loaded modules
-        # Allocate memory regions
-        # Reconstruct CUDA graph via capture replay
-
-    def _allocate_memory(self):
-        """Allocate device memory for all regions."""
-
-    def _load_modules(self, modules_dir: str):
-        """Load CUBIN files for all modules."""
-
-    def _load_kernels(self):
-        """Get kernel function handles from loaded modules."""
-
-    def _build_cuda_graph(self):
-        """Construct the CUDA graph by replaying recorded operations."""
-
-    def bind_input(self, name: str, arr: array) -> None:
-        """Bind an input array (updates graph exec parameters)."""
+    def bind_input(self, name: str, arr) -> None:
+        """Bind an input array to a named input slot."""
         if name not in self._input_bindings:
-            raise KeyError(f"Unknown input binding: {name}")
-        binding = self._input_bindings[name]
-        self._update_binding(binding, arr)
+            raise ValueError(f"Unknown input binding: {name}")
+        region_id = self._input_bindings[name]
+        region = self._memory_regions[region_id]
+        if arr.capacity != region["size"]:
+            raise ValueError(f"Size mismatch: expected {region['size']}, got {arr.capacity}")
+        region["ptr"] = arr.ptr
+        region["external"] = True
+        self._update_region_bindings(region_id, arr.ptr)
 
-    def bind_output(self, name: str, arr: array) -> None:
-        """Bind an output array (updates graph exec parameters)."""
-        if name not in self._output_bindings:
-            raise KeyError(f"Unknown output binding: {name}")
-        binding = self._output_bindings[name]
-        self._update_binding(binding, arr)
+    def bind_output(self, name: str, arr) -> None:
+        """Bind an output array to a named output slot."""
+        # Same logic as bind_input
 
-    def _update_binding(self, binding: ArrayBinding, arr: array):
-        """Update kernel node parameters for a binding."""
-        # Validate array properties
-        if binding.element_size != arr.dtype._length_ * arr.dtype._type_._length_:
-            raise TypeError(f"Element size mismatch")
-        # Use cudaGraphExecKernelNodeSetParams to update
-        for node_ref in binding.node_references:
-            runtime.core.wp_apic_update_kernel_node(
-                self.graph_exec, node_ref.node_id,
-                node_ref.param_index, arr.ptr
-            )
+    def _update_region_bindings(self, region_id: int, new_ptr: int):
+        """Update all bindings referencing a region and mark for rebuild."""
+        if self.is_loaded:
+            self._needs_rebuild = True
+            if self.graph_exec is not None:
+                runtime.core.wp_cuda_graph_exec_destroy(...)
+                self.graph_exec = None
+        # Update kernel param bindings and memory ops with new pointer
+
+    def _rebuild_cuda_graph(self):
+        """Rebuild CUDA graph by replaying operations during capture."""
+        # Destroy old graph
+        # Start capture: wp_cuda_graph_begin_capture(..., external=0)
+        # Replay: self._execute_loaded(stream)
+        # End capture: wp_cuda_graph_end_capture()
+        # self._needs_rebuild = False
+
+    def _execute_loaded(self, stream=None):
+        """Execute/replay operations (used during rebuild or execution)."""
+        # For each op in self._operations:
+        #   - memop: call wp_memcpy_* or wp_memset_device
+        #   - launch: build args, call wp_cuda_launch_kernel
 
     @property
-    def inputs(self) -> dict[str, InputBinding]:
-        """Get input binding information."""
-        return self._input_bindings
+    def inputs(self) -> dict:
+        """Get input binding names to region IDs."""
+        return dict(self._input_bindings)
 
     @property
-    def outputs(self) -> dict[str, OutputBinding]:
-        """Get output binding information."""
-        return self._output_bindings
+    def outputs(self) -> dict:
+        """Get output binding names to region IDs."""
+        return dict(self._output_bindings)
+
+    @property
+    def is_loaded(self) -> bool:
+        """True if this graph was loaded from a file."""
+        return self._source_path is not None
 ```
 
 **Graph Reconstruction via Replay:**
 
-Rather than deserializing a CUDA graph directly (not supported by CUDA), we reconstruct it by replaying operations:
+When a graph is loaded or bindings change, we reconstruct the CUDA graph by replaying operations during capture:
 
 ```python
-def _build_cuda_graph(self):
+def _rebuild_cuda_graph(self):
     """Reconstruct CUDA graph from recorded operations."""
+    # Destroy old graph/exec
+    if self.graph is not None:
+        runtime.core.wp_cuda_graph_destroy(self.device.context, self.graph)
+    # ...
 
-    # Start capture on our device/stream
-    wp.capture_begin(self.device, self.stream)
+    stream = self.device.stream
+
+    # Start capture (external=0 for new capture)
+    runtime.core.wp_cuda_graph_begin_capture(self.device.context, stream.cuda_stream, 0)
 
     try:
-        for op in self._apic_state.operations:
-            if isinstance(op, Launch):
-                # Replay kernel launch
-                self._replay_kernel_launch(op)
-            elif isinstance(op, MemcpyOp):
-                # Replay memory copy
-                self._replay_memcpy(op)
-            elif isinstance(op, MemsetOp):
-                # Replay memory set
-                self._replay_memset(op)
+        # Replay all operations - they get captured into the graph
+        self._execute_loaded(stream)
 
-        # End capture - this populates self.graph
-        captured = wp.capture_end()
-        self.graph = captured.graph
-        self.graph_exec = None  # Will be created on first launch
+        # End capture
+        g = ctypes.c_void_p()
+        runtime.core.wp_cuda_graph_end_capture(self.device.context, stream.cuda_stream, ctypes.byref(g))
+        self.graph = g
+        self._needs_rebuild = False
 
     except Exception:
-        wp.capture_end()  # Clean up capture state
+        # Clean up capture state on failure
+        runtime.core.wp_cuda_graph_end_capture(...)
         raise
 ```
 
 #### 4.2.5 Input/Output Binding System
 
-To support parameterized graphs, we need a binding system:
+**Actual Implementation (Simplified):**
+
+Rather than complex dataclasses with dtype/shape, the implementation uses simple mappings:
 
 ```python
-@dataclass
-class InputBinding:
-    """Describes an input array slot."""
-    name: str                # User-visible name
-    index: int               # Binding index
-    dtype: type              # Expected data type
-    shape: tuple | None      # Expected shape (None = any)
-    region_id: int           # Which memory region this replaces
+# In APICapture during capture:
+self.input_bindings: dict[str, int] = {}   # name -> region_id
+self.output_bindings: dict[str, int] = {}  # name -> region_id
 
-@dataclass
-class OutputBinding:
-    """Describes an output array slot."""
-    name: str
-    index: int
-    dtype: type
-    shape: tuple | None
-    region_id: int
+# Set during capture via:
+apic_capture.set_input_binding(name, arr)   # Tracks region_id, marks role=INPUT
+apic_capture.set_output_binding(name, arr)  # Tracks region_id, marks role=OUTPUT
 ```
 
-**Graph Node Update for Bindings:**
+**Binding Update Flow:**
 
-When a user binds an array, we need to update the kernel arguments in the CUDA graph:
+When a user binds an array, we:
+1. Validate array size matches region size
+2. Update the region's pointer to point to the new array
+3. Mark the array as externally owned (don't free on Graph destruction)
+4. Update all parameter bindings referencing the region
+5. Mark graph for rebuild (`_needs_rebuild = True`)
 
 ```python
-def bind_input(self, name: str, arr: array):
-    binding = self._find_binding(name, self._input_bindings)
+def bind_input(self, name: str, arr) -> None:
+    region_id = self._input_bindings[name]
+    region = self._memory_regions[region_id]
 
-    # Validate array properties
-    if binding.dtype != arr.dtype:
-        raise TypeError(f"Expected dtype {binding.dtype}, got {arr.dtype}")
-    if binding.shape and arr.shape != binding.shape:
-        raise ValueError(f"Expected shape {binding.shape}, got {arr.shape}")
+    # Validate size (not dtype - we're type-agnostic via element_size)
+    if arr.capacity != region["size"]:
+        raise ValueError(f"Size mismatch")
 
-    # Update CUDA graph kernel node parameters
-    # This uses cudaGraphExecKernelNodeSetParams
-    for node_id, param_idx in binding.node_references:
-        self._update_kernel_node_param(node_id, param_idx, arr)
+    # Update region pointer
+    region["ptr"] = arr.ptr
+    region["external"] = True
+
+    # Update all param bindings referencing this region
+    self._update_region_bindings(region_id, arr.ptr)
 ```
+
+**Note:** The current implementation validates only byte size, not dtype. This is intentional - it allows flexibility (e.g., binding a `float32[16]` where `vec4f[4]` was used) as long as total bytes match. Type interpretation is handled by the kernels.
 
 #### 4.2.6 C++ Header Generation
 
@@ -924,68 +920,69 @@ struct MyComputation::Impl {
 
 ### 5.1 New Public APIs
 
+**Implemented APIs:**
+
 ```python
-# Core capture/save/load APIs
-def capture_save(graph: Graph, path: str,
-                 inputs: dict[str, array] = None,
-                 outputs: dict[str, array] = None,
-                 generate_cpp_header: bool = False) -> None:
+# Public APIs exposed via warp module
+def wp.capture_save(
+    graph: Graph,
+    path: str,
+    inputs: dict[str, array] = None,
+    outputs: dict[str, array] = None,
+) -> None:
     """
-    Save a captured CUDA graph to a .wgf file.
+    Save a captured CUDA graph to disk.
 
     Args:
-        graph: A graph obtained from wp.capture_end() with apic=True
-        path: Output file path (.wgf extension)
-        inputs: Named arrays to mark as inputs (updateable at load time)
-        outputs: Named arrays to mark as outputs (updateable at load time)
-        generate_cpp_header: If True, also generate a .h file
-
-    Creates:
-        path.wgf                - Main graph file
-        path_modules/           - Directory with .cubin files (one per Warp module)
-        path_memory/            - Directory with large memory blobs (optional)
-        path.h                  - C++ header (if generate_cpp_header=True)
+        graph: A Graph as returned by wp.capture_end() with apic=True
+        path: Output path (without extension). Creates {path}.wgf and {path}_modules/
+        inputs: Dictionary mapping names to input arrays for binding
+        outputs: Dictionary mapping names to output arrays for binding
     """
 
-def capture_load(path: str, device: Device = None) -> Graph:
+def wp.capture_load(path: str, device=None) -> Graph:
     """
-    Load a serialized graph from a .wgf file.
+    Load a previously saved CUDA graph from disk.
 
     Args:
-        path: Path to .wgf file
+        path: Path to the .wgf file (with or without extension)
         device: Target device (default: current CUDA device)
 
     Returns:
-        Graph object ready for binding and execution (same type as capture_end())
+        Graph object ready for binding and execution via wp.capture_launch()
     """
+```
 
+**Usage Pattern:**
+
+```python
+# Capture with APIC enabled
+with wp.ScopedCapture(apic=True) as capture:
+    wp.launch(my_kernel, dim=n, inputs=[a], outputs=[b])
+
+# Save with named bindings
+wp.capture_save(capture.graph, "my_computation",
+                inputs={"positions": a},
+                outputs={"results": b})
+
+# Load and execute
+loaded_graph = wp.capture_load("my_computation")
+loaded_graph.bind_input("positions", new_positions)
+loaded_graph.bind_output("results", new_results)
+wp.capture_launch(loaded_graph)
+```
+
+**Not Yet Implemented:**
+
+```python
+# capture_func() - convenience function (FR-6, deferred)
 def capture_func(fn: Callable,
                  inputs: dict[str, array],
                  outputs: dict[str, array],
                  path: str = None,
                  device: Device = None) -> Graph | None:
-    """
-    Convenience function to capture, and optionally save, a computation.
-
-    Args:
-        fn: A callable that takes no arguments and performs Warp operations
-        inputs: Named input arrays used by fn
-        outputs: Named output arrays produced by fn
-        path: If provided, save the captured graph to this path
-        device: Target device
-
-    Returns:
-        Graph object if path is None, else None (graph is saved to file)
-
-    Example:
-        def compute():
-            wp.launch(my_kernel, dim=N, inputs=[a], outputs=[b])
-
-        wp.capture_func(compute,
-                        inputs={"positions": a},
-                        outputs={"results": b},
-                        path="my_computation.wgf")
-    """
+    """Convenience function to capture and optionally save a computation."""
+    pass  # Not implemented
 ```
 
 ### 5.2 Extended capture_begin/capture_end
@@ -1021,43 +1018,50 @@ def capture_end(device: Device = None, stream: Stream = None) -> Graph:
 
 ### 5.3 Extended Graph Class API
 
-The existing `Graph` class gains new methods:
+The existing `Graph` class gained new methods:
 
 ```python
 class Graph:
     # Existing methods (unchanged)
-    def __init__(self, device: Device, capture_id: int): ...
+    def __init__(self, device: Device, capture_id: int | None = None, apic_capture=None): ...
     def retain_module_exec(self, module_exec: ModuleExec): ...
 
-    # New class method for loading
+    # Internal class method for loading (use wp.capture_load() instead)
     @classmethod
     def load(cls, path: str, device: Device = None) -> "Graph":
-        """Load a graph from a .wgf file."""
+        """Load a graph from a .wgf file (called by wp.capture_load())."""
 
-    # New instance methods for APIC-enabled graphs
-    def save(self, path: str,
-             inputs: dict[str, array] = None,
-             outputs: dict[str, array] = None,
-             generate_cpp_header: bool = False) -> None:
-        """Save this graph to a .wgf file (requires apic=True during capture)."""
+    # New instance methods for loaded graphs
+    def bind_input(self, name: str, arr) -> None:
+        """Bind an array to a named input slot (marks graph for rebuild)."""
 
-    def bind_input(self, name: str, arr: array) -> None:
-        """Bind an array to a named input slot."""
-
-    def bind_output(self, name: str, arr: array) -> None:
-        """Bind an array to a named output slot."""
+    def bind_output(self, name: str, arr) -> None:
+        """Bind an array to a named output slot (marks graph for rebuild)."""
 
     @property
-    def inputs(self) -> dict[str, InputBinding]:
-        """Get input binding information (empty if not loaded from file)."""
+    def inputs(self) -> dict:
+        """Get input binding names to region IDs (empty if not loaded)."""
 
     @property
-    def outputs(self) -> dict[str, OutputBinding]:
-        """Get output binding information (empty if not loaded from file)."""
+    def outputs(self) -> dict:
+        """Get output binding names to region IDs (empty if not loaded)."""
 
     @property
-    def is_serializable(self) -> bool:
-        """True if graph was captured with apic=True or loaded from file."""
+    def is_loaded(self) -> bool:
+        """True if this graph was loaded from a file."""
+
+    # Internal methods
+    def _rebuild_cuda_graph(self) -> None:
+        """Rebuild CUDA graph by replaying operations during capture."""
+
+    def _execute_loaded(self, stream=None) -> None:
+        """Execute/replay loaded operations."""
+
+    def _update_region_bindings(self, region_id: int, new_ptr: int) -> None:
+        """Update all bindings referencing a region."""
+
+    def _get_kernel_function(self, kernel_name: str, module_hash: str):
+        """Get kernel function pointer from loaded modules."""
 ```
 
 ### 5.4 capture_launch (Unchanged)
@@ -1074,31 +1078,35 @@ def capture_launch(graph: Graph, stream: Stream = None) -> None:
 
 ## 6. Implementation Strategy
 
-### 6.1 Phase 1: C++ APIC Infrastructure
+### 6.1 Phase 1: Python APIC Infrastructure
 
-1. **APICState structure in warp.cu** - Core recording state
-2. **Hook wp_cuda_launch_kernel()** - Record kernel launches when APIC active
-3. **Hook memory operations** - Record memcpy, memset, alloc
-4. **wp_apic_begin/end()** - Start/stop recording
-5. **wp_apic_get_operations()** - Retrieve recorded ops for Python
+**Implementation Note:** The original design proposed C++ infrastructure, but the actual implementation is Python-only. This simplifies the implementation significantly while achieving the same functionality.
+
+1. **APICapture class** - Python-side recording state and orchestration
+2. **record_launch() hook** - Called from launch() during APIC-enabled capture
+3. **Memory operation hooks** - Record memcpy/memset via Python callbacks
+4. **begin()/end() methods** - Start/stop recording on APICapture object
+5. **Memory region tracking** - Handle array aliasing via `_ref` chain resolution
 
 ### 6.2 Phase 2: Python APIC Layer (Arrays Only)
 
-1. **Extend Graph class** - Add APIC fields and methods
-2. **APICapture class** - Python-side orchestration
-3. **Memory region tracking** - Handle array aliasing via `_ref` chain
-4. **Launch recording** - Capture `Launch` objects with full context
-5. **Basic .wgf file format** - Header, sections, JSON metadata
-6. **capture_save()** - Serialize to .wgf + copy .cubin files
-7. **Graph.load()** - Load .wgf and reconstruct graph
+1. **Extend Graph class** - Add APIC fields for loaded state (`_loaded_modules`, `_memory_regions`, `_launches`, `_memory_ops`, `_operations`, `_input_bindings`, `_output_bindings`, `_source_path`, `_kernel_cache`, `_metadata`, `_needs_rebuild`)
+2. **APICapture class** - Python recording state (warp/_src/apic/capture.py)
+3. **Memory region tracking** - Handle array aliasing via `_ref` chain resolution in track_array()
+4. **Launch recording** - Capture LaunchRecord objects with kernel info and parameter bindings
+5. **WGF file format** - Binary format with header, sections (metadata JSON, memory, operations)
+6. **save_graph()** - Serialize to .wgf + copy .cubin files (warp/_src/apic/serialize.py)
+7. **Graph.load()** - Class method to load .wgf and reconstruct graph via capture replay
 
 ### 6.3 Phase 3: Input/Output Bindings
 
-1. **Binding specification** - Mark arrays as inputs/outputs in save()
-2. **Track graph nodes** - Record which nodes use which bindings
-3. **Graph node update** - Implement `cudaGraphExecKernelNodeSetParams` wrapper
-4. **Validation** - Element size checking for bound arrays
-5. **Graph.bind_input/output()** - Full binding API
+1. **Binding specification** - Mark arrays as inputs/outputs via `set_input_binding()`/`set_output_binding()` during capture
+2. **Region-based tracking** - Bindings map names to region IDs (simple dict[str, int])
+3. **Graph rebuild on binding change** - When bindings change, `_rebuild_cuda_graph()` replays all operations during capture to create a new CUDA graph with updated pointers
+4. **Validation** - Size checking for bound arrays (capacity must match region size)
+5. **Graph.bind_input/output()** - Update region pointers and mark graph for rebuild
+
+**Note:** The original design proposed using `cudaGraphExecKernelNodeSetParams` for efficient in-place updates. The current implementation rebuilds the entire graph, which is simpler but less efficient for frequent binding changes. This trade-off was made to reduce implementation complexity.
 
 ### 6.4 Phase 4: C++ Header Generation
 
@@ -1119,126 +1127,82 @@ def capture_launch(graph: Graph, stream: Stream = None) -> None:
 
 ### 7.1 Modifications to Existing Code
 
-**warp/native/warp.cu (C++ Layer):**
-- Add APIC state management (`APICState`, `g_apic_state`)
-- Modify `wp_cuda_launch_kernel()` to record when APIC active
-- Add memory operation hooks:
-  - `wp_alloc_device_*` - record allocations
-  - `wp_memcpy_*` - record memory copies
-  - `wp_memset_device` - record memory sets
-- Add APIC-specific functions:
-  - `wp_apic_create_state()` / `wp_apic_destroy_state()`
-  - `wp_apic_begin()` / `wp_apic_end()`
-  - `wp_apic_get_operations()` - retrieve recorded ops
-  - `wp_apic_update_kernel_node()` - update graph exec params
-  - `wp_cuda_load_module_from_data()` - load CUBIN from memory
-
-**warp/native/warp.h:**
-- Export new APIC functions
-- Define APIC data structures for C/Python interop
+**Implementation Note:** The original design proposed C++ modifications. The actual implementation is Python-only, which simplifies integration significantly.
 
 **warp/_src/context.py (Python Layer):**
-- Extend `Graph` class with APIC fields and methods
-- Add `apic` parameter to `capture_begin()`
-- Modify `launch()` to record `Launch` objects when APIC active
-- Add public APIs: `capture_save`, `capture_load`, `capture_func`
-- Add thread-local `_apic_capture` state
+- Extended `Graph` class with APIC fields:
+  - `_loaded_modules`, `_memory_regions`, `_launches`, `_memory_ops`, `_operations`
+  - `_input_bindings`, `_output_bindings` (dict[str, int] mapping names to region IDs)
+  - `_source_path`, `_kernel_cache`, `_metadata`, `_needs_rebuild`
+- Added `apic` parameter to `capture_begin()`
+- Added `apic_capture` field to `Graph.__init__()`
+- Modified `launch()` to call `apic_capture.record_launch()` when APIC active
+- Added `Graph.load()` class method (internal, called by `wp.capture_load()`)
+- Added `Graph.bind_input()`, `Graph.bind_output()`, `Graph._rebuild_cuda_graph()`, `Graph._execute_loaded()` methods
+- Added `Graph.is_loaded` property
+- Added public APIs: `wp.capture_save()`, `wp.capture_load()`
 
 **warp/_src/types.py:**
-- Add `get_element_size()` helper for arrays
-- Ensure `_ref` chain is properly serializable
+- No modifications needed; `_ref` chain and array attributes work as-is
 
-**warp/_src/build.py:**
-- Add `get_kernel_cubin_path()` helper
-- Add `compile_ptx_to_cubin()` if needed
-
-### 7.2 New Files
+### 7.2 New Files (Actual Implementation)
 
 ```
 warp/_src/apic/
-    __init__.py           # Public exports
-    capture.py            # APICapture class (Python side)
-    serialize.py          # Serialization/deserialization
-    format.py             # .wgf file format handling
-    bindings.py           # Input/output binding system
-    cpp_gen.py            # C++ header generation
-
-warp/native/
-    apic.h                # APIC C++ declarations
-    apic.cpp              # APIC C++ implementation (compiled into warp.dll)
+    __init__.py           # Public exports (APICapture, KernelInfo, etc.)
+    capture.py            # APICapture class, LaunchRecord, MemcpyRecord, etc.
+    serialize.py          # save_graph(), load_graph(), load_graph_into()
+    format.py             # WGFReader, WGFWriter for .wgf file handling
 ```
 
-### 7.3 Memory Operation Hooks
+**Not implemented (deferred to Phase 4):**
+- `cpp_gen.py` - C++ header generation
 
-The C++ layer needs to intercept memory operations during APIC capture:
+### 7.3 Python Recording Hooks
 
-```cpp
-// In warp.cu - modified allocation function
-void* wp_alloc_device_default(void* context, size_t size) {
-    ContextGuard guard(context);
-    void* ptr;
-    check_cuda(cudaMalloc(&ptr, size));
-
-    // APIC hook
-    if (g_apic_state && g_apic_state->recording) {
-        g_apic_state->record_alloc(ptr, size);
-    }
-
-    return ptr;
-}
-
-// Modified memcpy
-void wp_memcpy_d2d(void* context, void* dst, void* src, size_t size) {
-    ContextGuard guard(context);
-
-    // APIC hook
-    if (g_apic_state && g_apic_state->recording) {
-        g_apic_state->record_memcpy(dst, src, size, APIC_MEMCPY_D2D);
-    }
-
-    check_cuda(cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToDevice,
-                               get_current_stream()));
-}
-
-// Modified kernel launch
-size_t wp_cuda_launch_kernel(void* context, void* kernel, size_t dim,
-                             int max_blocks, int block_dim,
-                             int shared_memory_bytes, void** args,
-                             void* stream) {
-    ContextGuard guard(context);
-
-    // APIC hook
-    if (g_apic_state && g_apic_state->recording) {
-        g_apic_state->record_kernel_launch(
-            kernel, dim, max_blocks, block_dim, shared_memory_bytes, args
-        );
-    }
-
-    // ... existing launch code ...
-}
-```
-
-### 7.4 Python-C++ Interface
-
-The Python side retrieves recorded operations from C++:
+Recording is done at the Python level via explicit calls:
 
 ```python
-# In context.py
-def capture_end(device=None, stream=None):
-    # ... existing code ...
+# In context.py launch() function
+def launch(...):
+    # ... existing launch code ...
 
-    graph = runtime.captures[stream].get(capture_id)
+    # APIC recording hook
+    if graph and graph.apic_capture and graph.apic_capture.is_recording():
+        graph.apic_capture.record_launch(launch_obj, inputs, outputs)
 
-    # If APIC was enabled, finalize recording
-    if graph._apic_state is not None:
-        # Get recorded operations from C++ layer
-        ops_data = runtime.core.wp_apic_get_operations(graph._apic_state._c_state)
-        graph._apic_state.parse_operations(ops_data)
+    # ... rest of launch code ...
+```
 
-        # Collect Launch objects recorded on Python side
-        # (these have richer type information than C++ layer)
+Memory operations are recorded via dedicated methods on APICapture:
 
-    # ... rest of existing code ...
+```python
+# Recording D2D copy
+apic_capture.record_memcpy_d2d(dest, dest_offset, src, src_offset, count)
+```
+
+### 7.4 Graph Reconstruction
+
+Rather than recording operations in C++ and retrieving them, the implementation:
+1. Records operations at the Python level during capture
+2. On load, parses the .wgf file and populates Graph fields
+3. Rebuilds the CUDA graph by starting capture, replaying all operations, and ending capture
+
+```python
+def _rebuild_cuda_graph(self):
+    """Rebuild CUDA graph by replaying operations during capture."""
+    # Start capture
+    runtime.core.wp_cuda_graph_begin_capture(self.device.context, stream.cuda_stream, 0)
+    try:
+        # Replay all recorded operations
+        self._execute_loaded(stream)
+        # End capture to get the graph
+        runtime.core.wp_cuda_graph_end_capture(self.device.context, stream.cuda_stream, ctypes.byref(g))
+        self.graph = g
+    except:
+        # Clean up on failure
+        runtime.core.wp_cuda_graph_end_capture(...)
+        raise
 ```
 
 ---
@@ -1589,21 +1553,42 @@ For binding validation, we only check `element_size` matches between the binding
 
 ### 13.3 CUDA Graph Node Updates
 
-When binding arrays at runtime, we use CUDA's graph update APIs:
+**Original Design (Not Implemented):**
+
+The design proposed using CUDA's graph update APIs for efficient in-place binding updates:
 
 ```cpp
 // Update kernel node parameters without rebuilding graph
-cudaGraphExecKernelNodeSetParams(
-    graphExec,
-    kernelNode,
-    &updatedParams
-);
+cudaGraphExecKernelNodeSetParams(graphExec, kernelNode, &updatedParams);
 
 // For memory operations
 cudaGraphExecMemcpyNodeSetParams(graphExec, memcpyNode, &updatedParams);
 ```
 
-This allows efficient rebinding without recreating the graph executable.
+**Actual Implementation:**
+
+The current implementation takes a simpler approach: when bindings change, the entire CUDA graph is rebuilt by replaying all operations during capture:
+
+```python
+def bind_input(self, name: str, arr):
+    # ... update region pointer ...
+    self._needs_rebuild = True
+
+# Later, in capture_launch() or explicitly:
+if graph._needs_rebuild:
+    graph._rebuild_cuda_graph()  # Replay all ops during capture
+```
+
+**Trade-offs:**
+
+| Aspect | Node Update APIs | Graph Rebuild |
+|--------|------------------|---------------|
+| Performance | O(1) per binding change | O(n) where n = num operations |
+| Complexity | Requires tracking graph nodes | Simple replay mechanism |
+| CUDA API | Uses advanced graph APIs | Uses basic capture APIs |
+| Flexibility | Limited to parameter changes | Can handle structural changes |
+
+For graphs with many operations and frequent binding changes, the node update approach would be more efficient. For typical use cases (bind once, launch many times), the rebuild approach is sufficient and simpler to implement.
 
 ### 13.4 References
 

@@ -8604,14 +8604,14 @@ def capture_load(path: str, device: DeviceLike = None):
         device: Target device (default: current CUDA device)
 
     Returns:
-        A :class:`LoadedGraph` object that can be executed with its ``execute()`` method
+        A :class:`Graph` object that can be executed with :func:`~warp.capture_launch()`
 
     Example::
 
         graph = wp.capture_load("my_graph")
         graph.bind_input("a", my_input_array)
         graph.bind_output("b", my_output_array)
-        graph.execute()
+        wp.capture_launch(graph)
     """
     from warp._src.apic import load_graph
 
