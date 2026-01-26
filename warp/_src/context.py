@@ -8039,7 +8039,7 @@ def capture_begin(
     stream: Stream | None = None,
     force_module_load: bool | None = None,
     external: bool = False,
-    apic: bool = False,
+    apic: bool = True,
 ):
     """Begin capture of a CUDA graph
 
@@ -8061,7 +8061,7 @@ def capture_begin(
           ``None``, then the behavior inherits from ``wp.config.enable_graph_capture_module_load_by_default`` if the
           driver is older than CUDA 12.3.
         external: Whether the capture was already started externally
-        apic: Whether to enable APIC (API Capture) mode for serialization
+        apic: Whether to enable APIC (API Capture) mode for serialization (enabled by default)
 
     """
 
@@ -8565,22 +8565,20 @@ def capture_save(
 ):
     """Save a captured CUDA graph to disk for later loading or embedding in native applications.
 
-    The graph must have been captured with ``apic=True`` in :func:`~warp.capture_begin()`.
-
     Args:
-        graph: A :class:`Graph` as returned by :func:`~warp.capture_end()` with APIC enabled
+        graph: A :class:`Graph` as returned by :func:`~warp.capture_end()`
         path: Output path (without extension). Creates ``{path}.wgf`` and ``{path}_modules/``
         inputs: Dictionary mapping names to input arrays for binding
         outputs: Dictionary mapping names to output arrays for binding
 
     Example::
 
-        with wp.ScopedCapture(apic=True) as capture:
+        with wp.ScopedCapture() as capture:
             wp.launch(my_kernel, dim=n, inputs=[a], outputs=[b])
         wp.capture_save(capture.graph, "my_graph", inputs={"a": a}, outputs={"b": b})
     """
     if graph.apic_capture is None:
-        raise RuntimeError("Graph was not captured with APIC enabled. Use capture_begin(apic=True)")
+        raise RuntimeError("Graph was not captured with APIC enabled (was apic=False passed to capture_begin?)")
 
     from warp._src.apic import save_graph
 

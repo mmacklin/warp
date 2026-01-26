@@ -987,14 +987,14 @@ def capture_func(fn: Callable,
 
 ### 5.2 Extended capture_begin/capture_end
 
-To enable APIC recording, we add an `apic` parameter:
+APIC recording is enabled by default. The `apic` parameter can be set to `False` to disable it if needed:
 
 ```python
 def capture_begin(device: Device = None,
                   stream: Stream = None,
                   force_module_load: bool = None,
                   external: bool = False,
-                  apic: bool = False) -> None:
+                  apic: bool = True) -> None:
     """
     Begin CUDA graph capture.
 
@@ -1003,7 +1003,7 @@ def capture_begin(device: Device = None,
         stream: Stream to capture on
         force_module_load: Force loading all modules before capture
         external: Whether capture was started externally
-        apic: Enable API capture for serialization support
+        apic: Enable API capture for serialization support (default: True)
     """
 
 def capture_end(device: Device = None, stream: Stream = None) -> Graph:
@@ -1011,8 +1011,7 @@ def capture_end(device: Device = None, stream: Stream = None) -> Graph:
     End CUDA graph capture.
 
     Returns:
-        Graph object. If apic=True was set in capture_begin,
-        the graph will have serialization support (save/bind methods).
+        Graph object with serialization support (save/bind methods).
     """
 ```
 
