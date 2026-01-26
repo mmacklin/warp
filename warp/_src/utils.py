@@ -1607,6 +1607,7 @@ class ScopedCapture:
         stream: Stream on which to capture operations.
         force_module_load: If ``True``, force all modules to load before capture begins.
         external: If ``True``, indicates an external graph capture is already active.
+        apic: If ``True``, enable APIC (API Capture) mode for serialization.
 
     Attributes:
         graph: The captured CUDA graph, available after context exit.
@@ -1621,22 +1622,35 @@ class ScopedCapture:
             # Replay the captured graph
             wp.capture_launch(capture.graph)
 
+        For serialization with APIC:
+
+        .. code-block:: python
+
+            with wp.ScopedCapture(apic=True) as capture:
+                wp.launch(my_kernel, dim=n, inputs=[a], outputs=[b])
+            wp.capture_save(capture.graph, "my_graph", inputs={"a": a}, outputs={"b": b})
+
     See Also:
-        :func:`capture_begin`, :func:`capture_end`, :func:`capture_launch`
+        :func:`capture_begin`, :func:`capture_end`, :func:`capture_launch`, :func:`capture_save`
     """
 
-    def __init__(self, device: DeviceLike = None, stream=None, force_module_load=None, external=False):
+    def __init__(self, device: DeviceLike = None, stream=None, force_module_load=None, external=False, apic=False):
         self.device = device
         self.stream = stream
         self.force_module_load = force_module_load
         self.external = external
+        self.apic = apic
         self.active = False
         self.graph = None
 
     def __enter__(self):
         try:
             wp.capture_begin(
-                device=self.device, stream=self.stream, force_module_load=self.force_module_load, external=self.external
+                device=self.device,
+                stream=self.stream,
+                force_module_load=self.force_module_load,
+                external=self.external,
+                apic=self.apic,
             )
             self.active = True
             return self

@@ -17,6 +17,7 @@
 
 #include "warp.h"
 
+#include "apic.h"
 #include "cuda_util.h"
 #include "error.h"
 #include "scan.h"
@@ -266,6 +267,37 @@ static std::vector<GraphDestroyInfo> g_deferred_graph_list;
 // Data from on_graph_destroy() callbacks that run on a different thread.
 static std::vector<GraphDestroyCallbackInfo*> g_deferred_graph_destroy_list;
 static std::mutex g_graph_destroy_mutex;
+
+// ============================================================================
+// APIC (API Capture) State
+// ============================================================================
+
+// Internal APIC operation structure (stores all operation data)
+struct APICOperation {
+    APICOpType type;
+    std::vector<uint8_t> data;  // Serialized operation data
+};
+
+// Internal APIC state structure
+struct APICStateInternal {
+    bool recording = false;
+
+    // Recorded operations
+    std::vector<APICOperation> operations;
+
+    // Memory regions (keyed by base pointer)
+    std::unordered_map<uint64_t, APICMemoryRegion> memory_regions;
+    uint32_t next_region_id = 0;
+
+    // Unique kernel names encountered
+    std::unordered_set<std::string> kernel_names;
+
+    // Mutex for thread safety
+    std::mutex mutex;
+};
+
+// Thread-local APIC state (set during recording)
+static thread_local APICState g_apic_state = nullptr;
 
 
 void wp_cuda_set_context_restore_policy(bool always_restore) { ContextGuard::always_restore = always_restore; }
@@ -876,6 +908,11 @@ bool wp_memcpy_h2d(void* context, void* dest, void* src, size_t n, void* stream)
 {
     ContextGuard guard(context);
 
+    // APIC hook
+    if (g_apic_state && g_apic_state->recording) {
+        apic_record_memcpy(g_apic_state, dest, src, n, APIC_OP_MEMCPY_H2D);
+    }
+
     CUstream cuda_stream;
     if (stream != WP_CURRENT_STREAM)
         cuda_stream = static_cast<CUstream>(stream);
@@ -913,6 +950,11 @@ bool wp_memcpy_d2h(void* context, void* dest, void* src, size_t n, void* stream)
 bool wp_memcpy_d2d(void* context, void* dest, void* src, size_t n, void* stream)
 {
     ContextGuard guard(context);
+
+    // APIC hook
+    if (g_apic_state && g_apic_state->recording) {
+        apic_record_memcpy(g_apic_state, dest, src, n, APIC_OP_MEMCPY_D2D);
+    }
 
     CUstream cuda_stream;
     if (stream != WP_CURRENT_STREAM)
@@ -1077,6 +1119,11 @@ __global__ void memset_kernel(int* dest, int value, size_t n)
 void wp_memset_device(void* context, void* dest, int value, size_t n)
 {
     ContextGuard guard(context);
+
+    // APIC hook
+    if (g_apic_state && g_apic_state->recording) {
+        apic_record_memset(g_apic_state, dest, value, n);
+    }
 
     if (true)  // ((n%4) > 0)
     {
@@ -4514,6 +4561,17 @@ size_t wp_cuda_launch_kernel(
 {
     ContextGuard guard(context);
 
+    // APIC hook: record basic launch info (Python handles full parameter serialization)
+    if (g_apic_state && g_apic_state->recording) {
+        // Record kernel name if available
+        auto it = g_kernel_names.find((CUfunction)kernel);
+        if (it != g_kernel_names.end()) {
+            g_apic_state->kernel_names.insert(it->second);
+        }
+        // Note: Full launch recording with parameters is handled by Python layer
+        // since it has access to kernel signature and argument types
+    }
+
     if (block_dim <= 0) {
 #if defined(_DEBUG)
         fprintf(stderr, "Warp warning: Launch got block_dim %d. Setting to 256.\n", block_dim);
@@ -4648,3 +4706,363 @@ void wp_cuda_timing_end(timing_result_t* results, int size)
 
 // #include "spline.inl"
 // #include "volume.inl"
+
+// ============================================================================
+// APIC (API Capture) Implementation
+// ============================================================================
+
+APICState wp_apic_create_state() { return new APICStateInternal(); }
+
+void wp_apic_destroy_state(APICState state)
+{
+    if (state) {
+        delete state;
+    }
+}
+
+void wp_apic_begin_recording(APICState state)
+{
+    if (state) {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->recording = true;
+        state->operations.clear();
+        state->memory_regions.clear();
+        state->kernel_names.clear();
+        state->next_region_id = 0;
+        g_apic_state = state;
+    }
+}
+
+void wp_apic_end_recording(APICState state)
+{
+    if (state) {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->recording = false;
+        if (g_apic_state == state) {
+            g_apic_state = nullptr;
+        }
+    }
+}
+
+int wp_apic_is_recording(APICState state)
+{
+    if (state) {
+        return state->recording ? 1 : 0;
+    }
+    return 0;
+}
+
+uint32_t wp_apic_register_memory_region(
+    APICState state, uint64_t base_ptr, uint64_t size, uint32_t element_size, APICMemoryRole role
+)
+{
+    if (!state)
+        return UINT32_MAX;
+
+    std::lock_guard<std::mutex> lock(state->mutex);
+
+    // Check if region already exists
+    auto it = state->memory_regions.find(base_ptr);
+    if (it != state->memory_regions.end()) {
+        // Update role if needed (e.g., internal -> input)
+        if (role > it->second.role) {
+            it->second.role = role;
+        }
+        return it->second.region_id;
+    }
+
+    // Create new region
+    uint32_t region_id = state->next_region_id++;
+    APICMemoryRegion region;
+    region.region_id = region_id;
+    region.base_ptr = base_ptr;
+    region.size = size;
+    region.element_size = element_size;
+    region.role = role;
+
+    state->memory_regions[base_ptr] = region;
+    return region_id;
+}
+
+size_t wp_apic_get_num_operations(APICState state)
+{
+    if (!state)
+        return 0;
+    std::lock_guard<std::mutex> lock(state->mutex);
+    return state->operations.size();
+}
+
+size_t wp_apic_get_num_memory_regions(APICState state)
+{
+    if (!state)
+        return 0;
+    std::lock_guard<std::mutex> lock(state->mutex);
+    return state->memory_regions.size();
+}
+
+size_t wp_apic_get_num_kernels(APICState state)
+{
+    if (!state)
+        return 0;
+    std::lock_guard<std::mutex> lock(state->mutex);
+    return state->kernel_names.size();
+}
+
+size_t wp_apic_get_operations_data_size(APICState state)
+{
+    if (!state)
+        return 0;
+    std::lock_guard<std::mutex> lock(state->mutex);
+
+    size_t total = 0;
+    for (const auto& op : state->operations) {
+        // Header: type (1 byte) + data size (4 bytes) + data
+        total += 1 + 4 + op.data.size();
+    }
+    return total;
+}
+
+void wp_apic_get_operations_data(APICState state, void* buffer, size_t buffer_size)
+{
+    if (!state || !buffer)
+        return;
+    std::lock_guard<std::mutex> lock(state->mutex);
+
+    uint8_t* ptr = static_cast<uint8_t*>(buffer);
+    uint8_t* end = ptr + buffer_size;
+
+    for (const auto& op : state->operations) {
+        size_t op_size = 1 + 4 + op.data.size();
+        if (ptr + op_size > end)
+            break;
+
+        // Write type
+        *ptr++ = static_cast<uint8_t>(op.type);
+
+        // Write data size (little-endian)
+        uint32_t data_size = static_cast<uint32_t>(op.data.size());
+        memcpy(ptr, &data_size, 4);
+        ptr += 4;
+
+        // Write data
+        if (!op.data.empty()) {
+            memcpy(ptr, op.data.data(), op.data.size());
+            ptr += op.data.size();
+        }
+    }
+}
+
+size_t wp_apic_get_memory_regions_data_size(APICState state)
+{
+    if (!state)
+        return 0;
+    std::lock_guard<std::mutex> lock(state->mutex);
+    // Each region: region_id (4) + base_ptr (8) + size (8) + element_size (4) + role (1) = 25 bytes
+    return state->memory_regions.size() * 25;
+}
+
+void wp_apic_get_memory_regions_data(APICState state, void* buffer, size_t buffer_size)
+{
+    if (!state || !buffer)
+        return;
+    std::lock_guard<std::mutex> lock(state->mutex);
+
+    uint8_t* ptr = static_cast<uint8_t*>(buffer);
+    uint8_t* end = ptr + buffer_size;
+
+    for (const auto& pair : state->memory_regions) {
+        if (ptr + 25 > end)
+            break;
+
+        const APICMemoryRegion& region = pair.second;
+
+        memcpy(ptr, &region.region_id, 4);
+        ptr += 4;
+        memcpy(ptr, &region.base_ptr, 8);
+        ptr += 8;
+        memcpy(ptr, &region.size, 8);
+        ptr += 8;
+        memcpy(ptr, &region.element_size, 4);
+        ptr += 4;
+        *ptr++ = static_cast<uint8_t>(region.role);
+    }
+}
+
+size_t wp_apic_get_kernel_names_size(APICState state)
+{
+    if (!state)
+        return 0;
+    std::lock_guard<std::mutex> lock(state->mutex);
+
+    size_t total = 0;
+    for (const auto& name : state->kernel_names) {
+        total += name.size() + 1;  // Include null terminator
+    }
+    return total;
+}
+
+void wp_apic_get_kernel_names(APICState state, char* buffer, size_t buffer_size)
+{
+    if (!state || !buffer)
+        return;
+    std::lock_guard<std::mutex> lock(state->mutex);
+
+    char* ptr = buffer;
+    char* end = buffer + buffer_size;
+
+    for (const auto& name : state->kernel_names) {
+        size_t len = name.size() + 1;
+        if (ptr + len > end)
+            break;
+        memcpy(ptr, name.c_str(), len);
+        ptr += len;
+    }
+}
+
+// Internal recording functions
+
+void apic_record_kernel_launch(
+    APICState state,
+    void* kernel,
+    size_t dim,
+    int max_blocks,
+    int block_dim,
+    int smem_bytes,
+    void** args,
+    size_t num_args,
+    size_t* arg_sizes
+)
+{
+    if (!state || !state->recording)
+        return;
+    std::lock_guard<std::mutex> lock(state->mutex);
+
+    // Get kernel name
+    std::string kernel_name;
+    auto it = g_kernel_names.find((CUfunction)kernel);
+    if (it != g_kernel_names.end()) {
+        kernel_name = it->second;
+        state->kernel_names.insert(kernel_name);
+    }
+
+    // Create operation
+    APICOperation op;
+    op.type = APIC_OP_KERNEL_LAUNCH;
+
+    // Serialize launch data
+    // Format: kernel_name_len (4) + kernel_name + dim (8) + max_blocks (4) + block_dim (4) + smem_bytes (4)
+    //         + num_params (4) + [param_size (4) + param_data]...
+    size_t name_len = kernel_name.size();
+    size_t total_param_size = 0;
+    for (size_t i = 0; i < num_args; i++) {
+        total_param_size += 4 + arg_sizes[i];  // size prefix + data
+    }
+
+    size_t data_size = 4 + name_len + 8 + 4 + 4 + 4 + 4 + total_param_size;
+    op.data.resize(data_size);
+    uint8_t* ptr = op.data.data();
+
+    // Write kernel name
+    uint32_t name_len32 = static_cast<uint32_t>(name_len);
+    memcpy(ptr, &name_len32, 4);
+    ptr += 4;
+    if (name_len > 0) {
+        memcpy(ptr, kernel_name.c_str(), name_len);
+        ptr += name_len;
+    }
+
+    // Write launch params
+    memcpy(ptr, &dim, 8);
+    ptr += 8;
+    memcpy(ptr, &max_blocks, 4);
+    ptr += 4;
+    memcpy(ptr, &block_dim, 4);
+    ptr += 4;
+    memcpy(ptr, &smem_bytes, 4);
+    ptr += 4;
+
+    // Write num_params
+    uint32_t num_params32 = static_cast<uint32_t>(num_args);
+    memcpy(ptr, &num_params32, 4);
+    ptr += 4;
+
+    // Write each parameter
+    for (size_t i = 0; i < num_args; i++) {
+        uint32_t arg_size32 = static_cast<uint32_t>(arg_sizes[i]);
+        memcpy(ptr, &arg_size32, 4);
+        ptr += 4;
+        if (args[i] && arg_sizes[i] > 0) {
+            memcpy(ptr, args[i], arg_sizes[i]);
+            ptr += arg_sizes[i];
+        }
+    }
+
+    state->operations.push_back(std::move(op));
+}
+
+void apic_record_memcpy(APICState state, void* dst, void* src, size_t size, APICOpType kind)
+{
+    if (!state || !state->recording)
+        return;
+    std::lock_guard<std::mutex> lock(state->mutex);
+
+    APICOperation op;
+    op.type = kind;
+
+    // Format: dst_ptr (8) + src_ptr (8) + size (8)
+    op.data.resize(24);
+    uint8_t* ptr = op.data.data();
+
+    uint64_t dst_ptr = reinterpret_cast<uint64_t>(dst);
+    uint64_t src_ptr = reinterpret_cast<uint64_t>(src);
+    memcpy(ptr, &dst_ptr, 8);
+    ptr += 8;
+    memcpy(ptr, &src_ptr, 8);
+    ptr += 8;
+    memcpy(ptr, &size, 8);
+
+    state->operations.push_back(std::move(op));
+}
+
+void apic_record_memset(APICState state, void* dst, int value, size_t size)
+{
+    if (!state || !state->recording)
+        return;
+    std::lock_guard<std::mutex> lock(state->mutex);
+
+    APICOperation op;
+    op.type = APIC_OP_MEMSET;
+
+    // Format: dst_ptr (8) + value (4) + size (8)
+    op.data.resize(20);
+    uint8_t* ptr = op.data.data();
+
+    uint64_t dst_ptr = reinterpret_cast<uint64_t>(dst);
+    memcpy(ptr, &dst_ptr, 8);
+    ptr += 8;
+    memcpy(ptr, &value, 4);
+    ptr += 4;
+    memcpy(ptr, &size, 8);
+
+    state->operations.push_back(std::move(op));
+}
+
+void apic_record_alloc(APICState state, void* ptr, size_t size)
+{
+    if (!state || !state->recording)
+        return;
+    std::lock_guard<std::mutex> lock(state->mutex);
+
+    APICOperation op;
+    op.type = APIC_OP_ALLOC;
+
+    // Format: ptr (8) + size (8)
+    op.data.resize(16);
+    uint8_t* data = op.data.data();
+
+    uint64_t ptr_val = reinterpret_cast<uint64_t>(ptr);
+    memcpy(data, &ptr_val, 8);
+    memcpy(data + 8, &size, 8);
+
+    state->operations.push_back(std::move(op));
+}

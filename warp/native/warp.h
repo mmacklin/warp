@@ -660,4 +660,43 @@ WP_API float wp_balance_coloring(
     int num_nodes, wp::array_t<int> edges, int num_colors, float target_max_min_ratio, wp::array_t<int> node_colors
 );
 
+// APIC (API Capture) - Records Warp API calls for serialization and replay
+// Opaque handle to APIC state
+typedef struct APICStateInternal* APICState;
+
+// Memory region roles
+enum APICMemoryRole : uint8_t {
+    APIC_ROLE_INTERNAL = 0,
+    APIC_ROLE_INPUT = 1,
+    APIC_ROLE_OUTPUT = 2,
+    APIC_ROLE_INPUT_OUTPUT = 3,
+};
+
+// APIC State Management
+WP_API APICState wp_apic_create_state();
+WP_API void wp_apic_destroy_state(APICState state);
+
+// Recording Control
+WP_API void wp_apic_begin_recording(APICState state);
+WP_API void wp_apic_end_recording(APICState state);
+WP_API int wp_apic_is_recording(APICState state);
+
+// Memory Region Registration
+WP_API uint32_t wp_apic_register_memory_region(
+    APICState state, uint64_t base_ptr, uint64_t size, uint32_t element_size, APICMemoryRole role
+);
+
+// Query recorded data
+WP_API size_t wp_apic_get_num_operations(APICState state);
+WP_API size_t wp_apic_get_num_memory_regions(APICState state);
+WP_API size_t wp_apic_get_num_kernels(APICState state);
+
+// Serialization helpers
+WP_API size_t wp_apic_get_operations_data_size(APICState state);
+WP_API void wp_apic_get_operations_data(APICState state, void* buffer, size_t buffer_size);
+WP_API size_t wp_apic_get_memory_regions_data_size(APICState state);
+WP_API void wp_apic_get_memory_regions_data(APICState state, void* buffer, size_t buffer_size);
+WP_API size_t wp_apic_get_kernel_names_size(APICState state);
+WP_API void wp_apic_get_kernel_names(APICState state, char* buffer, size_t buffer_size);
+
 }  // extern "C"

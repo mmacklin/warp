@@ -1014,7 +1014,7 @@ def func_grad(forward_fn):
             grad_fn, skip_forward_codegen=True, skip_reverse_codegen=False, transformers=forward_fn.adj.transformers
         )
 
-        from warp._src.types import types_equal  # noqa: PLC0415
+        from warp._src.types import types_equal
 
         grad_args = adj.args
         grad_sig = warp._src.types.get_signature([arg.type for arg in grad_args], func_name=forward_fn.key)
@@ -2400,7 +2400,7 @@ class Module:
         self.dependents = set()  # modules that depend on our content
 
     def __getattr__(self, name):
-        from warp._src.utils import get_deprecated_method  # noqa: PLC0415
+        from warp._src.utils import get_deprecated_method
 
         return get_deprecated_method(self, "warp.Module", name)
 
@@ -3627,7 +3627,7 @@ class Device:
             return total_mem.value
         else:
             try:
-                import psutil  # noqa: PLC0415
+                import psutil
 
                 return psutil.virtual_memory().total
             except ModuleNotFoundError:
@@ -3652,7 +3652,7 @@ class Device:
             return free_mem.value
         else:
             try:
-                import psutil  # noqa: PLC0415
+                import psutil
 
                 return psutil.virtual_memory().free
             except ModuleNotFoundError:
@@ -3784,12 +3784,14 @@ DeviceLike = Union[Device, str, None]
 
 
 class Graph:
-    def __init__(self, device: Device, capture_id: int):
+    def __init__(self, device: Device, capture_id: int, apic_capture=None):
         self.device = device
         self.capture_id = capture_id
         self.module_execs: set[ModuleExec] = set()
         self.graph_exec: ctypes.c_void_p | None = None
         self.graph: ctypes.c_void_p | None = None
+        # APIC capture state (optional)
+        self.apic_capture = apic_capture
 
     def __del__(self):
         if not hasattr(self, "graph") or not hasattr(self, "device") or not self.graph:
@@ -6056,7 +6058,7 @@ class RegisteredGLBuffer:
 
             if self.flags == self.READ_ONLY or self.flags == self.NONE:
                 # copy from OpenGL buffer to Warp array
-                from pyglet import gl  # noqa: PLC0415
+                from pyglet import gl
 
                 gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.gl_buffer_id)
                 nbytes = self.warp_buffer.size * warp._src.types.type_size_in_bytes(dtype)
@@ -6077,7 +6079,7 @@ class RegisteredGLBuffer:
 
             if self.flags == self.WRITE_DISCARD or self.flags == self.NONE:
                 # copy from Warp array to OpenGL buffer
-                from pyglet import gl  # noqa: PLC0415
+                from pyglet import gl
 
                 gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.gl_buffer_id)
                 buffer = self.warp_buffer.numpy()
@@ -6858,6 +6860,9 @@ class Launch:
                 graph = runtime.captures.get(capture_id)
                 if graph is not None:
                     graph.retain_module_exec(self.module_exec)
+                    # Record to APIC if active
+                    if graph.apic_capture is not None:
+                        graph.apic_capture.record_launch(self)
 
             if self.adjoint:
                 runtime.core.wp_cuda_launch_kernel(
@@ -7042,6 +7047,22 @@ def launch(
                 graph = runtime.captures.get(capture_id)
                 if graph is not None:
                     graph.retain_module_exec(module_exec)
+                    # Check if APIC recording is active and record the launch
+                    if graph.apic_capture is not None:
+                        # Create a Launch object to record the full context
+                        apic_launch = Launch(
+                            kernel=kernel,
+                            hooks=hooks,
+                            params=params,
+                            params_addr=kernel_params,
+                            bounds=bounds,
+                            device=device,
+                            max_blocks=max_blocks,
+                            block_dim=block_dim,
+                            adjoint=adjoint,
+                        )
+                        # Pass original arrays for proper tracking
+                        graph.apic_capture.record_launch(apic_launch, inputs=inputs, outputs=outputs)
 
             if adjoint:
                 if hooks.backward is None:
@@ -7504,7 +7525,7 @@ def compile_aot_module(
 
     # Warn if there are generic kernels without overloads
     if no_overloads:
-        from warp._src.utils import warn  # noqa: PLC0415
+        from warp._src.utils import warn
 
         warn(
             f"Generic kernels without overloads will be skipped during AOT compilation. "
@@ -7722,6 +7743,7 @@ def capture_begin(
     stream: Stream | None = None,
     force_module_load: bool | None = None,
     external: bool = False,
+    apic: bool = False,
 ):
     """Begin capture of a CUDA graph
 
@@ -7743,6 +7765,7 @@ def capture_begin(
           ``None``, then the behavior inherits from ``wp.config.enable_graph_capture_module_load_by_default`` if the
           driver is older than CUDA 12.3.
         external: Whether the capture was already started externally
+        apic: Whether to enable APIC (API Capture) mode for serialization
 
     """
 
@@ -7780,7 +7803,16 @@ def capture_begin(
         raise RuntimeError(runtime.get_error_string())
 
     capture_id = runtime.core.wp_cuda_stream_get_capture_id(stream.cuda_stream)
-    graph = Graph(device, capture_id)
+
+    # Create APIC capture if requested
+    apic_capture = None
+    if apic:
+        from warp._src.apic import APICapture
+
+        apic_capture = APICapture(device, stream)
+        apic_capture.begin()
+
+    graph = Graph(device, capture_id, apic_capture)
 
     _register_capture(device, stream, graph, capture_id)
 
@@ -7823,6 +7855,10 @@ def capture_end(device: DeviceLike = None, stream: Stream | None = None) -> Grap
     # set the graph executable
     graph.graph = g
     graph.graph_exec = None  # Lazy initialization
+
+    # End APIC recording if active
+    if graph.apic_capture is not None:
+        graph.apic_capture.end()
 
     return graph
 
@@ -8221,6 +8257,72 @@ def capture_launch(graph: Graph, stream: Stream | None = None):
         raise RuntimeError(f"Graph launch error: {runtime.get_error_string()}")
 
 
+def capture_save(
+    graph: Graph,
+    path: str,
+    inputs: dict[str, warp.array] | None = None,
+    outputs: dict[str, warp.array] | None = None,
+):
+    """Save a captured CUDA graph to disk for later loading or embedding in native applications.
+
+    The graph must have been captured with ``apic=True`` in :func:`~warp.capture_begin()`.
+
+    Args:
+        graph: A :class:`Graph` as returned by :func:`~warp.capture_end()` with APIC enabled
+        path: Output path (without extension). Creates ``{path}.wgf`` and ``{path}_modules/``
+        inputs: Dictionary mapping names to input arrays for binding
+        outputs: Dictionary mapping names to output arrays for binding
+
+    Example::
+
+        with wp.ScopedCapture(apic=True) as capture:
+            wp.launch(my_kernel, dim=n, inputs=[a], outputs=[b])
+        wp.capture_save(capture.graph, "my_graph", inputs={"a": a}, outputs={"b": b})
+    """
+    if graph.apic_capture is None:
+        raise RuntimeError("Graph was not captured with APIC enabled. Use capture_begin(apic=True)")
+
+    from warp._src.apic import save_graph
+
+    # Set input/output bindings
+    if inputs:
+        for name, arr in inputs.items():
+            graph.apic_capture.set_input_binding(name, arr)
+
+    if outputs:
+        for name, arr in outputs.items():
+            graph.apic_capture.set_output_binding(name, arr)
+
+    save_graph(graph.apic_capture, path)
+
+
+def capture_load(path: str, device: DeviceLike = None):
+    """Load a previously saved CUDA graph from disk.
+
+    Args:
+        path: Path to the ``.wgf`` file (with or without extension)
+        device: Target device (default: current CUDA device)
+
+    Returns:
+        A :class:`LoadedGraph` object that can be executed with its ``execute()`` method
+
+    Example::
+
+        graph = wp.capture_load("my_graph")
+        graph.bind_input("a", my_input_array)
+        graph.bind_output("b", my_output_array)
+        graph.execute()
+    """
+    from warp._src.apic import load_graph
+
+    if device is None:
+        device = runtime.get_device()
+    else:
+        device = runtime.get_device(device)
+
+    return load_graph(path, device)
+
+
 def copy(
     dest: warp.array,
     src: warp.array,
@@ -8245,7 +8347,7 @@ def copy(
 
     If neither source nor destination are on a CUDA device, no stream is used for the copy.
     """
-    from warp._src.context import runtime  # noqa: PLC0415
+    from warp._src.context import runtime
 
     if not warp._src.types.is_array(src) or not warp._src.types.is_array(dest):
         raise RuntimeError("Copy source and destination must be arrays")

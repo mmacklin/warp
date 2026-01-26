@@ -132,7 +132,10 @@ ignore = [
 "__init__.py" = ["F401", "PLC0414"]
 "__init__.pyi" = ["E402", "I001"]
 "warp/*.py" = ["PLC0414"]
+"warp/_src/context.py" = ["PLC0415"]  # Allow imports in functions to avoid circular imports
 "warp/tests/*.py" = ["F841"]
+"warp/tests/cuda/*.py" = ["PLC0415"]  # Allow imports in functions for test isolation
+"warp/_src/apic/*.py" = ["PLC0415"]  # Allow imports in functions to avoid circular imports
 "asv/benchmarks/**.py" = ["RUF012"]
 
 [tool.ruff.lint.pydocstyle]
