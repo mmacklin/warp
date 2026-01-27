@@ -1,9 +1,9 @@
 # APIC (API Capture) Design Document
 ## CUDA Graph Capture, Serialization, and Replay for Warp
 
-### Version: 1.3
+### Version: 1.4
 ### Date: January 2026
-### Status: Implemented (Phases 1-3, Python-only)
+### Status: Implemented (Phases 1-3 Python, Phase 4 C++ Native Loading)
 
 ---
 
@@ -32,7 +32,7 @@ This document outlines the design for adding CUDA graph capture, serialization, 
 | FR-6 | Support `wp.capture_func(fn)` convenience API for capturing a callable | Medium | Not Implemented |
 | FR-7 | Serialize all referenced `wp.array` memory with proper aliasing handling | High | Done |
 | FR-8 | Serialize compiled CUDA kernels (CUBIN as separate files) | High | Done |
-| FR-9 | Generate C++ header for native application embedding | Medium | Not Implemented |
+| FR-9 | Generate C++ header for native application embedding | Medium | Partial (C++ loading API done) |
 | FR-10 | Support input/output array designation for graph parameters | High | Done |
 | FR-11 | Support `wp.Mesh`, `wp.Volume`, `wp.BVH` data structures | Medium | Not Implemented |
 | FR-12 | Handle array slicing/aliasing (same underlying memory) | High | Done |
@@ -627,7 +627,7 @@ class Graph:
         # APIC capture state (for graphs being captured)
         self.apic_capture = apic_capture
 
-        # APIC loaded state (populated when loaded from file)
+        # APIC loaded state (populated when loaded from file - Python path)
         self._loaded_modules: dict = {}  # module_hash -> {cuda_module, info}
         self._memory_regions: dict = {}  # region_id -> {ptr, size, element_size, role}
         self._launches: list = []         # parsed launch records
@@ -639,6 +639,9 @@ class Graph:
         self._kernel_cache: dict = {}     # (kernel_name, module_hash) -> kernel func
         self._metadata: dict = {}
         self._needs_rebuild: bool = False  # True if bindings changed
+
+        # Native C++ graph handle (for C++ loading path)
+        self._native_graph: ctypes.c_void_p | None = None
 
     @classmethod
     def load(cls, path: str, device: Device = None) -> "Graph":
@@ -1025,10 +1028,15 @@ class Graph:
     def __init__(self, device: Device, capture_id: int | None = None, apic_capture=None): ...
     def retain_module_exec(self, module_exec: ModuleExec): ...
 
-    # Internal class method for loading (use wp.capture_load() instead)
+    # Python loading path (use wp.capture_load() instead)
     @classmethod
     def load(cls, path: str, device: Device = None) -> "Graph":
-        """Load a graph from a .wgf file (called by wp.capture_load())."""
+        """Load a graph from a .wgf file using Python implementation."""
+
+    # C++ native loading path (for testing/embedded use)
+    @classmethod
+    def load_native(cls, path: str, device: Device = None) -> "Graph":
+        """Load a graph from a .wgf file using C++ implementation."""
 
     # New instance methods for loaded graphs
     def bind_input(self, name: str, arr) -> None:
@@ -1049,7 +1057,7 @@ class Graph:
     def is_loaded(self) -> bool:
         """True if this graph was loaded from a file."""
 
-    # Internal methods
+    # Internal methods (Python path)
     def _rebuild_cuda_graph(self) -> None:
         """Rebuild CUDA graph by replaying operations during capture."""
 
@@ -1061,9 +1069,175 @@ class Graph:
 
     def _get_kernel_function(self, kernel_name: str, module_hash: str):
         """Get kernel function pointer from loaded modules."""
+
+    # Properties
+    @property
+    def is_native(self) -> bool:
+        """True if this graph was loaded via C++ native path."""
+        return self._native_graph is not None
 ```
 
-### 5.4 capture_launch (Unchanged)
+**Native Graph Handling:**
+
+When a graph is loaded via `load_native()`, operations delegate to C++ functions:
+
+```python
+def bind_input(self, name: str, arr) -> None:
+    if self._native_graph is not None:
+        # Use C++ binding
+        result = runtime.core.wp_apic_bind_input(
+            self._native_graph, name.encode(), arr.ptr, arr.capacity
+        )
+        if result == 0:
+            raise RuntimeError(f"Failed to bind input: {runtime.get_error_string()}")
+        return
+    # ... Python path ...
+
+def __del__(self):
+    if self._native_graph is not None:
+        runtime.core.wp_apic_destroy_graph(self._native_graph)
+        self._native_graph = None
+    # ... cleanup Python resources ...
+```
+
+### 5.4 C++ Native Loading API
+
+The C++ APIC loading API enables loading and executing serialized graphs without Python. This is essential for embedded devices and native C++ applications.
+
+**C++ API (warp/native/warp.h):**
+
+```cpp
+// Opaque handle for a loaded APIC graph
+typedef void* wp_apic_graph_t;
+
+// Load a graph from a .wgf file
+// Returns: Graph handle on success, nullptr on failure
+WP_API wp_apic_graph_t wp_apic_load_graph(void* context, const char* path);
+
+// Destroy a loaded graph and free all associated resources
+WP_API void wp_apic_destroy_graph(wp_apic_graph_t graph);
+
+// Bind an input array to a named slot
+// Returns: 1 on success, 0 on failure
+WP_API int wp_apic_bind_input(wp_apic_graph_t graph, const char* name,
+                              void* ptr, size_t size);
+
+// Bind an output array to a named slot
+// Returns: 1 on success, 0 on failure
+WP_API int wp_apic_bind_output(wp_apic_graph_t graph, const char* name,
+                               void* ptr, size_t size);
+
+// Launch the graph on a stream
+// Returns: 1 on success, 0 on failure
+WP_API int wp_apic_launch(wp_apic_graph_t graph, void* stream);
+```
+
+**Python ctypes Bindings (warp/_src/context.py):**
+
+```python
+# APIC graph loading functions
+self.core.wp_apic_load_graph.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+self.core.wp_apic_load_graph.restype = ctypes.c_void_p
+
+self.core.wp_apic_destroy_graph.argtypes = [ctypes.c_void_p]
+self.core.wp_apic_destroy_graph.restype = None
+
+self.core.wp_apic_bind_input.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
+                                          ctypes.c_void_p, ctypes.c_size_t]
+self.core.wp_apic_bind_input.restype = ctypes.c_int
+
+self.core.wp_apic_bind_output.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
+                                           ctypes.c_void_p, ctypes.c_size_t]
+self.core.wp_apic_bind_output.restype = ctypes.c_int
+
+self.core.wp_apic_launch.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+self.core.wp_apic_launch.restype = ctypes.c_int
+```
+
+**Graph.load_native() Method:**
+
+For testing and hybrid workflows, the C++ loading path is accessible from Python:
+
+```python
+@classmethod
+def load_native(cls, path: str, device: Device = None) -> "Graph":
+    """Load a graph using the native C++ implementation.
+
+    This uses the C++ APIC loading code path, which is useful for:
+    - Testing the native loading implementation
+    - Hybrid workflows where native loading is preferred
+
+    Args:
+        path: Path to the .wgf file
+        device: Target CUDA device (default: current device)
+
+    Returns:
+        Graph object with native graph handle
+    """
+    device = device or warp.get_device()
+    graph = cls(device)
+    graph._native_graph = runtime.core.wp_apic_load_graph(
+        device.context, path.encode()
+    )
+    if graph._native_graph is None:
+        raise RuntimeError(f"Failed to load graph: {runtime.get_error_string()}")
+    graph._source_path = path
+    return graph
+```
+
+**C++ Implementation Details (warp/native/warp.cu):**
+
+The C++ implementation uses a `LoadedApicGraph` structure that mirrors the Python Graph class:
+
+```cpp
+struct LoadedApicGraph {
+    void* context;                        // CUDA context
+    void* stream;                         // CUDA stream for execution
+    void* graph;                          // cudaGraph_t
+    void* graph_exec;                     // cudaGraphExec_t
+    bool needs_rebuild;                   // True if bindings changed
+
+    // Module management
+    std::map<std::string, void*> modules; // module_hash -> CUmodule
+
+    // Memory regions
+    std::map<int, MemoryRegion> regions;  // region_id -> {ptr, size, external}
+
+    // Kernel cache
+    std::map<std::pair<std::string, std::string>, void*> kernel_cache;
+
+    // Binding maps
+    std::map<std::string, int> input_bindings;   // name -> region_id
+    std::map<std::string, int> output_bindings;  // name -> region_id
+
+    // Operations for replay
+    std::vector<LaunchRecord> launches;
+    std::vector<MemoryOp> memory_ops;
+    std::vector<std::pair<std::string, int>> operations;  // ("launch"|"memop", idx)
+
+    // Parsed metadata
+    json metadata;
+};
+```
+
+Graph reconstruction uses the same capture-replay pattern as Python:
+
+```cpp
+int wp_apic_launch(wp_apic_graph_t graph_handle, void* stream) {
+    LoadedApicGraph* graph = (LoadedApicGraph*)graph_handle;
+
+    // Rebuild CUDA graph if bindings changed
+    if (graph->needs_rebuild || graph->graph_exec == nullptr) {
+        rebuild_cuda_graph(graph, stream);
+    }
+
+    // Launch the graph
+    cudaGraphLaunch((cudaGraphExec_t)graph->graph_exec, (cudaStream_t)stream);
+    return 1;
+}
+```
+
+### 5.5 capture_launch (Unchanged)
 
 The existing `capture_launch` works with all Graph objects:
 
@@ -1107,11 +1281,25 @@ def capture_launch(graph: Graph, stream: Stream = None) -> None:
 
 **Note:** The original design proposed using `cudaGraphExecKernelNodeSetParams` for efficient in-place updates. The current implementation rebuilds the entire graph, which is simpler but less efficient for frequent binding changes. This trade-off was made to reduce implementation complexity.
 
-### 6.4 Phase 4: C++ Header Generation
+### 6.4 Phase 4: C++ Native Loading (Implemented)
 
-1. **Template system** - Generate C++ header + implementation
-2. **Standalone loader** - C++ code to load .wgf without Python
-3. **Testing** - Verify C++ integration compiles and runs
+**Completed:**
+
+1. **C++ APIC API** - Native functions in warp.h for loading, binding, and launching
+2. **LoadedApicGraph structure** - C++ equivalent of Python's Graph class with loaded state
+3. **WGF file parsing** - Header, section table, metadata (JSON), memory, and operations parsing
+4. **Module loading** - CUBIN files loaded via wp_cuda_load_module
+5. **Memory region management** - Allocation and binding with external array support
+6. **Kernel lookup** - Function handles retrieved via cuModuleGetFunction_f wrapper
+7. **Graph reconstruction** - Capture-replay pattern using CUDA graph APIs
+8. **Python ctypes bindings** - Full integration with context.py
+9. **Graph.load_native()** - Python method to test C++ loading path
+10. **Test coverage** - test_apic_native_loading verifies C++ implementation
+
+**Not Yet Implemented:**
+
+1. **C++ header generation** - Generate standalone .h/.cpp for embedding without Warp runtime
+2. **CMake integration** - Build system support for generated C++ code
 
 ### 6.5 Phase 5: Complex Data Structures
 
@@ -1144,6 +1332,22 @@ def capture_launch(graph: Graph, stream: Stream = None) -> None:
 **warp/_src/types.py:**
 - No modifications needed; `_ref` chain and array attributes work as-is
 
+**warp/native/warp.h (C++ API):**
+- Added `wp_apic_load_graph()` - Load graph from .wgf file
+- Added `wp_apic_destroy_graph()` - Free graph resources
+- Added `wp_apic_bind_input()` - Bind input array by name
+- Added `wp_apic_bind_output()` - Bind output array by name
+- Added `wp_apic_launch()` - Launch graph on stream
+
+**warp/native/warp.cu (C++ Implementation):**
+- Added `LoadedApicGraph` structure with module map, memory regions, kernel cache, bindings, operations
+- Added `apic_launch_bounds_t` and `apic_array_t` structures for kernel parameters
+- Added WGF file parsing (header, sections, metadata JSON, memory, operations)
+- Added module loading via `wp_cuda_load_module()`
+- Added kernel lookup via `cuModuleGetFunction_f()` wrapper
+- Added graph reconstruction via capture-replay pattern
+- Uses CUDA runtime API (cudaMalloc, cudaMemcpy) to avoid linker issues with driver API
+
 ### 7.2 New Files (Actual Implementation)
 
 ```
@@ -1154,8 +1358,17 @@ warp/_src/apic/
     format.py             # WGFReader, WGFWriter for .wgf file handling
 ```
 
-**Not implemented (deferred to Phase 4):**
-- `cpp_gen.py` - C++ header generation
+**C++ Native Loading (Phase 4):**
+
+```
+warp/native/warp.h           # Added C++ APIC API declarations
+warp/native/warp.cu          # Added LoadedApicGraph struct and implementation
+warp/_src/context.py         # Added ctypes bindings and Graph.load_native()
+warp/tests/cuda/test_apic.py # Added test_apic_native_loading test
+```
+
+**Not implemented (deferred):**
+- `cpp_gen.py` - C++ header/implementation generation for standalone embedding
 
 ### 7.3 Python Recording Hooks
 
@@ -1484,6 +1697,29 @@ def test_large_memory():
 def test_cpp_header_compilation():
     """Test that generated C++ header compiles."""
 ```
+
+### 11.3 C++ Native Loading Tests
+
+```python
+def test_apic_native_loading():
+    """Test loading a graph using the native C++ implementation.
+
+    Verifies:
+    - Graph.load_native() successfully loads a .wgf file via C++ code path
+    - wp_apic_bind_input() and wp_apic_bind_output() work correctly
+    - wp_apic_launch() executes the graph and produces correct results
+    - Graph cleanup via wp_apic_destroy_graph() works without errors
+    """
+```
+
+**Test Coverage (19 tests total):**
+- Basic capture/save/load roundtrips
+- Array aliasing and slicing
+- Input/output bindings
+- Multiple kernels and modules
+- Memory operations (memcpy, memset, allocations)
+- Graph rebuild on binding changes
+- C++ native loading path
 
 ---
 
