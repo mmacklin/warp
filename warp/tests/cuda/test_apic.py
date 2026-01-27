@@ -674,6 +674,55 @@ def test_apic_multiple_internal_allocations(test, device):
         np.testing.assert_array_almost_equal(new_output.numpy(), expected)
 
 
+def test_apic_native_loading(test, device):
+    """Test loading a graph using the native C++ implementation."""
+    from warp._src.context import Graph
+
+    n = 128
+
+    # Create input/output arrays
+    input_data = wp.array(np.ones(n, dtype=np.float32) * 2.0, device=device)
+    output_data = wp.zeros(n, dtype=float, device=device)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        graph_path = os.path.join(tmpdir, "test_native_graph")
+
+        # Capture with APIC
+        with wp.ScopedCapture(device=device, apic=True) as capture:
+            wp.launch(scale_kernel, dim=n, inputs=[input_data, output_data, 3.0], device=device)
+
+        # Save the graph with bindings
+        wp.capture_save(
+            capture.graph,
+            graph_path,
+            inputs={"input": input_data},
+            outputs={"output": output_data},
+        )
+
+        # Load using native C++ implementation
+        loaded_graph = Graph.load_native(graph_path, device=device)
+
+        # Verify inputs/outputs are detected
+        test.assertIn("input", loaded_graph.inputs)
+        test.assertIn("output", loaded_graph.outputs)
+
+        # Create new arrays for execution
+        new_input = wp.array(np.ones(n, dtype=np.float32) * 10.0, device=device)
+        new_output = wp.zeros(n, dtype=float, device=device)
+
+        # Bind the new arrays
+        loaded_graph.bind_input("input", new_input)
+        loaded_graph.bind_output("output", new_output)
+
+        # Execute using capture_launch
+        wp.capture_launch(loaded_graph)
+        wp.synchronize_device(device)
+
+        # Verify result: 10.0 * 3.0 = 30.0
+        expected = np.ones(n, dtype=np.float32) * 30.0
+        np.testing.assert_array_almost_equal(new_output.numpy(), expected)
+
+
 class TestApic(unittest.TestCase):
     pass
 
@@ -703,6 +752,7 @@ add_function_test(TestApic, "test_apic_internal_allocation", test_apic_internal_
 add_function_test(
     TestApic, "test_apic_multiple_internal_allocations", test_apic_multiple_internal_allocations, devices=devices
 )
+add_function_test(TestApic, "test_apic_native_loading", test_apic_native_loading, devices=devices)
 
 
 if __name__ == "__main__":

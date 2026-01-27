@@ -3805,6 +3805,7 @@ class Graph:
         self._kernel_cache: dict = {}  # (kernel_name, module_hash) -> kernel function
         self._metadata: dict = {}  # metadata from loaded file
         self._needs_rebuild: bool = False  # True if bindings changed and graph needs rebuild
+        self._native_graph = None  # Native C++ APIC graph handle (when loaded via load_native)
 
     @classmethod
     def load(cls, path: str, device: Device = None) -> Graph:
@@ -3827,6 +3828,61 @@ class Graph:
         load_graph_into(graph, path)
         return graph
 
+    @classmethod
+    def load_native(cls, path: str, device: Device = None) -> Graph:
+        """Load a graph from a .wgf file using native C++ implementation.
+
+        This uses the C++ APIC graph loading which is suitable for testing
+        the native code path that can also be used from pure C++ applications.
+
+        Args:
+            path: Path to the .wgf file
+            device: Target device (default: current CUDA device)
+
+        Returns:
+            Graph object ready for binding and execution
+        """
+        from pathlib import Path
+
+        if device is None:
+            device = warp.get_device()
+
+        base_path = Path(path)
+        if not base_path.suffix:
+            base_path = base_path.with_suffix(".wgf")
+
+        # Load using native C++ implementation
+        native_graph = runtime.core.wp_apic_load_graph(device.context, str(base_path).encode("utf-8"))
+        if native_graph is None:
+            raise RuntimeError(f"Failed to load graph from {path}: {runtime.get_error_string()}")
+
+        graph = cls(device)
+        graph._source_path = str(base_path)
+        graph._native_graph = native_graph
+
+        # Populate input/output bindings from native graph
+        num_inputs = runtime.core.wp_apic_get_num_inputs(native_graph)
+        for i in range(num_inputs):
+            name = runtime.core.wp_apic_get_input_name(native_graph, i)
+            if name:
+                name = name.decode("utf-8")
+                size = runtime.core.wp_apic_get_input_size(native_graph, name.encode("utf-8"))
+                graph._input_bindings[name] = {"size": size}
+
+        num_outputs = runtime.core.wp_apic_get_num_outputs(native_graph)
+        for i in range(num_outputs):
+            name = runtime.core.wp_apic_get_output_name(native_graph, i)
+            if name:
+                name = name.decode("utf-8")
+                size = runtime.core.wp_apic_get_output_size(native_graph, name.encode("utf-8"))
+                graph._output_bindings[name] = {"size": size}
+
+        # Get the CUDA graph handles from native
+        graph.graph = runtime.core.wp_apic_get_cuda_graph(native_graph)
+        graph.graph_exec = runtime.core.wp_apic_get_cuda_graph_exec(native_graph)
+
+        return graph
+
     def __del__(self):
         if not hasattr(self, "graph") or not hasattr(self, "device"):
             return
@@ -3834,6 +3890,12 @@ class Graph:
         try:
             # use CUDA context guard to avoid side effects during garbage collection
             with self.device.context_guard:
+                # If this is a native graph, use the native cleanup
+                if hasattr(self, "_native_graph") and self._native_graph is not None:
+                    runtime.core.wp_apic_destroy_graph(self._native_graph)
+                    # Don't clean up graph/graph_exec as they're owned by native
+                    return
+
                 if self.graph:
                     runtime.core.wp_cuda_graph_destroy(self.device.context, self.graph)
                 if hasattr(self, "graph_exec") and self.graph_exec is not None:
@@ -3864,6 +3926,25 @@ class Graph:
         if name not in self._input_bindings:
             raise ValueError(f"Unknown input binding: {name}")
 
+        # Handle native graph binding
+        if self._native_graph is not None:
+            binding_info = self._input_bindings[name]
+            expected_size = binding_info["size"]
+            if arr.capacity != expected_size:
+                raise ValueError(f"Input array size mismatch: expected {expected_size}, got {arr.capacity}")
+
+            result = runtime.core.wp_apic_bind_input(
+                self._native_graph, name.encode("utf-8"), ctypes.c_void_p(arr.ptr), arr.capacity
+            )
+            if result == 0:
+                raise RuntimeError(f"Failed to bind input '{name}': {runtime.get_error_string()}")
+
+            # Update cached graph handles (they may be rebuilt)
+            self.graph = runtime.core.wp_apic_get_cuda_graph(self._native_graph)
+            self.graph_exec = runtime.core.wp_apic_get_cuda_graph_exec(self._native_graph)
+            return
+
+        # Python-side binding
         region_id = self._input_bindings[name]
         if region_id not in self._memory_regions:
             raise ValueError(f"Input region {region_id} not allocated")
@@ -3894,6 +3975,25 @@ class Graph:
         if name not in self._output_bindings:
             raise ValueError(f"Unknown output binding: {name}")
 
+        # Handle native graph binding
+        if self._native_graph is not None:
+            binding_info = self._output_bindings[name]
+            expected_size = binding_info["size"]
+            if arr.capacity != expected_size:
+                raise ValueError(f"Output array size mismatch: expected {expected_size}, got {arr.capacity}")
+
+            result = runtime.core.wp_apic_bind_output(
+                self._native_graph, name.encode("utf-8"), ctypes.c_void_p(arr.ptr), arr.capacity
+            )
+            if result == 0:
+                raise RuntimeError(f"Failed to bind output '{name}': {runtime.get_error_string()}")
+
+            # Update cached graph handles (they may be rebuilt)
+            self.graph = runtime.core.wp_apic_get_cuda_graph(self._native_graph)
+            self.graph_exec = runtime.core.wp_apic_get_cuda_graph_exec(self._native_graph)
+            return
+
+        # Python-side binding
         region_id = self._output_bindings[name]
         if region_id not in self._memory_regions:
             raise ValueError(f"Output region {region_id} not allocated")
@@ -5025,6 +5125,51 @@ class Runtime:
                 ctypes.c_int,
             ]
             self.core.wp_cuda_graph_update_memcpy_batch.restype = ctypes.c_bool
+
+            # APIC graph loading functions
+            self.core.wp_apic_load_graph.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+            self.core.wp_apic_load_graph.restype = ctypes.c_void_p
+
+            self.core.wp_apic_destroy_graph.argtypes = [ctypes.c_void_p]
+            self.core.wp_apic_destroy_graph.restype = None
+
+            self.core.wp_apic_bind_input.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t]
+            self.core.wp_apic_bind_input.restype = ctypes.c_int
+
+            self.core.wp_apic_bind_output.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_char_p,
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+            ]
+            self.core.wp_apic_bind_output.restype = ctypes.c_int
+
+            self.core.wp_apic_get_cuda_graph.argtypes = [ctypes.c_void_p]
+            self.core.wp_apic_get_cuda_graph.restype = ctypes.c_void_p
+
+            self.core.wp_apic_get_cuda_graph_exec.argtypes = [ctypes.c_void_p]
+            self.core.wp_apic_get_cuda_graph_exec.restype = ctypes.c_void_p
+
+            self.core.wp_apic_launch_graph.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            self.core.wp_apic_launch_graph.restype = ctypes.c_int
+
+            self.core.wp_apic_get_num_inputs.argtypes = [ctypes.c_void_p]
+            self.core.wp_apic_get_num_inputs.restype = ctypes.c_int
+
+            self.core.wp_apic_get_num_outputs.argtypes = [ctypes.c_void_p]
+            self.core.wp_apic_get_num_outputs.restype = ctypes.c_int
+
+            self.core.wp_apic_get_input_name.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            self.core.wp_apic_get_input_name.restype = ctypes.c_char_p
+
+            self.core.wp_apic_get_output_name.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            self.core.wp_apic_get_output_name.restype = ctypes.c_char_p
+
+            self.core.wp_apic_get_input_size.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+            self.core.wp_apic_get_input_size.restype = ctypes.c_size_t
+
+            self.core.wp_apic_get_output_size.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+            self.core.wp_apic_get_output_size.restype = ctypes.c_size_t
 
             self.core.wp_cuda_compile_program.argtypes = [
                 ctypes.c_char_p,  # cuda_src

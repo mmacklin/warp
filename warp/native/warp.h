@@ -699,4 +699,46 @@ WP_API void wp_apic_get_memory_regions_data(APICState state, void* buffer, size_
 WP_API size_t wp_apic_get_kernel_names_size(APICState state);
 WP_API void wp_apic_get_kernel_names(APICState state, char* buffer, size_t buffer_size);
 
+// =============================================================================
+// APIC Graph Loading - Load and execute serialized graphs from .wgf files
+// =============================================================================
+
+// Opaque handle to a loaded APIC graph
+typedef struct APICGraphInternal* APICGraph;
+
+// Load a graph from a .wgf file
+// Returns NULL on failure (use wp_get_error_string() for details)
+WP_API APICGraph wp_apic_load_graph(void* context, const char* path);
+
+// Destroy a loaded graph and free all resources
+WP_API void wp_apic_destroy_graph(APICGraph graph);
+
+// Bind an input array by name
+// Returns 1 on success, 0 on failure
+WP_API int wp_apic_bind_input(APICGraph graph, const char* name, void* ptr, size_t size);
+
+// Bind an output array by name
+// Returns 1 on success, 0 on failure
+WP_API int wp_apic_bind_output(APICGraph graph, const char* name, void* ptr, size_t size);
+
+// Get the CUDA graph handle (rebuilds if bindings changed)
+// Returns the cudaGraph_t handle, or NULL on failure
+WP_API void* wp_apic_get_cuda_graph(APICGraph graph);
+
+// Get the instantiated CUDA graph executable (creates if needed, rebuilds if bindings changed)
+// Returns the cudaGraphExec_t handle, or NULL on failure
+WP_API void* wp_apic_get_cuda_graph_exec(APICGraph graph);
+
+// Launch the graph on a stream
+// Returns 1 on success, 0 on failure
+WP_API int wp_apic_launch_graph(APICGraph graph, void* stream);
+
+// Query functions
+WP_API int wp_apic_get_num_inputs(APICGraph graph);
+WP_API int wp_apic_get_num_outputs(APICGraph graph);
+WP_API const char* wp_apic_get_input_name(APICGraph graph, int index);
+WP_API const char* wp_apic_get_output_name(APICGraph graph, int index);
+WP_API size_t wp_apic_get_input_size(APICGraph graph, const char* name);
+WP_API size_t wp_apic_get_output_size(APICGraph graph, const char* name);
+
 }  // extern "C"
