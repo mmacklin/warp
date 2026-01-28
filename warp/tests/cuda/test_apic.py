@@ -59,9 +59,9 @@ def test_apic_capture_begin_end(test, device):
 
     # Verify APIC capture was created
     test.assertIsNotNone(graph.apic_capture)
-    test.assertEqual(len(graph.apic_capture.launches), 1)
-    test.assertEqual(len(graph.apic_capture.modules), 1)
-    test.assertEqual(len(graph.apic_capture.kernels), 1)
+    test.assertEqual(graph.apic_capture.operation_count, 1)
+    test.assertEqual(graph.apic_capture.module_count, 1)
+    test.assertEqual(graph.apic_capture.kernel_count, 1)
 
 
 def test_apic_scoped_capture(test, device):
@@ -76,7 +76,7 @@ def test_apic_scoped_capture(test, device):
 
     # Verify APIC capture
     test.assertIsNotNone(capture.graph.apic_capture)
-    test.assertEqual(len(capture.graph.apic_capture.launches), 1)
+    test.assertEqual(capture.graph.apic_capture.operation_count, 1)
 
     # Execute the graph normally to verify it still works
     wp.capture_launch(capture.graph)
@@ -104,7 +104,7 @@ def test_apic_multiple_launches(test, device):
         wp.launch(scale_kernel, dim=n, inputs=[c, d, 2.0], device=device)
 
     # Verify multiple launches were recorded
-    test.assertEqual(len(capture.graph.apic_capture.launches), 2)
+    test.assertEqual(capture.graph.apic_capture.operation_count, 2)
 
     # Execute and verify
     wp.capture_launch(capture.graph)
@@ -289,7 +289,7 @@ def test_apic_kernel_info_tracking(test, device):
 
 
 def test_apic_launch_record(test, device):
-    """Test launch record details."""
+    """Test launch record is captured correctly."""
     n = 512
 
     x = wp.array(np.ones(n, dtype=np.float32), device=device)
@@ -300,19 +300,14 @@ def test_apic_launch_record(test, device):
 
     apic = capture.graph.apic_capture
 
-    test.assertEqual(len(apic.launches), 1)
-
-    launch = apic.launches[0]
-    test.assertEqual(launch.dim, n)
-    test.assertTrue(launch.is_forward)
-    test.assertGreater(len(launch.param_bindings), 0)
-
-    # Check parameter bindings
-    array_bindings = [b for b in launch.param_bindings if b["type"] == "array"]
-    scalar_bindings = [b for b in launch.param_bindings if b["type"] == "scalar"]
-
-    test.assertEqual(len(array_bindings), 2)  # x and y
-    test.assertEqual(len(scalar_bindings), 1)  # a (the scalar)
+    # Verify operation was recorded
+    test.assertEqual(apic.operation_count, 1)
+    # Verify kernel was tracked
+    test.assertEqual(apic.kernel_count, 1)
+    # Verify module was tracked
+    test.assertEqual(apic.module_count, 1)
+    # Verify memory regions were tracked (x and y arrays)
+    test.assertGreaterEqual(len(apic.memory_regions), 2)
 
 
 def test_apic_graph_execution_unchanged(test, device):
@@ -449,11 +444,9 @@ def test_apic_with_memory_ops(test, device):
             wp.copy(tmp, src)
             wp.launch(scale_kernel, dim=n, inputs=[tmp, dst, 2.0], device=device)
 
-        # Verify memory op was recorded
+        # Verify operations were recorded (1 memcpy + 1 launch)
         apic = capture.graph.apic_capture
-        test.assertEqual(len(apic.memory_ops), 1)
-        test.assertEqual(len(apic.launches), 1)
-        test.assertEqual(apic.memory_ops[0].kind, "D2D")
+        test.assertEqual(apic.operation_count, 2)
 
         # Execute original graph to verify it works
         wp.capture_launch(capture.graph)
@@ -520,8 +513,8 @@ def test_apic_complex_pipeline(test, device):
             wp.launch(add_kernel, dim=n, inputs=[f, c, g], device=device)  # g = 10 + 5 = 15
 
         apic = capture.graph.apic_capture
-        test.assertEqual(len(apic.launches), 3)
-        test.assertEqual(len(apic.memory_ops), 2)
+        # 3 kernel launches + 2 memory copies = 5 operations
+        test.assertEqual(apic.operation_count, 5)
 
         # Execute and verify
         wp.capture_launch(capture.graph)

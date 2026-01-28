@@ -4872,18 +4872,51 @@ class Runtime:
             ]
             self.core.wp_cuda_graph_update_memcpy_batch.restype = ctypes.c_bool
 
-            # APIC WGF file writing
-            self.core.wp_apic_write_wgf.argtypes = [
+            # APIC state management
+            self.core.wp_apic_create_state.argtypes = []
+            self.core.wp_apic_create_state.restype = ctypes.c_void_p
+
+            self.core.wp_apic_destroy_state.argtypes = [ctypes.c_void_p]
+            self.core.wp_apic_destroy_state.restype = None
+
+            self.core.wp_apic_begin_recording.argtypes = [ctypes.c_void_p]
+            self.core.wp_apic_begin_recording.restype = None
+
+            self.core.wp_apic_end_recording.argtypes = [ctypes.c_void_p]
+            self.core.wp_apic_end_recording.restype = None
+
+            # APIC state queries
+            self.core.wp_apic_get_operation_count.argtypes = [ctypes.c_void_p]
+            self.core.wp_apic_get_operation_count.restype = ctypes.c_uint32
+
+            self.core.wp_apic_get_memory_region_count.argtypes = [ctypes.c_void_p]
+            self.core.wp_apic_get_memory_region_count.restype = ctypes.c_uint32
+
+            self.core.wp_apic_get_module_count.argtypes = [ctypes.c_void_p]
+            self.core.wp_apic_get_module_count.restype = ctypes.c_uint32
+
+            self.core.wp_apic_get_kernel_count.argtypes = [ctypes.c_void_p]
+            self.core.wp_apic_get_kernel_count.restype = ctypes.c_uint32
+
+            # APIC memory region registration
+            self.core.wp_apic_register_memory_region.argtypes = [
+                ctypes.c_void_p,  # state
+                ctypes.c_uint64,  # base_ptr
+                ctypes.c_uint64,  # size
+                ctypes.c_uint32,  # element_size
+                ctypes.c_int,  # role (APICMemoryRole)
+            ]
+            self.core.wp_apic_register_memory_region.restype = ctypes.c_uint32
+
+            # APIC state save (serializes directly from APICState)
+            self.core.wp_apic_state_save.argtypes = [
+                ctypes.c_void_p,  # state (APICState)
                 ctypes.c_char_p,  # path
                 ctypes.c_uint32,  # target_arch
                 ctypes.c_char_p,  # metadata_json
                 ctypes.c_size_t,  # metadata_len
-                ctypes.c_void_p,  # memory_section
-                ctypes.c_size_t,  # memory_len
-                ctypes.c_void_p,  # operations_section
-                ctypes.c_size_t,  # operations_len
             ]
-            self.core.wp_apic_write_wgf.restype = ctypes.c_int
+            self.core.wp_apic_state_save.restype = ctypes.c_int
 
             # APIC graph loading functions
             self.core.wp_apic_load_graph.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
@@ -5034,6 +5067,7 @@ class Runtime:
                 ctypes.c_int,
                 ctypes.POINTER(ctypes.c_void_p),
                 ctypes.c_void_p,
+                ctypes.c_void_p,  # APICLaunchInfo* (optional, can be None)
             ]
             self.core.wp_cuda_launch_kernel.restype = ctypes.c_size_t
 
@@ -7052,14 +7086,15 @@ class Launch:
 
             # If the stream is capturing, we retain the CUDA module so that it doesn't get unloaded
             # before the captured graph is released.
+            apic_info = None
             if len(runtime.captures) > 0 and runtime.core.wp_cuda_stream_is_capturing(stream.cuda_stream):
                 capture_id = runtime.core.wp_cuda_stream_get_capture_id(stream.cuda_stream)
                 graph = runtime.captures.get(capture_id)
                 if graph is not None:
                     graph.retain_module_exec(self.module_exec)
-                    # Record to APIC if active
+                    # Build APIC launch info if recording
                     if graph.apic_capture is not None:
-                        graph.apic_capture.record_launch(self)
+                        apic_info = graph.apic_capture.build_launch_info(self)
 
             if self.adjoint:
                 runtime.core.wp_cuda_launch_kernel(
@@ -7071,6 +7106,7 @@ class Launch:
                     self.hooks.backward_smem_bytes,
                     self.params_addr,
                     stream.cuda_stream,
+                    ctypes.byref(apic_info) if apic_info else None,
                 )
             else:
                 runtime.core.wp_cuda_launch_kernel(
@@ -7082,6 +7118,7 @@ class Launch:
                     self.hooks.forward_smem_bytes,
                     self.params_addr,
                     stream.cuda_stream,
+                    ctypes.byref(apic_info) if apic_info else None,
                 )
 
 
@@ -7239,14 +7276,15 @@ def launch(
 
             # If the stream is capturing, we retain the CUDA module so that it doesn't get unloaded
             # before the captured graph is released.
+            apic_info = None
             if len(runtime.captures) > 0 and runtime.core.wp_cuda_stream_is_capturing(stream.cuda_stream):
                 capture_id = runtime.core.wp_cuda_stream_get_capture_id(stream.cuda_stream)
                 graph = runtime.captures.get(capture_id)
                 if graph is not None:
                     graph.retain_module_exec(module_exec)
-                    # Check if APIC recording is active and record the launch
+                    # Check if APIC recording is active and build launch info
                     if graph.apic_capture is not None:
-                        # Create a Launch object to record the full context
+                        # Create a Launch object to build the APIC info
                         apic_launch = Launch(
                             kernel=kernel,
                             hooks=hooks,
@@ -7258,8 +7296,8 @@ def launch(
                             block_dim=block_dim,
                             adjoint=adjoint,
                         )
-                        # Pass original arrays for proper tracking
-                        graph.apic_capture.record_launch(apic_launch, inputs=inputs, outputs=outputs)
+                        # Build APIC info with original arrays for proper tracking
+                        apic_info = graph.apic_capture.build_launch_info(apic_launch, inputs=inputs, outputs=outputs)
 
             if adjoint:
                 if hooks.backward is None:
@@ -7290,6 +7328,7 @@ def launch(
                         hooks.backward_smem_bytes,
                         kernel_params,
                         stream.cuda_stream,
+                        ctypes.byref(apic_info) if apic_info else None,
                     )
 
             else:
@@ -7321,6 +7360,7 @@ def launch(
                         hooks.forward_smem_bytes,
                         kernel_params,
                         stream.cuda_stream,
+                        ctypes.byref(apic_info) if apic_info else None,
                     )
 
             try:
@@ -8620,17 +8660,22 @@ def copy(
             )
 
         if dest.device.is_cuda:
+            # APIC: track arrays during graph capture so native memcpy can resolve region IDs
+            if len(runtime.captures) > 0 and runtime.core.wp_cuda_stream_is_capturing(stream.cuda_stream):
+                capture_id = runtime.core.wp_cuda_stream_get_capture_id(stream.cuda_stream)
+                graph = runtime.captures.get(capture_id)
+                if graph is not None and graph.apic_capture is not None:
+                    from warp._src.apic.capture import MemoryRole
+
+                    graph.apic_capture.track_array(dest, MemoryRole.OUTPUT)
+                    if src.device.is_cuda:
+                        graph.apic_capture.track_array(src, MemoryRole.INPUT)
+
             if src.device.is_cuda:
                 if src.device == dest.device:
                     result = runtime.core.wp_memcpy_d2d(
                         dest.device.context, dst_ptr, src_ptr, bytes_to_copy, stream.cuda_stream
                     )
-                    # Record D2D copy for APIC if capturing
-                    if len(runtime.captures) > 0 and runtime.core.wp_cuda_stream_is_capturing(stream.cuda_stream):
-                        capture_id = runtime.core.wp_cuda_stream_get_capture_id(stream.cuda_stream)
-                        graph = runtime.captures.get(capture_id)
-                        if graph is not None and graph.apic_capture is not None:
-                            graph.apic_capture.record_memcpy_d2d(dest, dest_offset, src, src_offset, count)
                 else:
                     result = runtime.core.wp_memcpy_p2p(
                         dest.device.context, dst_ptr, src.device.context, src_ptr, bytes_to_copy, stream.cuda_stream

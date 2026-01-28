@@ -1044,7 +1044,8 @@ WP_API size_t wp_cuda_launch_kernel(
     int block_dim,
     int shared_memory_bytes,
     void** args,
-    void* stream
+    void* stream,
+    const APICLaunchInfo* apic_info
 )
 {
     return 0;

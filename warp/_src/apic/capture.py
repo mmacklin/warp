@@ -15,10 +15,23 @@
 
 """
 APIC Capture - Records API calls during CUDA graph capture for serialization.
+
+Recording is done natively in C++ (warp.cu/apic.cu). Python's role is to:
+- Track arrays and compute region_id/offset
+- Track modules and kernels for metadata
+- Compute parameter bindings from Python type info
+- Set launch context before each kernel launch
 """
 
 import ctypes
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+
+# Constants from apic_types.h
+APIC_MAX_DIMS = 4
+APIC_LAUNCH_MAX_DIMS = 4
+APIC_MAX_SCALAR_SIZE = 128
+APIC_PARAM_ARRAY = 1
+APIC_PARAM_SCALAR = 2
 
 
 # Memory region roles (must match C++ APICMemoryRole enum)
@@ -27,6 +40,43 @@ class MemoryRole:
     INPUT = 1
     OUTPUT = 2
     INPUT_OUTPUT = 3
+
+
+class APICParamBindingInfo(ctypes.Structure):
+    """Parameter binding info - matches C struct in apic_types.h."""
+
+    _pack_ = 1
+    _fields_ = [  # noqa: RUF012
+        ("type", ctypes.c_uint8),
+        ("ndim", ctypes.c_uint8),
+        ("param_index", ctypes.c_uint16),
+        ("region_id", ctypes.c_int32),
+        ("byte_offset", ctypes.c_uint64),
+        ("shape", ctypes.c_int64 * APIC_MAX_DIMS),
+        ("strides", ctypes.c_int64 * APIC_MAX_DIMS),
+        ("element_size", ctypes.c_uint32),
+        ("scalar_size", ctypes.c_uint16),
+        ("_pad", ctypes.c_uint8 * 2),
+        ("scalar_value", ctypes.c_uint8 * APIC_MAX_SCALAR_SIZE),
+    ]
+
+
+class APICLaunchInfo(ctypes.Structure):
+    """Launch info passed to wp_cuda_launch_kernel() - matches C struct in apic_types.h."""
+
+    _pack_ = 1
+    _fields_ = [  # noqa: RUF012
+        ("kernel_key", ctypes.c_char_p),
+        ("module_hash", ctypes.c_char_p),
+        ("shape", ctypes.c_int32 * APIC_LAUNCH_MAX_DIMS),
+        ("ndim", ctypes.c_int32),
+        ("block_dim", ctypes.c_int32),
+        ("smem_bytes", ctypes.c_int32),
+        ("is_forward", ctypes.c_uint8),
+        ("_pad", ctypes.c_uint8 * 3),
+        ("params", ctypes.POINTER(APICParamBindingInfo)),
+        ("num_params", ctypes.c_int32),
+    ]
 
 
 @dataclass
@@ -38,11 +88,9 @@ class MemoryRegion:
     device_ptr: int  # Original device pointer
     element_size: int  # Size of one element in bytes
     role: int = MemoryRole.INTERNAL
-    initial_data: bytes | None = None  # For internal arrays: serialized content
 
     def update_role(self, new_role: int):
         """Update role, preferring higher priority roles."""
-        # INPUT_OUTPUT > OUTPUT > INPUT > INTERNAL
         if new_role > self.role:
             self.role = new_role
         elif self.role == MemoryRole.INPUT and new_role == MemoryRole.OUTPUT:
@@ -74,58 +122,24 @@ class KernelInfo:
     block_dim: int
 
 
-@dataclass
-class LaunchRecord:
-    """Records a kernel launch with all necessary context."""
-
-    kernel_key: str
-    module_hash: str
-    dim: int  # Total threads
-    shape: tuple  # Shape of each dimension (up to 4D)
-    max_blocks: int
-    block_dim: int
-    smem_bytes: int
-    is_forward: bool
-    # Parameter bindings: list of (param_index, region_id, offset, shape, strides, element_size)
-    # For scalars: (param_index, None, 0, None, None, size, value_bytes)
-    param_bindings: list = field(default_factory=list)
-
-
-@dataclass
-class MemcpyRecord:
-    """Records a memory copy operation."""
-
-    dst_region_id: int
-    dst_offset: int
-    src_region_id: int | None  # None for host source
-    src_offset: int
-    size: int
-    kind: str  # "H2D", "D2H", "D2D"
-    # For H2D: store the source data
-    src_data: bytes | None = None
-
-
-@dataclass
-class MemsetRecord:
-    """Records a memory set operation."""
-
-    region_id: int
-    offset: int
-    value: int
-    size: int
-
-
 class APICapture:
-    """Records API calls during CUDA graph capture for serialization."""
+    """Records API calls during CUDA graph capture for serialization.
+
+    Recording happens natively in C++. Python's role is to:
+    - Track arrays and compute region_id/offset
+    - Track modules and kernels for metadata
+    - Build APICLaunchInfo structs with parameter bindings
+    - Pass launch info directly to wp_cuda_launch_kernel()
+    """
 
     def __init__(self, device, stream=None):
         self.device = device
         self.stream = stream or device.stream
 
-        # Recorded data
-        self.launches: list[LaunchRecord] = []
-        self.memory_ops: list = []  # MemcpyRecord or MemsetRecord
-        self.operations: list = []  # All operations in order: ("launch", idx) or ("memop", idx)
+        # Native APIC state handle
+        self.native_state = None
+
+        # Metadata (still tracked in Python for building metadata JSON)
         self.memory_regions: dict[int, MemoryRegion] = {}  # base_ptr -> region
         self.modules: dict[str, ModuleInfo] = {}  # module_hash -> ModuleInfo
         self.kernels: dict[str, KernelInfo] = {}  # kernel_key -> KernelInfo
@@ -141,61 +155,109 @@ class APICapture:
 
     def begin(self):
         """Start APIC recording."""
-        # APIC recording is done at the Python level via record_launch()
-        # No C++ state needed for the initial implementation
+        import warp._src.context
+
+        runtime = warp._src.context.runtime
+
+        # Create native state
+        self.native_state = runtime.core.wp_apic_create_state()
+        if not self.native_state:
+            raise RuntimeError("Failed to create APIC state")
+
+        # Begin native recording
+        runtime.core.wp_apic_begin_recording(self.native_state)
         self._recording = True
 
     def end(self):
         """End APIC recording."""
+        import warp._src.context
+
+        if self.native_state:
+            runtime = warp._src.context.runtime
+            runtime.core.wp_apic_end_recording(self.native_state)
         self._recording = False
+
+    def destroy(self):
+        """Destroy native state and free resources."""
+        import warp._src.context
+
+        if self.native_state:
+            runtime = warp._src.context.runtime
+            runtime.core.wp_apic_destroy_state(self.native_state)
+            self.native_state = None
 
     def is_recording(self) -> bool:
         """Check if recording is active."""
-        return getattr(self, "_recording", False)
+        return self._recording
+
+    @property
+    def operation_count(self) -> int:
+        """Get the number of recorded operations (launches, memops, allocs)."""
+        import warp._src.context
+
+        if self.native_state:
+            runtime = warp._src.context.runtime
+            return runtime.core.wp_apic_get_operation_count(self.native_state)
+        return 0
+
+    @property
+    def module_count(self) -> int:
+        """Get the number of unique modules recorded."""
+        return len(self.modules)
+
+    @property
+    def kernel_count(self) -> int:
+        """Get the number of unique kernels recorded."""
+        return len(self.kernels)
 
     def track_array(self, arr, role: int = MemoryRole.INTERNAL) -> tuple[int, int]:
         """
         Track an array, resolving to its base allocation.
+        Registers the region with native code if new.
 
         Returns:
             (region_id, offset) - The region ID and byte offset within the region
         """
+        import warp._src.context
+
         # Walk the _ref chain to find base allocation
         base = arr
         offset = 0
         while hasattr(base, "_ref") and base._ref is not None:
-            # Calculate offset from parent
             offset += base.ptr - base._ref.ptr
             base = base._ref
 
         base_ptr = base.ptr
         base_size = base.capacity
-
-        # Get element size
         element_size = self._get_element_size(arr)
 
         # Check if we already have this region
         if base_ptr in self.memory_regions:
             region = self.memory_regions[base_ptr]
             region.update_role(role)
-            region_id = region.region_id
-        else:
-            # Create new region
-            region_id = self._next_region_id
-            self._next_region_id += 1
+            return region.region_id, offset
 
-            region = MemoryRegion(
-                region_id=region_id,
-                size=base_size,
-                device_ptr=base_ptr,
-                element_size=element_size,
-                role=role,
-                initial_data=None,
-            )
-            self.memory_regions[base_ptr] = region
+        # Register with native code
+        runtime = warp._src.context.runtime
+        region_id = runtime.core.wp_apic_register_memory_region(
+            self.native_state,
+            base_ptr,
+            base_size,
+            element_size,
+            role,
+        )
 
-        # Map this array's ptr to the region
+        # Track in Python for metadata
+        region = MemoryRegion(
+            region_id=region_id,
+            size=base_size,
+            device_ptr=base_ptr,
+            element_size=element_size,
+            role=role,
+        )
+        self.memory_regions[base_ptr] = region
         self._ptr_to_region_id[arr.ptr] = region_id
+        self._next_region_id = max(self._next_region_id, region_id + 1)
 
         return region_id, offset
 
@@ -205,23 +267,27 @@ class APICapture:
         if hasattr(dtype, "_type_size_"):
             return dtype._type_size_
         elif hasattr(dtype, "_length_") and hasattr(dtype, "_type_"):
-            # Vector/matrix type
             return dtype._length_ * ctypes.sizeof(dtype._type_)
         else:
             return ctypes.sizeof(dtype)
 
-    def record_launch(self, launch, inputs=None, outputs=None):
-        """Record a kernel launch from a Launch object.
+    def build_launch_info(self, launch, inputs=None, outputs=None) -> APICLaunchInfo:
+        """Build APICLaunchInfo struct for a kernel launch.
+
+        Tracks metadata and memory regions, then builds the launch info struct
+        to be passed to wp_cuda_launch_kernel().
 
         Args:
             launch: The Launch object containing kernel and parameter info
-            inputs: Original input arrays (optional, for memory region tracking)
-            outputs: Original output arrays (optional, for memory region tracking)
+            inputs: Original input arrays (for memory region tracking)
+            outputs: Original output arrays (for memory region tracking)
+
+        Returns:
+            APICLaunchInfo struct to pass to wp_cuda_launch_kernel()
         """
         kernel = launch.kernel
         module = kernel.module
         module_exec = launch.module_exec
-        # Convert bytes hash to hex string for serialization
         module_hash = (
             module_exec.module_hash.hex() if isinstance(module_exec.module_hash, bytes) else module_exec.module_hash
         )
@@ -238,7 +304,7 @@ class APICapture:
             if hasattr(arr, "ptr") and arr.ptr:
                 self.track_array(arr)
 
-        # Track unique modules
+        # Track unique modules (for metadata)
         if module_hash not in self.modules:
             self.modules[module_hash] = ModuleInfo(
                 module_name=module.name,
@@ -247,10 +313,9 @@ class APICapture:
                 cubin_filename=f"{module.name}_{module_hash_short}.cubin",
             )
 
-        # Track kernel info
+        # Track kernel info (for metadata)
         if kernel.key not in self.kernels:
             hooks = launch.hooks
-            # Get the kernel's mangled name (includes kernel-specific hash)
             mangled_name = kernel.get_mangled_name()
             self.kernels[kernel.key] = KernelInfo(
                 kernel_key=kernel.key,
@@ -262,57 +327,71 @@ class APICapture:
                 block_dim=launch.block_dim,
             )
 
-        # Record the launch
+        # Build parameter bindings
+        param_bindings = self._build_param_bindings(launch, inputs, outputs)
+
+        # Build APICLaunchInfo struct
+        # Store strings as instance attributes to keep them alive
+        self._kernel_key_bytes = kernel.key.encode("utf-8")
+        self._module_hash_bytes = module_hash.encode("utf-8")
+
+        info = APICLaunchInfo()
+        info.kernel_key = self._kernel_key_bytes
+        info.module_hash = self._module_hash_bytes
+
         bounds = launch.bounds
-        shape = tuple(bounds.shape[i] for i in range(bounds.ndim))
-        record = LaunchRecord(
-            kernel_key=kernel.key,
-            module_hash=module_hash,
-            dim=bounds.size,
-            shape=shape,
-            max_blocks=launch.max_blocks,
-            block_dim=launch.block_dim,
-            smem_bytes=(launch.hooks.backward_smem_bytes if launch.adjoint else launch.hooks.forward_smem_bytes),
-            is_forward=not launch.adjoint,
-            param_bindings=[],
-        )
+        for i in range(min(bounds.ndim, APIC_LAUNCH_MAX_DIMS)):
+            info.shape[i] = bounds.shape[i]
+        for i in range(bounds.ndim, APIC_LAUNCH_MAX_DIMS):
+            info.shape[i] = 1
 
-        # Record parameter bindings using original arrays
-        self._record_param_bindings(record, launch, inputs, outputs)
+        info.ndim = bounds.ndim
+        info.block_dim = launch.block_dim
+        info.smem_bytes = launch.hooks.forward_smem_bytes if not launch.adjoint else launch.hooks.backward_smem_bytes
+        info.is_forward = 1 if not launch.adjoint else 0
 
-        self.launches.append(record)
-        self.operations.append(("launch", len(self.launches) - 1))
+        if param_bindings:
+            # Store param_bindings as instance attribute to keep it alive
+            self._current_param_bindings = param_bindings
+            info.params = ctypes.cast(param_bindings, ctypes.POINTER(APICParamBindingInfo))
+            info.num_params = len(param_bindings)
+        else:
+            info.params = None
+            info.num_params = 0
 
-    def _record_param_bindings(self, record: LaunchRecord, launch, inputs=None, outputs=None):
-        """Extract parameter bindings from a Launch object.
+        return info
 
-        Args:
-            record: The LaunchRecord to populate
-            launch: The Launch object containing kernel and parameter info
-            inputs: Original input arrays passed to wp.launch
-            outputs: Original output arrays passed to wp.launch (optional)
+    def record_launch(self, launch, inputs=None, outputs=None):
+        """Record a kernel launch (deprecated - use build_launch_info instead).
+
+        This method exists for backward compatibility. New code should use
+        build_launch_info() and pass the result to wp_cuda_launch_kernel().
         """
+        # Just build the info - recording happens in native code during launch
+        self.build_launch_info(launch, inputs, outputs)
+
+    def _build_param_bindings(self, launch, inputs=None, outputs=None):
+        """Build parameter bindings array for native code."""
         import warp
 
-        # Build a list of original arrays from inputs/outputs
-        # The kernel arguments come from inputs first, then outputs (if separate)
         original_arrays = []
         if inputs:
             original_arrays.extend(inputs)
         if outputs:
             original_arrays.extend(outputs)
 
-        # params[0] is bounds, params[1:] are kernel arguments
         kernel = launch.kernel
+        bindings = []
 
-        array_idx = 0  # Index into original_arrays for array params
+        array_idx = 0
         for i, arg in enumerate(kernel.adj.args):
             param_idx = i + 1  # Skip bounds at index 0
             param = launch.params[param_idx]
             arg_type = arg.type
 
+            binding = APICParamBindingInfo()
+
             if isinstance(arg_type, warp._src.types.array):
-                # Array parameter - use original array from inputs/outputs
                 arr = None
                 if array_idx < len(original_arrays):
                     candidate = original_arrays[array_idx]
@@ -320,76 +399,40 @@ class APICapture:
                         arr = candidate
                     array_idx += 1
 
+                binding.type = APIC_PARAM_ARRAY
+                binding.param_index = param_idx
+
                 if arr is not None and arr.ptr:
                     region_id, offset = self.track_array(arr)
-                    record.param_bindings.append(
-                        {
-                            "type": "array",
-                            "param_index": param_idx,
-                            "region_id": region_id,
-                            "offset": offset,
-                            "shape": list(arr.shape),
-                            "strides": list(arr.strides),
-                            "ndim": arr.ndim,
-                            "element_size": self._get_element_size(arr),
-                        }
-                    )
+                    binding.region_id = region_id
+                    binding.byte_offset = offset
+                    binding.ndim = arr.ndim
+                    binding.element_size = self._get_element_size(arr)
+                    for d in range(min(arr.ndim, APIC_MAX_DIMS)):
+                        binding.shape[d] = arr.shape[d]
+                        binding.strides[d] = arr.strides[d]
                 else:
-                    # Null array
-                    record.param_bindings.append(
-                        {
-                            "type": "array",
-                            "param_index": param_idx,
-                            "region_id": None,
-                            "offset": 0,
-                            "shape": [],
-                            "strides": [],
-                            "ndim": 0,
-                            "element_size": 0,
-                        }
-                    )
+                    binding.region_id = -1
+                    binding.byte_offset = 0
+                    binding.ndim = 0
+                    binding.element_size = 0
             else:
-                # Scalar parameter - serialize value
+                binding.type = APIC_PARAM_SCALAR
+                binding.param_index = param_idx
                 value_bytes = bytes(param)
-                record.param_bindings.append(
-                    {
-                        "type": "scalar",
-                        "param_index": param_idx,
-                        "size": len(value_bytes),
-                        "value": value_bytes,
-                    }
-                )
+                binding.scalar_size = len(value_bytes)
+                for k, b in enumerate(value_bytes):
+                    if k < APIC_MAX_SCALAR_SIZE:
+                        binding.scalar_value[k] = b
 
-    def finalize_memory_data(self):
-        """Capture initial data for internal memory regions.
+            bindings.append(binding)
 
-        Note: Memory allocated during graph capture (cudaMallocAsync) may not be
-        valid for D2H copy outside the graph context. Such regions are skipped
-        and will need to be fully written before being read during execution.
-        """
-        import warp
+        if not bindings:
+            return None
 
-        for base_ptr, region in self.memory_regions.items():
-            if region.role == MemoryRole.INTERNAL:
-                # Try to copy data from device to host
-                # This may fail for memory allocated during graph capture
-                try:
-                    data = (ctypes.c_uint8 * region.size)()
-                    result = warp._src.context.runtime.core.wp_memcpy_d2h(
-                        self.device.context,
-                        ctypes.cast(data, ctypes.c_void_p),
-                        ctypes.c_void_p(base_ptr),
-                        region.size,
-                        None,  # Use current stream
-                    )
-                    if result:
-                        # Synchronize to ensure copy is complete
-                        warp.synchronize_device(self.device)
-                        region.initial_data = bytes(data)
-                    # If result is False, the copy failed (likely async-allocated memory)
-                except Exception:
-                    # Skip regions that can't be copied (e.g., async allocations during capture)
-                    pass
+        # Convert to ctypes array
+        arr = (APICParamBindingInfo * len(bindings))(*bindings)
+        return arr
 
     def set_input_binding(self, name: str, arr):
         """Mark an array as an input binding."""
@@ -404,37 +447,3 @@ class APICapture:
         if offset != 0:
             raise ValueError(f"Output binding '{name}' must be a base array, not a slice")
         self.output_bindings[name] = region_id
-
-    def record_memcpy_d2d(self, dest, dest_offset: int, src, src_offset: int, count: int):
-        """Record a device-to-device memory copy operation.
-
-        Args:
-            dest: Destination array
-            dest_offset: Element offset in destination
-            src: Source array
-            src_offset: Element offset in source
-            count: Number of elements to copy
-        """
-        import warp
-
-        # Track both arrays
-        dst_region_id, dst_byte_offset = self.track_array(dest)
-        src_region_id, src_byte_offset = self.track_array(src)
-
-        # Calculate byte offsets including element offsets
-        element_size = warp._src.types.type_size_in_bytes(src.dtype)
-        dst_byte_offset += dest_offset * element_size
-        src_byte_offset += src_offset * element_size
-        size = count * element_size
-
-        record = MemcpyRecord(
-            dst_region_id=dst_region_id,
-            dst_offset=dst_byte_offset,
-            src_region_id=src_region_id,
-            src_offset=src_byte_offset,
-            size=size,
-            kind="D2D",
-            src_data=None,
-        )
-        self.memory_ops.append(record)
-        self.operations.append(("memop", len(self.memory_ops) - 1))

@@ -8,37 +8,18 @@
 """
 Serialization of captured CUDA graphs to WGF format.
 
-Uses native C++ for WGF file writing. Serialization of individual records
-is done using ctypes structures that match the C++ POD structs.
+All recording and serialization is done in C++ (apic.cu/warp.cu).
+Python just builds metadata JSON and calls wp_apic_state_save().
 """
 
-import ctypes
 import json
 import os
-import struct
 from pathlib import Path
 
 from .capture import APICapture, ModuleInfo
-from .types import (
-    APIC_FORMAT_VERSION,
-    APIC_LAUNCH_MAX_DIMS,
-    APIC_MAX_DIMS,
-    APIC_OP_ALLOC,
-    APIC_OP_KERNEL_LAUNCH,
-    APIC_OP_MEMCPY_D2D,
-    APIC_OP_MEMCPY_H2D,
-    APIC_OP_MEMSET,
-    APIC_PARAM_ARRAY,
-    APIC_PARAM_SCALAR,
-    APICAllocRecord,
-    APICArrayBindingRecord,
-    APICLaunchRecord,
-    APICMemcpyD2DRecord,
-    APICMemcpyH2DRecord,
-    APICMemoryRegionRecord,
-    APICMemsetRecord,
-    APICScalarBindingRecord,
-)
+
+# Constants from apic_types.h
+APIC_FORMAT_VERSION = 2
 
 
 def save_graph(capture: APICapture, path: str):
@@ -46,14 +27,17 @@ def save_graph(capture: APICapture, path: str):
     Save a captured graph to disk.
 
     Args:
-        capture: The APICapture containing recorded operations
+        capture: The APICapture containing the native state handle
         path: Output path for the .wgf file (without extension)
 
     Creates:
         - {path}.wgf: The main graph file
         - {path}_modules/: Directory containing .cubin files
     """
-    import warp
+    import warp._src.context
+
+    if capture.native_state is None:
+        raise RuntimeError("No native APIC state - was capture started with wp_apic_begin_recording?")
 
     base_path = Path(path)
     wgf_path = base_path.with_suffix(".wgf")
@@ -61,9 +45,6 @@ def save_graph(capture: APICapture, path: str):
 
     # Create modules directory
     modules_dir.mkdir(parents=True, exist_ok=True)
-
-    # Finalize memory data for internal regions
-    capture.finalize_memory_data()
 
     # Export cubin files for each unique module
     for _module_hash, module_info in capture.modules.items():
@@ -74,22 +55,14 @@ def save_graph(capture: APICapture, path: str):
     metadata = _build_metadata(capture)
     metadata_json = json.dumps(metadata, indent=2).encode("utf-8")
 
-    # Build memory section
-    memory_data = _build_memory_section(capture)
-
-    # Build operations section
-    operations_data = _build_operations_section(capture)
-
-    # Write .wgf file using native C++ function
-    result = warp._src.context.runtime.core.wp_apic_write_wgf(
+    # Call native to save the graph (serializes from native state)
+    runtime = warp._src.context.runtime
+    result = runtime.core.wp_apic_state_save(
+        capture.native_state,
         str(wgf_path).encode("utf-8"),
         capture.device.arch,
         metadata_json,
         len(metadata_json),
-        memory_data if memory_data else None,
-        len(memory_data) if memory_data else 0,
-        operations_data if operations_data else None,
-        len(operations_data) if operations_data else 0,
     )
 
     if not result:
@@ -104,40 +77,32 @@ def _export_module_cubin(module_info: ModuleInfo, cubin_path: Path):
     import warp
     import warp._src.context
 
-    # Find the module by name
     user_modules = warp._src.context.user_modules
     module_hash_hex = module_info.module_hash
-    module_hash_short = module_hash_hex[:7]  # Warp uses 7 hex chars
+    module_hash_short = module_hash_hex[:7]
 
     for module in user_modules.values():
         if module.name == module_info.module_name:
-            # Try to find the cached binary using the module identifier pattern
             module_name_short = module.get_module_identifier()
             arch = module_info.target_arch
-
             module_dir = os.path.join(warp.config.kernel_cache_dir, module_name_short)
 
             if os.path.exists(module_dir):
-                # Look for cubin or ptx files matching the architecture
                 patterns = [
                     os.path.join(module_dir, f"*.sm{arch}.cubin"),
                     os.path.join(module_dir, f"*.sm{arch}.ptx"),
                 ]
-
                 for pattern in patterns:
                     matches = glob.glob(pattern)
                     if matches:
-                        # Use the first match
                         shutil.copy2(matches[0], cubin_path)
                         return
 
-            # Fall back to searching all subdirectories
             cache_dir = warp.config.kernel_cache_dir
             for root, _dirs, files in os.walk(cache_dir):
                 for f in files:
                     if module_hash_short in f and (f.endswith(f".sm{arch}.cubin") or f.endswith(f".sm{arch}.ptx")):
-                        src_path = os.path.join(root, f)
-                        shutil.copy2(src_path, cubin_path)
+                        shutil.copy2(os.path.join(root, f), cubin_path)
                         return
 
     raise ValueError(f"Could not find cubin for module {module_info.module_name} ({module_info.module_hash})")
@@ -145,229 +110,27 @@ def _export_module_cubin(module_info: ModuleInfo, cubin_path: Path):
 
 def _build_metadata(capture: APICapture) -> dict:
     """Build the metadata dictionary."""
-    # Convert modules
-    modules = {}
-    for module_hash, info in capture.modules.items():
-        modules[module_hash] = {
-            "name": info.module_name,
-            "cubin_filename": info.cubin_filename,
-            "target_arch": info.target_arch,
+    modules = {
+        h: {"name": i.module_name, "cubin_filename": i.cubin_filename, "target_arch": i.target_arch}
+        for h, i in capture.modules.items()
+    }
+    kernels = {
+        k: {
+            "module_hash": i.module_hash,
+            "forward_name": i.forward_name,
+            "backward_name": i.backward_name,
+            "forward_smem_bytes": i.forward_smem_bytes,
+            "backward_smem_bytes": i.backward_smem_bytes,
+            "block_dim": i.block_dim,
         }
-
-    # Convert kernels
-    kernels = {}
-    for kernel_key, info in capture.kernels.items():
-        kernels[kernel_key] = {
-            "module_hash": info.module_hash,
-            "forward_name": info.forward_name,
-            "backward_name": info.backward_name,
-            "forward_smem_bytes": info.forward_smem_bytes,
-            "backward_smem_bytes": info.backward_smem_bytes,
-            "block_dim": info.block_dim,
-        }
-
-    # Convert memory regions
-    regions = {}
-    for _base_ptr, region in capture.memory_regions.items():
-        regions[str(region.region_id)] = {
-            "size": region.size,
-            "element_size": region.element_size,
-            "role": region.role,
-            "has_initial_data": region.initial_data is not None,
-        }
-
-    # Input/output bindings
-    input_bindings = dict(capture.input_bindings)
-    output_bindings = dict(capture.output_bindings)
+        for k, i in capture.kernels.items()
+    }
 
     return {
         "version": APIC_FORMAT_VERSION,
         "target_arch": capture.device.arch,
         "modules": modules,
         "kernels": kernels,
-        "memory_regions": regions,
-        "input_bindings": input_bindings,
-        "output_bindings": output_bindings,
-        "num_launches": len(capture.launches),
-        "num_memory_ops": len(capture.memory_ops),
+        "input_bindings": dict(capture.input_bindings),
+        "output_bindings": dict(capture.output_bindings),
     }
-
-
-def _build_memory_section(capture: APICapture) -> bytes:
-    """Build the memory section containing initial data for internal regions.
-
-    Uses APICMemoryRegionRecord structs for each region.
-    """
-    chunks = []
-
-    # Count regions with initial data
-    regions_with_data = [r for r in capture.memory_regions.values() if r.initial_data is not None]
-    chunks.append(struct.pack("<I", len(regions_with_data)))
-
-    # Write each region using the struct
-    for region in regions_with_data:
-        record = APICMemoryRegionRecord()
-        record.region_id = region.region_id
-        record.element_size = region.element_size
-        record.size = region.size
-        record.role = region.role
-        record.has_initial_data = 1
-
-        chunks.append(bytes(record))
-        chunks.append(region.initial_data)
-
-    return b"".join(chunks)
-
-
-def _build_operations_section(capture: APICapture) -> bytes:
-    """Build the operations section containing launches and memory ops in order.
-
-    Uses ctypes structs for each operation type.
-    """
-    chunks = []
-    total_ops = len(capture.operations)
-    chunks.append(struct.pack("<I", total_ops))
-
-    # Write operations in the order they were captured
-    for op_type, idx in capture.operations:
-        if op_type == "launch":
-            chunks.append(_serialize_launch(capture.launches[idx]))
-        elif op_type == "memop":
-            chunks.append(_serialize_memory_op(capture.memory_ops[idx]))
-        elif op_type == "alloc":
-            chunks.append(_serialize_alloc(capture.allocs[idx]))
-
-    return b"".join(chunks)
-
-
-def _serialize_launch(launch) -> bytes:
-    """Serialize a kernel launch record using APICLaunchRecord struct."""
-    # Encode strings
-    key_bytes = launch.kernel_key.encode("utf-8")
-    hash_bytes = launch.module_hash.encode("utf-8")
-
-    # Serialize parameter bindings
-    param_chunks = []
-    for binding in launch.param_bindings:
-        param_chunks.append(_serialize_param_binding(binding))
-    params_bytes = b"".join(param_chunks)
-
-    # Calculate total size
-    total_size = ctypes.sizeof(APICLaunchRecord) + len(key_bytes) + len(hash_bytes) + len(params_bytes)
-
-    # Create the fixed header struct
-    record = APICLaunchRecord()
-    record.header.op_type = APIC_OP_KERNEL_LAUNCH
-    record.header.total_size = total_size
-    record.dim = launch.dim
-    # Set shape and ndim
-    ndim = len(launch.shape)
-    record.ndim = ndim
-    for i in range(APIC_LAUNCH_MAX_DIMS):
-        record.shape[i] = launch.shape[i] if i < ndim else 1
-    record.max_blocks = launch.max_blocks
-    record.block_dim = launch.block_dim
-    record.smem_bytes = launch.smem_bytes
-    record.is_forward = 1 if launch.is_forward else 0
-    record.kernel_key_len = len(key_bytes)
-    record.module_hash_len = len(hash_bytes)
-    record.num_params = len(launch.param_bindings)
-
-    return bytes(record) + key_bytes + hash_bytes + params_bytes
-
-
-def _serialize_param_binding(binding: dict) -> bytes:
-    """Serialize a parameter binding using ctypes structs."""
-    if binding["type"] == "array":
-        record = APICArrayBindingRecord()
-        record.type = APIC_PARAM_ARRAY
-        record.param_index = binding["param_index"]
-
-        region_id = binding["region_id"] if binding["region_id"] is not None else -1
-        record.region_id = region_id
-        record.byte_offset = binding["offset"]
-
-        ndim = binding["ndim"]
-        record.ndim = ndim
-        record.element_size = binding["element_size"]
-
-        # Copy shape and strides (pad with zeros)
-        for i in range(APIC_MAX_DIMS):
-            if i < ndim:
-                record.shape[i] = binding["shape"][i]
-                record.strides[i] = binding["strides"][i]
-            else:
-                record.shape[i] = 0
-                record.strides[i] = 0
-
-        return bytes(record)
-
-    else:  # scalar
-        record = APICScalarBindingRecord()
-        record.type = APIC_PARAM_SCALAR
-        record.param_index = binding["param_index"]
-        record.size = binding["size"]
-
-        # Copy value bytes
-        value_bytes = binding["value"]
-        for i, b in enumerate(value_bytes):
-            record.value[i] = b
-
-        return bytes(record)
-
-
-def _serialize_memory_op(op) -> bytes:
-    """Serialize a memory operation using ctypes structs."""
-    from .capture import MemcpyRecord, MemsetRecord
-
-    if isinstance(op, MemcpyRecord):
-        if op.kind == "H2D":
-            total_size = ctypes.sizeof(APICMemcpyH2DRecord) + op.size
-
-            record = APICMemcpyH2DRecord()
-            record.header.op_type = APIC_OP_MEMCPY_H2D
-            record.header.total_size = total_size
-            record.dst_region_id = op.dst_region_id
-            record.dst_offset = op.dst_offset
-            record.size = op.size
-
-            return bytes(record) + op.src_data
-
-        elif op.kind == "D2D":
-            record = APICMemcpyD2DRecord()
-            record.header.op_type = APIC_OP_MEMCPY_D2D
-            record.header.total_size = ctypes.sizeof(APICMemcpyD2DRecord)
-            record.dst_region_id = op.dst_region_id
-            record.src_region_id = op.src_region_id
-            record.dst_offset = op.dst_offset
-            record.src_offset = op.src_offset
-            record.size = op.size
-
-            return bytes(record)
-
-        # D2H not serialized (output operation)
-        return b""
-
-    elif isinstance(op, MemsetRecord):
-        record = APICMemsetRecord()
-        record.header.op_type = APIC_OP_MEMSET
-        record.header.total_size = ctypes.sizeof(APICMemsetRecord)
-        record.region_id = op.region_id
-        record.value = op.value
-        record.offset = op.offset
-        record.size = op.size
-
-        return bytes(record)
-
-    return b""
-
-
-def _serialize_alloc(alloc) -> bytes:
-    """Serialize an allocation operation using APICAllocRecord struct."""
-    record = APICAllocRecord()
-    record.header.op_type = APIC_OP_ALLOC
-    record.header.total_size = ctypes.sizeof(APICAllocRecord)
-    record.region_id = alloc.region_id
-    record.size = alloc.size
-
-    return bytes(record)

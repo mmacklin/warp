@@ -35,9 +35,13 @@ void apic_record_kernel_launch(
     int max_blocks,
     int block_dim,
     int smem_bytes,
-    void** args,
-    size_t num_args,
-    size_t* arg_sizes
+    bool is_forward,
+    const char* kernel_key,
+    const char* module_hash,
+    const int32_t* shape,
+    int32_t ndim,
+    const APICParamBindingInfo* params,
+    int num_params
 );
 
 void apic_record_memcpy(APICStateInternal* state, void* dst, void* src, size_t size, APICOpType kind);

@@ -26,9 +26,11 @@ void wp_apic_begin_recording(APICState state)
 {
     if (state) {
         state->recording = true;
-        state->operations.clear();
+        state->operation_stream.clear();
+        state->operation_count = 0;
         state->memory_regions.clear();
-        state->kernel_names.clear();
+        state->modules.clear();
+        state->kernels.clear();
         state->next_region_id = 0;
         g_apic_state = state;
     }
@@ -48,6 +50,38 @@ int wp_apic_is_recording(APICState state)
 {
     if (state) {
         return state->recording ? 1 : 0;
+    }
+    return 0;
+}
+
+uint32_t wp_apic_get_operation_count(APICState state)
+{
+    if (state) {
+        return state->operation_count;
+    }
+    return 0;
+}
+
+uint32_t wp_apic_get_memory_region_count(APICState state)
+{
+    if (state) {
+        return static_cast<uint32_t>(state->memory_regions.size());
+    }
+    return 0;
+}
+
+uint32_t wp_apic_get_module_count(APICState state)
+{
+    if (state) {
+        return static_cast<uint32_t>(state->modules.size());
+    }
+    return 0;
+}
+
+uint32_t wp_apic_get_kernel_count(APICState state)
+{
+    if (state) {
+        return static_cast<uint32_t>(state->kernels.size());
     }
     return 0;
 }
@@ -82,9 +116,9 @@ uint32_t wp_apic_register_memory_region(
     return region_id;
 }
 
-// Internal recording functions
-// Note: These are called during CUDA graph capture from wp_cuda_launch_kernel, etc.
-// They record raw pointer information which is later processed by Python for serialization.
+// =============================================================================
+// Internal Recording Functions (called from wp_cuda_launch_kernel, memcpy, etc.)
+// =============================================================================
 
 void apic_record_kernel_launch(
     APICState state,
@@ -93,44 +127,80 @@ void apic_record_kernel_launch(
     int max_blocks,
     int block_dim,
     int smem_bytes,
-    void** args,
-    size_t num_args,
-    size_t* arg_sizes
+    bool is_forward,
+    const char* kernel_key,
+    const char* module_hash,
+    const int32_t* shape,
+    int32_t ndim,
+    const APICParamBindingInfo* params,
+    int num_params
 )
 {
     if (!state || !state->recording)
         return;
 
-    // Get kernel name
-    std::string kernel_name;
-    auto it = g_kernel_names.find((CUfunction)kernel);
-    if (it != g_kernel_names.end()) {
-        kernel_name = it->second;
-        state->kernel_names.insert(kernel_name);
+    // Build param bindings data
+    std::vector<uint8_t> params_data;
+    for (int i = 0; i < num_params; i++) {
+        const APICParamBindingInfo& param = params[i];
+        if (param.type == APIC_PARAM_ARRAY) {
+            APICArrayBindingRecord rec = {};
+            rec.type = APIC_PARAM_ARRAY;
+            rec.ndim = param.ndim;
+            rec.param_index = param.param_index;
+            rec.region_id = param.region_id;
+            rec.byte_offset = param.byte_offset;
+            for (int d = 0; d < APIC_MAX_DIMS; d++) {
+                rec.shape[d] = param.shape[d];
+                rec.strides[d] = param.strides[d];
+            }
+            rec.element_size = param.element_size;
+            size_t off = params_data.size();
+            params_data.resize(off + sizeof(rec));
+            memcpy(params_data.data() + off, &rec, sizeof(rec));
+        } else {
+            APICScalarBindingRecord rec = {};
+            rec.type = APIC_PARAM_SCALAR;
+            rec.param_index = param.param_index;
+            rec.size = param.scalar_size;
+            memcpy(rec.value, param.scalar_value, param.scalar_size);
+            size_t off = params_data.size();
+            params_data.resize(off + sizeof(rec));
+            memcpy(params_data.data() + off, &rec, sizeof(rec));
+        }
     }
 
-    // Record the launch using the new structure
-    // Note: This records raw data; Python will process it into full semantic records
-    APICRecordedLaunch launch;
-    launch.kernel_key = kernel_name;  // Will be updated by Python with proper kernel_key
-    launch.module_hash = "";  // Will be filled by Python
-    launch.dim = dim;
-    launch.ndim = 1;  // Will be updated by Python with proper ndim
-    launch.shape[0] = static_cast<int32_t>(dim);
-    for (int i = 1; i < APIC_LAUNCH_MAX_DIMS; i++) {
-        launch.shape[i] = 1;
+    size_t key_len = kernel_key ? strlen(kernel_key) : 0;
+    size_t hash_len = module_hash ? strlen(module_hash) : 0;
+    uint32_t total_size = sizeof(APICLaunchRecord) + key_len + hash_len + params_data.size();
+
+    // Build launch record
+    APICLaunchRecord rec = {};
+    rec.header.op_type = APIC_OP_KERNEL_LAUNCH;
+    rec.header.total_size = total_size;
+    rec.dim = dim;
+    rec.ndim = ndim;
+    for (int d = 0; d < APIC_LAUNCH_MAX_DIMS; d++) {
+        rec.shape[d] = (shape && d < ndim) ? shape[d] : 1;
     }
-    launch.max_blocks = max_blocks;
-    launch.block_dim = block_dim;
-    launch.smem_bytes = smem_bytes;
-    launch.is_forward = true;  // Will be updated by Python
+    rec.max_blocks = max_blocks;
+    rec.block_dim = block_dim;
+    rec.smem_bytes = smem_bytes;
+    rec.is_forward = is_forward ? 1 : 0;
+    rec.kernel_key_len = static_cast<uint16_t>(key_len);
+    rec.module_hash_len = static_cast<uint16_t>(hash_len);
+    rec.num_params = static_cast<uint16_t>(num_params);
 
-    state->launches.push_back(std::move(launch));
+    // Append to operation stream
+    state->append_bytes(&rec, sizeof(rec));
+    if (key_len > 0)
+        state->append_bytes(kernel_key, key_len);
+    if (hash_len > 0)
+        state->append_bytes(module_hash, hash_len);
+    if (!params_data.empty())
+        state->append_bytes(params_data.data(), params_data.size());
 
-    APICRecordedOperation op;
-    op.kind = APICRecordedOperation::OP_LAUNCH;
-    op.index = state->launches.size() - 1;
-    state->operations.push_back(op);
+    state->operation_count++;
 }
 
 void apic_record_memcpy(APICState state, void* dst, void* src, size_t size, APICOpType kind)
@@ -138,24 +208,49 @@ void apic_record_memcpy(APICState state, void* dst, void* src, size_t size, APIC
     if (!state || !state->recording)
         return;
 
-    APICRecordedMemoryOp memop;
-    memop.type = kind;
-    memop.dst_region_id = -1;  // Will be resolved by Python using pointer mapping
-    memop.dst_offset = reinterpret_cast<uint64_t>(dst);  // Store raw ptr, Python will resolve
-    memop.src_region_id = -1;
-    memop.src_offset = reinterpret_cast<uint64_t>(src);
-    memop.size = size;
-    memop.value = 0;
+    // Resolve destination pointer to region
+    int32_t dst_region_id = -1;
+    uint64_t dst_offset = 0;
+    if (!state->find_region(reinterpret_cast<uint64_t>(dst), dst_region_id, dst_offset)) {
+        fprintf(stderr, "APIC: Warning - memcpy dst pointer not in any registered region\n");
+    }
 
-    // For H2D, we'd need to copy the source data, but Python handles this
-    // by capturing the data directly during its recording
+    if (kind == APIC_OP_MEMCPY_D2D) {
+        // Resolve source pointer to region
+        int32_t src_region_id = -1;
+        uint64_t src_offset = 0;
+        if (!state->find_region(reinterpret_cast<uint64_t>(src), src_region_id, src_offset)) {
+            fprintf(stderr, "APIC: Warning - memcpy D2D src pointer not in any registered region\n");
+        }
 
-    state->memory_ops.push_back(std::move(memop));
+        APICMemcpyD2DRecord rec = {};
+        rec.header.op_type = APIC_OP_MEMCPY_D2D;
+        rec.header.total_size = sizeof(rec);
+        rec.dst_region_id = dst_region_id;
+        rec.src_region_id = src_region_id;
+        rec.dst_offset = dst_offset;
+        rec.src_offset = src_offset;
+        rec.size = size;
 
-    APICRecordedOperation op;
-    op.kind = APICRecordedOperation::OP_MEMOP;
-    op.index = state->memory_ops.size() - 1;
-    state->operations.push_back(op);
+        state->append_bytes(&rec, sizeof(rec));
+
+    } else if (kind == APIC_OP_MEMCPY_H2D) {
+        uint32_t total_size = sizeof(APICMemcpyH2DRecord) + size;
+
+        APICMemcpyH2DRecord rec = {};
+        rec.header.op_type = APIC_OP_MEMCPY_H2D;
+        rec.header.total_size = total_size;
+        rec.dst_region_id = dst_region_id;
+        rec.dst_offset = dst_offset;
+        rec.size = size;
+
+        state->append_bytes(&rec, sizeof(rec));
+        if (src && size > 0) {
+            state->append_bytes(src, size);
+        }
+    }
+
+    state->operation_count++;
 }
 
 void apic_record_memset(APICState state, void* dst, int value, size_t size)
@@ -163,21 +258,23 @@ void apic_record_memset(APICState state, void* dst, int value, size_t size)
     if (!state || !state->recording)
         return;
 
-    APICRecordedMemoryOp memop;
-    memop.type = APIC_OP_MEMSET;
-    memop.dst_region_id = -1;  // Will be resolved by Python
-    memop.dst_offset = reinterpret_cast<uint64_t>(dst);  // Store raw ptr
-    memop.src_region_id = -1;
-    memop.src_offset = 0;
-    memop.size = size;
-    memop.value = value;
+    // Resolve destination pointer to region
+    int32_t dst_region_id = -1;
+    uint64_t dst_offset = 0;
+    if (!state->find_region(reinterpret_cast<uint64_t>(dst), dst_region_id, dst_offset)) {
+        fprintf(stderr, "APIC: Warning - memset dst pointer not in any registered region\n");
+    }
 
-    state->memory_ops.push_back(std::move(memop));
+    APICMemsetRecord rec = {};
+    rec.header.op_type = APIC_OP_MEMSET;
+    rec.header.total_size = sizeof(rec);
+    rec.region_id = dst_region_id;
+    rec.value = value;
+    rec.offset = dst_offset;
+    rec.size = size;
 
-    APICRecordedOperation op;
-    op.kind = APICRecordedOperation::OP_MEMOP;
-    op.index = state->memory_ops.size() - 1;
-    state->operations.push_back(op);
+    state->append_bytes(&rec, sizeof(rec));
+    state->operation_count++;
 }
 
 void apic_record_alloc(APICState state, void* ptr, size_t size)
@@ -192,66 +289,104 @@ void apic_record_alloc(APICState state, void* ptr, size_t size)
     region.region_id = region_id;
     region.base_ptr = reinterpret_cast<uint64_t>(ptr);
     region.size = size;
-    region.element_size = 1;  // Unknown, Python may update
+    region.element_size = 1;  // Unknown at alloc time
     region.role = APIC_ROLE_INTERNAL;
 
     state->memory_regions[region.base_ptr] = region;
 
-    // Record the allocation operation
-    APICRecordedAlloc alloc;
-    alloc.region_id = region_id;
-    alloc.size = size;
+    // Record the allocation operation directly to stream
+    APICAllocRecord rec = {};
+    rec.header.op_type = APIC_OP_ALLOC;
+    rec.header.total_size = sizeof(rec);
+    rec.region_id = region_id;
+    rec.size = size;
 
-    state->allocs.push_back(std::move(alloc));
-
-    APICRecordedOperation op;
-    op.kind = APICRecordedOperation::OP_ALLOC;
-    op.index = state->allocs.size() - 1;
-    state->operations.push_back(op);
+    state->append_bytes(&rec, sizeof(rec));
+    state->operation_count++;
 }
 
 // =============================================================================
-// APIC WGF File Writing
+// APIC WGF File Writing - Serialize directly from APICStateInternal
 // =============================================================================
 
-int wp_apic_write_wgf(
-    const char* path,
-    uint32_t target_arch,
-    const char* metadata_json,
-    size_t metadata_len,
-    const void* memory_section,
-    size_t memory_len,
-    const void* operations_section,
-    size_t operations_len
+int wp_apic_state_save(
+    APICState state, const char* path, uint32_t target_arch, const char* metadata_json, size_t metadata_len
 )
 {
+    if (!state) {
+        fprintf(stderr, "APIC: Null state passed to wp_apic_state_save\n");
+        return 0;
+    }
+
+    // Build memory section from state->memory_regions
+    // Write ALL regions (not just ones with data) so we have size info for input/output bindings
+    std::vector<uint8_t> memory_section;
+    {
+        uint32_t region_count = static_cast<uint32_t>(state->memory_regions.size());
+
+        // Write count
+        memory_section.resize(4);
+        memcpy(memory_section.data(), &region_count, 4);
+
+        // Write each region
+        for (const auto& kv : state->memory_regions) {
+            const APICRecordedRegion& region = kv.second;
+
+            APICMemoryRegionRecord rec = {};
+            rec.region_id = region.region_id;
+            rec.element_size = region.element_size;
+            rec.size = region.size;
+            rec.role = static_cast<uint8_t>(region.role);
+            rec.has_initial_data = region.initial_data.empty() ? 0 : 1;
+
+            size_t offset = memory_section.size();
+            size_t data_size = rec.has_initial_data ? region.initial_data.size() : 0;
+            memory_section.resize(offset + sizeof(rec) + data_size);
+            memcpy(memory_section.data() + offset, &rec, sizeof(rec));
+            if (rec.has_initial_data) {
+                memcpy(
+                    memory_section.data() + offset + sizeof(rec), region.initial_data.data(), region.initial_data.size()
+                );
+            }
+        }
+    }
+
+    // Build operations section - prepend count to the operation stream
+    std::vector<uint8_t> ops_section;
+    {
+        // Write operation count
+        ops_section.resize(4 + state->operation_stream.size());
+        memcpy(ops_section.data(), &state->operation_count, 4);
+        // Copy the entire operation stream (already in serialized format)
+        if (!state->operation_stream.empty()) {
+            memcpy(ops_section.data() + 4, state->operation_stream.data(), state->operation_stream.size());
+        }
+    }
+
+    // Write WGF file
     FILE* f = fopen(path, "wb");
     if (!f) {
         fprintf(stderr, "APIC: Failed to open file for writing: %s\n", path);
         return 0;
     }
 
-    // Build section entries
     const uint32_t HEADER_SIZE = 64;
     const uint32_t SECTION_ENTRY_SIZE = 32;
-    uint32_t num_sections = 3;  // metadata, memory, operations
+    uint32_t num_sections = 3;
 
     uint64_t section_table_offset = HEADER_SIZE;
     uint64_t data_offset = section_table_offset + num_sections * SECTION_ENTRY_SIZE;
-
-    // Section offsets
     uint64_t metadata_offset = data_offset;
     uint64_t memory_offset = metadata_offset + metadata_len;
-    uint64_t operations_offset = memory_offset + memory_len;
+    uint64_t operations_offset = memory_offset + memory_section.size();
 
-    // Write header (64 bytes)
+    // Write header
     APICFileHeader header = {};
     header.magic[0] = 'W';
     header.magic[1] = 'G';
     header.magic[2] = 'F';
     header.magic[3] = '1';
     header.version = APIC_FORMAT_VERSION;
-    header.flags = 0;
     header.num_sections = num_sections;
     header.section_table_offset = section_table_offset;
     header.target_arch = target_arch;
@@ -261,29 +396,17 @@ int wp_apic_write_wgf(
         return 0;
     }
 
-    // Write section table entries
-    APICSectionEntry entries[3];
-
-    // Metadata section
+    // Write section table
+    APICSectionEntry entries[3] = {};
     entries[0].type = APIC_SECTION_METADATA;
-    entries[0].flags = 0;
     entries[0].offset = metadata_offset;
-    entries[0].size = static_cast<int64_t>(metadata_len);
-    entries[0].uncompressed_size = static_cast<int64_t>(metadata_len);
-
-    // Memory section
+    entries[0].size = entries[0].uncompressed_size = static_cast<int64_t>(metadata_len);
     entries[1].type = APIC_SECTION_MEMORY;
-    entries[1].flags = 0;
     entries[1].offset = memory_offset;
-    entries[1].size = static_cast<int64_t>(memory_len);
-    entries[1].uncompressed_size = static_cast<int64_t>(memory_len);
-
-    // Operations section
+    entries[1].size = entries[1].uncompressed_size = static_cast<int64_t>(memory_section.size());
     entries[2].type = APIC_SECTION_OPERATIONS;
-    entries[2].flags = 0;
     entries[2].offset = operations_offset;
-    entries[2].size = static_cast<int64_t>(operations_len);
-    entries[2].uncompressed_size = static_cast<int64_t>(operations_len);
+    entries[2].size = entries[2].uncompressed_size = static_cast<int64_t>(ops_section.size());
 
     if (fwrite(entries, sizeof(APICSectionEntry), 3, f) != 3) {
         fclose(f);
@@ -295,13 +418,12 @@ int wp_apic_write_wgf(
         fclose(f);
         return 0;
     }
-
-    if (memory_len > 0 && fwrite(memory_section, 1, memory_len, f) != memory_len) {
+    if (!memory_section.empty()
+        && fwrite(memory_section.data(), 1, memory_section.size(), f) != memory_section.size()) {
         fclose(f);
         return 0;
     }
-
-    if (operations_len > 0 && fwrite(operations_section, 1, operations_len, f) != operations_len) {
+    if (!ops_section.empty() && fwrite(ops_section.data(), 1, ops_section.size(), f) != ops_section.size()) {
         fclose(f);
         return 0;
     }
@@ -321,59 +443,6 @@ static const uint32_t WGF_VERSION = APIC_FORMAT_VERSION;
 static const uint32_t WGF_SECTION_METADATA = APIC_SECTION_METADATA;
 static const uint32_t WGF_SECTION_MEMORY = APIC_SECTION_MEMORY;
 static const uint32_t WGF_SECTION_OPERATIONS = APIC_SECTION_OPERATIONS;
-
-// Parameter binding for loaded graphs
-struct APICParamBinding {
-    uint8_t type;  // 1=array, 2=scalar
-    uint16_t param_index;
-    int32_t region_id;  // -1 if null
-    uint64_t byte_offset;
-    int32_t ndim;
-    int64_t shape[APIC_MAX_DIMS];
-    int64_t strides[APIC_MAX_DIMS];
-    uint32_t element_size;
-    // For scalars:
-    std::vector<uint8_t> scalar_value;
-    // Resolved pointer (updated when bindings change)
-    void* resolved_ptr;
-};
-
-// Kernel launch operation
-struct APICKernelLaunch {
-    std::string kernel_key;
-    std::string module_hash;
-    std::string kernel_name;
-    uint64_t dim;
-    int32_t shape[APIC_LAUNCH_MAX_DIMS];
-    int32_t ndim;
-    int32_t max_blocks;
-    int32_t block_dim;
-    int32_t smem_bytes;
-    bool is_forward;
-    std::vector<APICParamBinding> param_bindings;
-    CUfunction kernel_func;  // Resolved kernel function
-};
-
-// Memory operation
-struct APICMemoryOp {
-    uint8_t type;  // 2=H2D, 4=D2D, 5=memset
-    int32_t dst_region_id;
-    uint64_t dst_offset;
-    int32_t src_region_id;  // For D2D
-    uint64_t src_offset;  // For D2D
-    uint64_t size;
-    int32_t value;  // For memset
-    std::vector<uint8_t> src_data;  // For H2D
-    // Resolved pointers
-    void* dst_ptr;
-    void* src_ptr;
-};
-
-// Operation entry (preserves order)
-struct APICOperationEntry {
-    bool is_launch;  // true=launch, false=memop
-    size_t index;  // Index into launches or memory_ops
-};
 
 // Loaded memory region
 struct APICLoadedRegion {
@@ -425,10 +494,10 @@ struct APICGraphInternal {
     std::vector<std::string> input_names;  // Ordered list for indexing
     std::vector<std::string> output_names;
 
-    // Operations
-    std::vector<APICKernelLaunch> launches;
-    std::vector<APICMemoryOp> memory_ops;
-    std::vector<APICOperationEntry> operations;
+    // Operation stream - stored directly in serialized format
+    // Iterate through using APICOpHeader to dispatch
+    std::vector<uint8_t> operation_stream;
+    uint32_t operation_count;
 
     // CUDA graph
     CUgraph cuda_graph;
@@ -441,6 +510,7 @@ struct APICGraphInternal {
     APICGraphInternal()
         : cuda_context(nullptr)
         , target_arch(0)
+        , operation_count(0)
         , cuda_graph(nullptr)
         , cuda_graph_exec(nullptr)
         , needs_rebuild(true)
@@ -862,208 +932,69 @@ static bool apic_parse_metadata(const std::string& json, APICGraphInternal* grap
     return true;
 }
 
-// Parse parameter binding from operations data (version 2 format using fixed-size structs)
-static bool apic_parse_param_binding(const uint8_t*& ptr, const uint8_t* end, APICParamBinding& binding)
-{
-    if (ptr >= end)
-        return false;
-
-    // Peek at the type to determine which struct to read
-    uint8_t param_type = *ptr;
-
-    if (param_type == APIC_PARAM_ARRAY) {
-        // Read fixed-size APICArrayBindingRecord (88 bytes)
-        if (ptr + sizeof(APICArrayBindingRecord) > end)
-            return false;
-
-        const APICArrayBindingRecord* rec = reinterpret_cast<const APICArrayBindingRecord*>(ptr);
-        ptr += sizeof(APICArrayBindingRecord);
-
-        binding.type = rec->type;
-        binding.param_index = rec->param_index;
-        binding.region_id = rec->region_id;
-        binding.byte_offset = rec->byte_offset;
-        binding.ndim = rec->ndim;
-        binding.element_size = rec->element_size;
-
-        for (int i = 0; i < APIC_MAX_DIMS; i++) {
-            binding.shape[i] = rec->shape[i];
-            binding.strides[i] = rec->strides[i];
-        }
-        binding.resolved_ptr = nullptr;
-
-    } else if (param_type == APIC_PARAM_SCALAR) {
-        // Read fixed-size APICScalarBindingRecord (136 bytes)
-        if (ptr + sizeof(APICScalarBindingRecord) > end)
-            return false;
-
-        const APICScalarBindingRecord* rec = reinterpret_cast<const APICScalarBindingRecord*>(ptr);
-        ptr += sizeof(APICScalarBindingRecord);
-
-        binding.type = rec->type;
-        binding.param_index = rec->param_index;
-        binding.scalar_value.resize(rec->size);
-        memcpy(binding.scalar_value.data(), rec->value, rec->size);
-
-    } else {
-        return false;  // Unknown param type
-    }
-
-    return true;
-}
-
-// Parse operations section (version 2 format using APICOpHeader with total_size)
+// Parse operations section - just copy the stream directly
+// Operations are stored in serialized format and iterated during rebuild
 static bool apic_parse_operations(const uint8_t* data, size_t size, APICGraphInternal* graph)
 {
     if (!data || size < 4)
         return false;
 
     const uint8_t* ptr = data;
+
+    // Read operation count
+    graph->operation_count = apic_read_value<uint32_t>(ptr);
+
+    // Copy the rest of the stream (operations data)
+    size_t stream_size = size - 4;
+    if (stream_size > 0) {
+        graph->operation_stream.resize(stream_size);
+        memcpy(graph->operation_stream.data(), ptr, stream_size);
+    }
+
+    return true;
+}
+
+// Parse memory section to create region entries (must be called before allocation)
+static bool apic_parse_memory_regions(const uint8_t* data, size_t size, APICGraphInternal* graph)
+{
+    if (!data || size < 4)
+        return true;  // Empty is OK
+
+    const uint8_t* ptr = data;
     const uint8_t* end = data + size;
 
-    uint32_t num_ops = apic_read_value<uint32_t>(ptr);
+    uint32_t region_count = apic_read_value<uint32_t>(ptr);
 
-    for (uint32_t i = 0; i < num_ops && ptr < end; i++) {
-        // Read the operation header
-        if (ptr + sizeof(APICOpHeader) > end)
+    for (uint32_t i = 0; i < region_count; i++) {
+        if (ptr + sizeof(APICMemoryRegionRecord) > end)
             return false;
 
-        const APICOpHeader* header = reinterpret_cast<const APICOpHeader*>(ptr);
-        const uint8_t* op_start = ptr;
-        uint8_t op_type = header->op_type;
-        if (op_type == APIC_OP_KERNEL_LAUNCH) {
-            // Read APICLaunchRecord header
-            if (ptr + sizeof(APICLaunchRecord) > end)
-                return false;
+        const APICMemoryRegionRecord* rec = reinterpret_cast<const APICMemoryRegionRecord*>(ptr);
+        ptr += sizeof(APICMemoryRegionRecord);
 
-            const APICLaunchRecord* rec = reinterpret_cast<const APICLaunchRecord*>(ptr);
-            const uint8_t* var_data = ptr + sizeof(APICLaunchRecord);
-
-            APICKernelLaunch launch;
-            launch.dim = rec->dim;
-            launch.ndim = rec->ndim;
-            for (int i = 0; i < APIC_LAUNCH_MAX_DIMS; i++) {
-                launch.shape[i] = rec->shape[i];
-            }
-            launch.max_blocks = rec->max_blocks;
-            launch.block_dim = rec->block_dim;
-            launch.smem_bytes = rec->smem_bytes;
-            launch.is_forward = rec->is_forward != 0;
-
-            // Read variable-length strings
-            launch.kernel_key = std::string(reinterpret_cast<const char*>(var_data), rec->kernel_key_len);
-            var_data += rec->kernel_key_len;
-            launch.module_hash = std::string(reinterpret_cast<const char*>(var_data), rec->module_hash_len);
-            var_data += rec->module_hash_len;
-
-            // Read parameter bindings
-            const uint8_t* params_ptr = var_data;
-            launch.param_bindings.resize(rec->num_params);
-            for (uint16_t j = 0; j < rec->num_params; j++) {
-                if (!apic_parse_param_binding(params_ptr, end, launch.param_bindings[j])) {
-                    return false;
-                }
-            }
-
-            // Get kernel name from metadata
-            auto it = graph->kernels.find(launch.kernel_key);
-            if (it != graph->kernels.end()) {
-                launch.kernel_name = launch.is_forward ? it->second.forward_name : it->second.backward_name;
-            }
-
-            launch.kernel_func = nullptr;
-
-            graph->launches.push_back(std::move(launch));
-
-            APICOperationEntry entry;
-            entry.is_launch = true;
-            entry.index = graph->launches.size() - 1;
-            graph->operations.push_back(entry);
-
-        } else if (op_type == APIC_OP_MEMCPY_H2D) {
-            // Read APICMemcpyH2DRecord
-            if (ptr + sizeof(APICMemcpyH2DRecord) > end)
-                return false;
-
-            const APICMemcpyH2DRecord* rec = reinterpret_cast<const APICMemcpyH2DRecord*>(ptr);
-            const uint8_t* data_ptr = ptr + sizeof(APICMemcpyH2DRecord);
-
-            APICMemoryOp op;
-            op.type = APIC_OP_MEMCPY_H2D;
-            op.dst_region_id = rec->dst_region_id;
-            op.dst_offset = rec->dst_offset;
-            op.size = rec->size;
-            op.src_data.resize(op.size);
-            memcpy(op.src_data.data(), data_ptr, op.size);
-            op.dst_ptr = nullptr;
-            op.src_ptr = nullptr;
-
-            graph->memory_ops.push_back(std::move(op));
-
-            APICOperationEntry entry;
-            entry.is_launch = false;
-            entry.index = graph->memory_ops.size() - 1;
-            graph->operations.push_back(entry);
-
-        } else if (op_type == APIC_OP_MEMCPY_D2D) {
-            // Read APICMemcpyD2DRecord
-            if (ptr + sizeof(APICMemcpyD2DRecord) > end)
-                return false;
-
-            const APICMemcpyD2DRecord* rec = reinterpret_cast<const APICMemcpyD2DRecord*>(ptr);
-
-            APICMemoryOp op;
-            op.type = APIC_OP_MEMCPY_D2D;
-            op.dst_region_id = rec->dst_region_id;
-            op.src_region_id = rec->src_region_id;
-            op.dst_offset = rec->dst_offset;
-            op.src_offset = rec->src_offset;
-            op.size = rec->size;
-            op.dst_ptr = nullptr;
-            op.src_ptr = nullptr;
-
-            graph->memory_ops.push_back(std::move(op));
-
-            APICOperationEntry entry;
-            entry.is_launch = false;
-            entry.index = graph->memory_ops.size() - 1;
-            graph->operations.push_back(entry);
-
-        } else if (op_type == APIC_OP_MEMSET) {
-            // Read APICMemsetRecord
-            if (ptr + sizeof(APICMemsetRecord) > end)
-                return false;
-
-            const APICMemsetRecord* rec = reinterpret_cast<const APICMemsetRecord*>(ptr);
-
-            APICMemoryOp op;
-            op.type = APIC_OP_MEMSET;
-            op.dst_region_id = rec->region_id;
-            op.dst_offset = rec->offset;
-            op.value = rec->value;
-            op.size = rec->size;
-            op.dst_ptr = nullptr;
-
-            graph->memory_ops.push_back(std::move(op));
-
-            APICOperationEntry entry;
-            entry.is_launch = false;
-            entry.index = graph->memory_ops.size() - 1;
-            graph->operations.push_back(entry);
-
-        } else if (op_type == APIC_OP_ALLOC) {
-            // Read APICAllocRecord - allocations are handled via memory_regions metadata
-            // Just skip for now
+        // Create region entry if not already in graph
+        if (graph->regions.find(rec->region_id) == graph->regions.end()) {
+            APICLoadedRegion region;
+            region.region_id = rec->region_id;
+            region.size = rec->size;
+            region.element_size = rec->element_size;
+            region.role = rec->role;
+            region.ptr = nullptr;  // Will be allocated later
+            region.external = false;
+            graph->regions[rec->region_id] = region;
         }
 
-        // Advance to next operation using total_size
-        ptr = op_start + header->total_size;
+        // Skip initial data if present
+        if (rec->has_initial_data) {
+            ptr += rec->size;
+        }
     }
 
     return true;
 }
 
 // Initialize memory regions with saved data (version 2 format using APICMemoryRegionRecord)
+// Must be called AFTER allocation
 static bool apic_init_memory(const uint8_t* data, size_t size, APICGraphInternal* graph)
 {
     if (!data || size < 4)
@@ -1110,39 +1041,57 @@ static apic_launch_bounds_t apic_make_launch_bounds(uint64_t dim, const int32_t*
     return bounds;
 }
 
-// Resolve all pointers based on current region allocations
-static void apic_resolve_pointers(APICGraphInternal* graph)
+// Helper: resolve region_id + offset to a pointer
+static void* apic_resolve_region_ptr(APICGraphInternal* graph, int32_t region_id, uint64_t offset)
 {
-    // Resolve launch param bindings
-    for (auto& launch : graph->launches) {
-        for (auto& binding : launch.param_bindings) {
-            if (binding.type == 1 && binding.region_id >= 0) {  // ARRAY
-                auto it = graph->regions.find(binding.region_id);
-                if (it != graph->regions.end() && it->second.ptr) {
-                    binding.resolved_ptr = (void*)((uint8_t*)it->second.ptr + binding.byte_offset);
-                }
-            }
-        }
+    if (region_id < 0)
+        return nullptr;
+    auto it = graph->regions.find(region_id);
+    if (it != graph->regions.end() && it->second.ptr) {
+        return (void*)((uint8_t*)it->second.ptr + offset);
     }
-
-    // Resolve memory op pointers
-    for (auto& op : graph->memory_ops) {
-        if (op.dst_region_id >= 0) {
-            auto it = graph->regions.find(op.dst_region_id);
-            if (it != graph->regions.end() && it->second.ptr) {
-                op.dst_ptr = (void*)((uint8_t*)it->second.ptr + op.dst_offset);
-            }
-        }
-        if (op.type == 4 && op.src_region_id >= 0) {  // D2D
-            auto it = graph->regions.find(op.src_region_id);
-            if (it != graph->regions.end() && it->second.ptr) {
-                op.src_ptr = (void*)((uint8_t*)it->second.ptr + op.src_offset);
-            }
-        }
-    }
+    return nullptr;
 }
 
-// Rebuild CUDA graph by replaying operations
+// Helper: get kernel function (looks up or retrieves from cache)
+static CUfunction apic_get_kernel_function(
+    APICGraphInternal* graph,
+    const char* module_hash,
+    size_t hash_len,
+    const char* kernel_key,
+    size_t key_len,
+    bool is_forward
+)
+{
+    std::string hash_str(module_hash, hash_len);
+    std::string key_str(kernel_key, key_len);
+
+    auto mod_it = graph->modules.find(hash_str);
+    if (mod_it == graph->modules.end() || !mod_it->second.cuda_module) {
+        wp::set_error_string("Module not loaded: %s", hash_str.c_str());
+        return nullptr;
+    }
+
+    // Get kernel name from metadata
+    auto kern_it = graph->kernels.find(key_str);
+    if (kern_it == graph->kernels.end()) {
+        wp::set_error_string("Kernel not found: %s", key_str.c_str());
+        return nullptr;
+    }
+
+    const std::string& kernel_name = is_forward ? kern_it->second.forward_name : kern_it->second.backward_name;
+
+    CUfunction kernel;
+    CUresult err = cuModuleGetFunction_f(&kernel, mod_it->second.cuda_module, kernel_name.c_str());
+    if (err != CUDA_SUCCESS) {
+        wp::set_error_string("Failed to get kernel function %s: %d", kernel_name.c_str(), err);
+        return nullptr;
+    }
+
+    return kernel;
+}
+
+// Rebuild CUDA graph by replaying operations from the stream
 static bool apic_rebuild_cuda_graph(APICGraphInternal* graph, CUstream stream)
 {
     // Destroy old graph using runtime API
@@ -1165,110 +1114,145 @@ static bool apic_rebuild_cuda_graph(APICGraphInternal* graph, CUstream stream)
     bool success = true;
     CUresult err;
 
-    // Replay all operations
-    for (const auto& entry : graph->operations) {
-        if (entry.is_launch) {
-            const APICKernelLaunch& launch = graph->launches[entry.index];
+    // Iterate through operation stream
+    const uint8_t* ptr = graph->operation_stream.data();
+    const uint8_t* end = ptr + graph->operation_stream.size();
 
-            // Get kernel function if not cached
-            CUfunction kernel = launch.kernel_func;
+    for (uint32_t i = 0; i < graph->operation_count && ptr < end && success; i++) {
+        const APICOpHeader* header = reinterpret_cast<const APICOpHeader*>(ptr);
+        const uint8_t* op_start = ptr;
+
+        switch (header->op_type) {
+        case APIC_OP_KERNEL_LAUNCH: {
+            const APICLaunchRecord* rec = reinterpret_cast<const APICLaunchRecord*>(ptr);
+            const uint8_t* var_data = ptr + sizeof(APICLaunchRecord);
+
+            // Parse strings: kernel_key followed by module_hash
+            const char* kernel_key = reinterpret_cast<const char*>(var_data);
+            const char* module_hash = reinterpret_cast<const char*>(var_data + rec->kernel_key_len);
+
+            // Get kernel function
+            CUfunction kernel = apic_get_kernel_function(
+                graph, module_hash, rec->module_hash_len, kernel_key, rec->kernel_key_len, rec->is_forward != 0
+            );
             if (!kernel) {
-                auto mod_it = graph->modules.find(launch.module_hash);
-                if (mod_it == graph->modules.end() || !mod_it->second.cuda_module) {
-                    wp::set_error_string("Module not loaded: %s", launch.module_hash.c_str());
-                    success = false;
-                    break;
-                }
-
-                err = cuModuleGetFunction_f(&kernel, mod_it->second.cuda_module, launch.kernel_name.c_str());
-                if (err != CUDA_SUCCESS) {
-                    wp::set_error_string("Failed to get kernel function %s: %d", launch.kernel_name.c_str(), err);
-                    success = false;
-                    break;
-                }
-                // Cache it (const_cast since we're caching)
-                const_cast<APICKernelLaunch&>(launch).kernel_func = kernel;
+                success = false;
+                break;
             }
 
+            // Skip past strings to param bindings
+            const uint8_t* params_ptr = var_data + rec->kernel_key_len + rec->module_hash_len;
+
             // Build launch bounds and arguments
-            // First arg is always launch_bounds_t
-            apic_launch_bounds_t bounds = apic_make_launch_bounds(launch.dim, launch.shape, launch.ndim);
+            apic_launch_bounds_t bounds = apic_make_launch_bounds(rec->dim, rec->shape, rec->ndim);
 
             std::vector<void*> args;
             std::vector<std::unique_ptr<uint8_t[]>> arg_storage;
-
             args.push_back(&bounds);
 
-            for (const auto& binding : launch.param_bindings) {
-                if (binding.type == 1) {  // ARRAY
+            // Parse and resolve param bindings
+            for (uint16_t j = 0; j < rec->num_params; j++) {
+                uint8_t param_type = *params_ptr;
+                if (param_type == APIC_PARAM_ARRAY) {
+                    const APICArrayBindingRecord* binding = reinterpret_cast<const APICArrayBindingRecord*>(params_ptr);
+                    params_ptr += sizeof(APICArrayBindingRecord);
+
                     // Create array_t structure
                     auto arr = std::make_unique<uint8_t[]>(sizeof(apic_array_t));
                     apic_array_t* arr_ptr = reinterpret_cast<apic_array_t*>(arr.get());
                     memset(arr_ptr, 0, sizeof(apic_array_t));
 
-                    arr_ptr->data = (uint64_t)binding.resolved_ptr;
+                    void* resolved = apic_resolve_region_ptr(graph, binding->region_id, binding->byte_offset);
+                    arr_ptr->data = (uint64_t)resolved;
                     arr_ptr->grad = 0;
-                    arr_ptr->ndim = binding.ndim;
-                    for (int d = 0; d < binding.ndim && d < APIC_MAX_DIMS; d++) {
-                        arr_ptr->shape[d] = (int)binding.shape[d];
-                        arr_ptr->strides[d] = (int)binding.strides[d];
+                    arr_ptr->ndim = binding->ndim;
+                    for (int d = 0; d < binding->ndim && d < APIC_MAX_DIMS; d++) {
+                        arr_ptr->shape[d] = (int)binding->shape[d];
+                        arr_ptr->strides[d] = (int)binding->strides[d];
                     }
 
                     args.push_back(arr_ptr);
                     arg_storage.push_back(std::move(arr));
                 } else {  // SCALAR
-                    auto scalar = std::make_unique<uint8_t[]>(binding.scalar_value.size());
-                    memcpy(scalar.get(), binding.scalar_value.data(), binding.scalar_value.size());
+                    const APICScalarBindingRecord* binding
+                        = reinterpret_cast<const APICScalarBindingRecord*>(params_ptr);
+                    params_ptr += sizeof(APICScalarBindingRecord);
+
+                    auto scalar = std::make_unique<uint8_t[]>(binding->size);
+                    memcpy(scalar.get(), binding->value, binding->size);
                     args.push_back(scalar.get());
                     arg_storage.push_back(std::move(scalar));
                 }
             }
 
             // Calculate grid dimensions
-            int num_threads = launch.dim;
-            int block_size = launch.block_dim;
-            int max_blocks = launch.max_blocks;
+            int num_threads = (int)rec->dim;
+            int block_size = rec->block_dim;
+            int max_blocks = rec->max_blocks;
             int num_blocks = (num_threads + block_size - 1) / block_size;
             if (max_blocks > 0 && num_blocks > max_blocks) {
                 num_blocks = max_blocks;
             }
 
-            // Launch kernel using wrapper function
+            // Launch kernel
             err = cuLaunchKernel_f(
-                kernel, num_blocks, 1, 1,  // grid dim
-                block_size, 1, 1,  // block dim
-                launch.smem_bytes,  // shared mem
-                stream,  // stream
-                args.data(),  // kernel args
-                nullptr  // extra
+                kernel, num_blocks, 1, 1, block_size, 1, 1, rec->smem_bytes, stream, args.data(), nullptr
             );
 
             if (err != CUDA_SUCCESS) {
-                wp::set_error_string("Failed to launch kernel %s: %d", launch.kernel_name.c_str(), err);
+                wp::set_error_string("Failed to launch kernel: %d", err);
                 success = false;
-                break;
             }
-
-        } else {
-            const APICMemoryOp& op = graph->memory_ops[entry.index];
-
-            if (op.type == 2) {  // H2D
-                cuda_err = cudaMemcpyAsync(
-                    op.dst_ptr, op.src_data.data(), op.size, cudaMemcpyHostToDevice, (cudaStream_t)stream
-                );
-            } else if (op.type == 4) {  // D2D
-                cuda_err
-                    = cudaMemcpyAsync(op.dst_ptr, op.src_ptr, op.size, cudaMemcpyDeviceToDevice, (cudaStream_t)stream);
-            } else if (op.type == 5) {  // Memset
-                cuda_err = cudaMemsetAsync(op.dst_ptr, op.value, op.size, (cudaStream_t)stream);
-            }
-
-            if (cuda_err != cudaSuccess) {
-                wp::set_error_string("Failed memory operation: %d", cuda_err);
-                success = false;
-                break;
-            }
+            break;
         }
+
+        case APIC_OP_MEMCPY_H2D: {
+            const APICMemcpyH2DRecord* rec = reinterpret_cast<const APICMemcpyH2DRecord*>(ptr);
+            const uint8_t* src_data = ptr + sizeof(APICMemcpyH2DRecord);
+            void* dst_ptr = apic_resolve_region_ptr(graph, rec->dst_region_id, rec->dst_offset);
+            cuda_err = cudaMemcpyAsync(dst_ptr, src_data, rec->size, cudaMemcpyHostToDevice, (cudaStream_t)stream);
+            if (cuda_err != cudaSuccess) {
+                wp::set_error_string("Failed H2D memcpy: %d", cuda_err);
+                success = false;
+            }
+            break;
+        }
+
+        case APIC_OP_MEMCPY_D2D: {
+            const APICMemcpyD2DRecord* rec = reinterpret_cast<const APICMemcpyD2DRecord*>(ptr);
+            void* dst_ptr = apic_resolve_region_ptr(graph, rec->dst_region_id, rec->dst_offset);
+            void* src_ptr = apic_resolve_region_ptr(graph, rec->src_region_id, rec->src_offset);
+            cuda_err = cudaMemcpyAsync(dst_ptr, src_ptr, rec->size, cudaMemcpyDeviceToDevice, (cudaStream_t)stream);
+            if (cuda_err != cudaSuccess) {
+                wp::set_error_string("Failed D2D memcpy: %d", cuda_err);
+                success = false;
+            }
+            break;
+        }
+
+        case APIC_OP_MEMSET: {
+            const APICMemsetRecord* rec = reinterpret_cast<const APICMemsetRecord*>(ptr);
+            void* dst_ptr = apic_resolve_region_ptr(graph, rec->region_id, rec->offset);
+            cuda_err = cudaMemsetAsync(dst_ptr, rec->value, rec->size, (cudaStream_t)stream);
+            if (cuda_err != cudaSuccess) {
+                wp::set_error_string("Failed memset: %d", cuda_err);
+                success = false;
+            }
+            break;
+        }
+
+        case APIC_OP_ALLOC:
+            // Allocations are handled by memory region setup, skip
+            break;
+
+        default:
+            wp::set_error_string("Unknown operation type: %d", header->op_type);
+            success = false;
+            break;
+        }
+
+        // Advance to next operation
+        ptr = op_start + header->total_size;
     }
 
     // End capture using runtime API
@@ -1386,6 +1370,13 @@ APICGraph wp_apic_load_graph(void* context, const char* path)
         }
     }
 
+    // Parse memory section to create region entries (needed for allocation)
+    if (memory_ptr && !apic_parse_memory_regions(memory_ptr, memory_size, graph)) {
+        wp::set_error_string("Failed to parse memory regions");
+        delete graph;
+        return nullptr;
+    }
+
     // Load cubin modules using the existing warp API
     for (auto& pair : graph->modules) {
         std::string cubin_path = modules_dir + "/" + pair.second.cubin_filename;
@@ -1430,9 +1421,6 @@ APICGraph wp_apic_load_graph(void* context, const char* path)
         return nullptr;
     }
 
-    // Resolve initial pointers
-    apic_resolve_pointers(graph);
-
     return graph;
 }
 
@@ -1473,9 +1461,6 @@ int wp_apic_bind_input(APICGraph graph, const char* name, void* ptr, size_t size
     region_it->second.external = true;
     graph->needs_rebuild = true;
 
-    // Re-resolve pointers
-    apic_resolve_pointers(graph);
-
     return 1;
 }
 
@@ -1508,9 +1493,6 @@ int wp_apic_bind_output(APICGraph graph, const char* name, void* ptr, size_t siz
     region_it->second.ptr = ptr;
     region_it->second.external = true;
     graph->needs_rebuild = true;
-
-    // Re-resolve pointers
-    apic_resolve_pointers(graph);
 
     return 1;
 }

@@ -272,44 +272,6 @@ static std::mutex g_graph_destroy_mutex;
 // APIC (API Capture) State
 // ============================================================================
 
-// Recorded kernel launch (with full semantic info)
-struct APICRecordedLaunch {
-    std::string kernel_key;
-    std::string module_hash;
-    uint64_t dim;
-    int32_t shape[APIC_LAUNCH_MAX_DIMS];
-    int32_t ndim;
-    int32_t max_blocks;
-    int32_t block_dim;
-    int32_t smem_bytes;
-    bool is_forward;
-    std::vector<APICParamBindingInfo> param_bindings;
-};
-
-// Recorded memory operation
-struct APICRecordedMemoryOp {
-    APICOpType type;  // APIC_OP_MEMCPY_H2D, APIC_OP_MEMCPY_D2D, APIC_OP_MEMSET
-    int32_t dst_region_id;
-    uint64_t dst_offset;
-    int32_t src_region_id;  // For D2D only
-    uint64_t src_offset;  // For D2D only
-    uint64_t size;
-    int32_t value;  // For memset only
-    std::vector<uint8_t> src_data;  // For H2D only (inline data)
-};
-
-// Recorded allocation
-struct APICRecordedAlloc {
-    int32_t region_id;
-    uint64_t size;
-};
-
-// Operation entry (preserves order of operations)
-struct APICRecordedOperation {
-    enum { OP_LAUNCH, OP_MEMOP, OP_ALLOC } kind;
-    size_t index;  // Index into launches, memory_ops, or allocs
-};
-
 // Module info (for metadata)
 struct APICRecordedModule {
     std::string module_hash;
@@ -335,14 +297,15 @@ struct APICRecordedRegion {
 };
 
 // Internal APIC state structure
+// Operations are stored in a single contiguous byte stream for efficient
+// serialization and to maintain operation order without a separate index.
 struct APICStateInternal {
     bool recording = false;
 
-    // Recorded operations (in order)
-    std::vector<APICRecordedOperation> operations;
-    std::vector<APICRecordedLaunch> launches;
-    std::vector<APICRecordedMemoryOp> memory_ops;
-    std::vector<APICRecordedAlloc> allocs;
+    // Contiguous operation stream - operations are serialized directly here
+    // Each operation has an APICOpHeader at the start with op_type and total_size
+    std::vector<uint8_t> operation_stream;
+    uint32_t operation_count = 0;  // Number of operations in stream
 
     // Memory regions (keyed by base pointer for lookup)
     std::unordered_map<uint64_t, APICRecordedRegion> memory_regions;
@@ -356,8 +319,27 @@ struct APICStateInternal {
     std::vector<std::pair<std::string, int32_t>> input_bindings;
     std::vector<std::pair<std::string, int32_t>> output_bindings;
 
-    // Unique kernel names encountered (legacy)
-    std::unordered_set<std::string> kernel_names;
+    // Helper: append bytes to operation stream
+    void append_bytes(const void* data, size_t size)
+    {
+        size_t offset = operation_stream.size();
+        operation_stream.resize(offset + size);
+        memcpy(operation_stream.data() + offset, data, size);
+    }
+
+    // Helper: find region containing a pointer
+    bool find_region(uint64_t ptr, int32_t& region_id, uint64_t& offset) const
+    {
+        for (const auto& kv : memory_regions) {
+            const APICRecordedRegion& r = kv.second;
+            if (ptr >= r.base_ptr && ptr < r.base_ptr + r.size) {
+                region_id = r.region_id;
+                offset = ptr - r.base_ptr;
+                return true;
+            }
+        }
+        return false;
+    }
 };
 
 // Thread-local APIC state (set during recording)
@@ -878,6 +860,11 @@ void* wp_alloc_device_async(void* context, size_t s)
                 alloc_info.ref_exists = true;  // user reference created and returned here
                 alloc_info.graph_destroyed = false;  // graph not destroyed yet
                 g_graph_allocs[ptr] = alloc_info;
+            }
+
+            // APIC hook: record allocation for internal arrays
+            if (g_apic_state && g_apic_state->recording) {
+                apic_record_alloc(g_apic_state, ptr, s);
             }
         }
     }
@@ -4620,20 +4607,19 @@ size_t wp_cuda_launch_kernel(
     int block_dim,
     int shared_memory_bytes,
     void** args,
-    void* stream
+    void* stream,
+    const APICLaunchInfo* apic_info
 )
 {
     ContextGuard guard(context);
 
-    // APIC hook: record basic launch info (Python handles full parameter serialization)
-    if (g_apic_state && g_apic_state->recording) {
-        // Record kernel name if available
-        auto it = g_kernel_names.find((CUfunction)kernel);
-        if (it != g_kernel_names.end()) {
-            g_apic_state->kernel_names.insert(it->second);
-        }
-        // Note: Full launch recording with parameters is handled by Python layer
-        // since it has access to kernel signature and argument types
+    // APIC hook: record kernel launch with full parameter info if provided
+    if (g_apic_state && g_apic_state->recording && apic_info) {
+        apic_record_kernel_launch(
+            g_apic_state, kernel, dim, max_blocks, apic_info->block_dim, apic_info->smem_bytes,
+            apic_info->is_forward != 0, apic_info->kernel_key, apic_info->module_hash, apic_info->shape,
+            apic_info->ndim, apic_info->params, apic_info->num_params
+        );
     }
 
     if (block_dim <= 0) {

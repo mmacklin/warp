@@ -637,7 +637,8 @@ WP_API size_t wp_cuda_launch_kernel(
     int block_dim,
     int shared_memory_bytes,
     void** args,
-    void* stream
+    void* stream,
+    const APICLaunchInfo* apic_info = nullptr  // Optional APIC launch info for recording
 );
 WP_API int wp_cuda_get_max_shared_memory(void* context);
 WP_API bool wp_cuda_configure_kernel_shared_memory(void* kernel, int size);
@@ -675,22 +676,22 @@ WP_API void wp_apic_begin_recording(APICState state);
 WP_API void wp_apic_end_recording(APICState state);
 WP_API int wp_apic_is_recording(APICState state);
 
+// State Queries
+WP_API uint32_t wp_apic_get_operation_count(APICState state);
+WP_API uint32_t wp_apic_get_memory_region_count(APICState state);
+WP_API uint32_t wp_apic_get_module_count(APICState state);
+WP_API uint32_t wp_apic_get_kernel_count(APICState state);
+
 // Memory Region Registration
 WP_API uint32_t wp_apic_register_memory_region(
     APICState state, uint64_t base_ptr, uint64_t size, uint32_t element_size, APICMemoryRole role
 );
 
-// Write a WGF file with pre-built section data
+// Save APIC state to a WGF file
+// Serializes directly from the APICState - Python just passes metadata JSON
 // Returns 1 on success, 0 on failure
-WP_API int wp_apic_write_wgf(
-    const char* path,
-    uint32_t target_arch,
-    const char* metadata_json,
-    size_t metadata_len,
-    const void* memory_section,
-    size_t memory_len,
-    const void* operations_section,
-    size_t operations_len
+WP_API int wp_apic_state_save(
+    APICState state, const char* path, uint32_t target_arch, const char* metadata_json, size_t metadata_len
 );
 
 // =============================================================================

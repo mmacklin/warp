@@ -236,6 +236,20 @@ typedef struct {
     uint8_t scalar_value[APIC_MAX_SCALAR_SIZE];  // For scalars: raw value bytes
 } APICParamBindingInfo;  // 216 bytes
 
+// Launch info passed to wp_cuda_launch_kernel() for APIC recording
+typedef struct {
+    const char* kernel_key;  // Kernel identifier string
+    const char* module_hash;  // Module hash string
+    int32_t shape[APIC_LAUNCH_MAX_DIMS];  // Launch shape
+    int32_t ndim;  // Number of dimensions
+    int32_t block_dim;  // Threads per block
+    int32_t smem_bytes;  // Shared memory bytes
+    uint8_t is_forward;  // 1 for forward, 0 for backward
+    uint8_t _pad[3];
+    const APICParamBindingInfo* params;  // Array of parameter bindings
+    int32_t num_params;  // Number of parameter bindings
+} APICLaunchInfo;
+
 #pragma pack(pop)
 
 // =============================================================================
