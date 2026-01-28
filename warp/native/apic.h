@@ -20,38 +20,11 @@
 // APIC (API Capture) - Records Warp API calls for serialization and replay
 // This header contains internal definitions used by the APIC implementation.
 // Public API declarations are in warp.h
+// POD structs for serialization are in apic_types.h
 
-#include <cstddef>
-#include <cstdint>
+#include "apic_types.h"
 
-// Operation types
-enum APICOpType : uint8_t {
-    APIC_OP_KERNEL_LAUNCH = 1,
-    APIC_OP_MEMCPY_H2D = 2,
-    APIC_OP_MEMCPY_D2H = 3,
-    APIC_OP_MEMCPY_D2D = 4,
-    APIC_OP_MEMSET = 5,
-    APIC_OP_ALLOC = 6,
-};
-
-// Parameter types for kernel launches
-enum APICParamType : uint8_t {
-    APIC_PARAM_ARRAY = 1,
-    APIC_PARAM_SCALAR = 2,
-};
-
-// Maximum dimensions for arrays (matches Warp's ARRAY_MAX_DIMS)
-#define APIC_MAX_DIMS 4
-
-// Memory region roles (must match warp.h APICMemoryRole enum)
-enum APICMemoryRoleInternal : uint8_t {
-    APIC_ROLE_INTERNAL_INT = 0,
-    APIC_ROLE_INPUT_INT = 1,
-    APIC_ROLE_OUTPUT_INT = 2,
-    APIC_ROLE_INPUT_OUTPUT_INT = 3,
-};
-
-// Memory region structure for internal use
+// Memory region structure for internal use during recording
 struct APICMemoryRegion {
     uint32_t region_id;
     uint64_t base_ptr;

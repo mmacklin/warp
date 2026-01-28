@@ -5070,44 +5070,15 @@ void apic_record_alloc(APICState state, void* ptr, size_t size)
 // =============================================================================
 // APIC Graph Loading Implementation
 // =============================================================================
+// Uses POD structs from apic_types.h for version 2 format
 
-// WGF file format constants
+// WGF file format constants (aliases to apic_types.h values for compatibility)
 static const char WGF_MAGIC[4] = { 'W', 'G', 'F', '1' };
-static const uint32_t WGF_VERSION = 1;
-static const uint32_t WGF_SECTION_METADATA = 0x01;
-static const uint32_t WGF_SECTION_MEMORY = 0x02;
-static const uint32_t WGF_SECTION_OPERATIONS = 0x03;
+static const uint32_t WGF_VERSION = APIC_FORMAT_VERSION;
+static const uint32_t WGF_SECTION_METADATA = APIC_SECTION_METADATA;
+static const uint32_t WGF_SECTION_MEMORY = APIC_SECTION_MEMORY;
+static const uint32_t WGF_SECTION_OPERATIONS = APIC_SECTION_OPERATIONS;
 static const size_t WGF_HEADER_SIZE = 64;
-
-// Constants matching warp/_src/types.py
-static const int APIC_ARRAY_MAX_DIMS = 4;
-static const int APIC_LAUNCH_MAX_DIMS = 4;
-
-// launch_bounds_t structure (matches warp/_src/types.py)
-struct apic_launch_bounds_t {
-    int32_t shape[APIC_LAUNCH_MAX_DIMS];
-    int32_t ndim;
-    size_t size;
-
-    apic_launch_bounds_t(uint64_t dim)
-    {
-        ndim = 1;
-        size = dim;
-        shape[0] = (int32_t)dim;
-        for (int i = 1; i < APIC_LAUNCH_MAX_DIMS; i++) {
-            shape[i] = 1;
-        }
-    }
-};
-
-// array_t structure (matches warp/_src/types.py)
-struct apic_array_t {
-    uint64_t data;
-    uint64_t grad;
-    int32_t shape[APIC_ARRAY_MAX_DIMS];
-    int32_t strides[APIC_ARRAY_MAX_DIMS];
-    int32_t ndim;
-};
 
 // Parameter binding for loaded graphs
 struct APICParamBinding {
@@ -5647,40 +5618,57 @@ static bool apic_parse_metadata(const std::string& json, APICGraphInternal* grap
     return true;
 }
 
-// Parse parameter binding from operations data
+// Parse parameter binding from operations data (version 2 format using fixed-size structs)
 static bool apic_parse_param_binding(const uint8_t*& ptr, const uint8_t* end, APICParamBinding& binding)
 {
     if (ptr >= end)
         return false;
 
-    binding.type = apic_read_value<uint8_t>(ptr);
+    // Peek at the type to determine which struct to read
+    uint8_t param_type = *ptr;
 
-    if (binding.type == 1) {  // ARRAY
-        binding.param_index = apic_read_value<uint16_t>(ptr);
-        binding.region_id = apic_read_value<int32_t>(ptr);
-        binding.byte_offset = apic_read_value<uint64_t>(ptr);
-        binding.ndim = apic_read_value<uint8_t>(ptr);
+    if (param_type == APIC_PARAM_ARRAY) {
+        // Read fixed-size APICArrayBindingRecord (88 bytes)
+        if (ptr + sizeof(APICArrayBindingRecord) > end)
+            return false;
 
-        for (int i = 0; i < binding.ndim; i++) {
-            binding.shape[i] = apic_read_value<int64_t>(ptr);
+        const APICArrayBindingRecord* rec = reinterpret_cast<const APICArrayBindingRecord*>(ptr);
+        ptr += sizeof(APICArrayBindingRecord);
+
+        binding.type = rec->type;
+        binding.param_index = rec->param_index;
+        binding.region_id = rec->region_id;
+        binding.byte_offset = rec->byte_offset;
+        binding.ndim = rec->ndim;
+        binding.element_size = rec->element_size;
+
+        for (int i = 0; i < APIC_MAX_DIMS; i++) {
+            binding.shape[i] = rec->shape[i];
+            binding.strides[i] = rec->strides[i];
         }
-        for (int i = 0; i < binding.ndim; i++) {
-            binding.strides[i] = apic_read_value<int64_t>(ptr);
-        }
-        binding.element_size = apic_read_value<uint32_t>(ptr);
         binding.resolved_ptr = nullptr;
-    } else if (binding.type == 2) {  // SCALAR
-        binding.param_index = apic_read_value<uint16_t>(ptr);
-        uint16_t size = apic_read_value<uint16_t>(ptr);
-        binding.scalar_value.resize(size);
-        memcpy(binding.scalar_value.data(), ptr, size);
-        ptr += size;
+
+    } else if (param_type == APIC_PARAM_SCALAR) {
+        // Read fixed-size APICScalarBindingRecord (136 bytes)
+        if (ptr + sizeof(APICScalarBindingRecord) > end)
+            return false;
+
+        const APICScalarBindingRecord* rec = reinterpret_cast<const APICScalarBindingRecord*>(ptr);
+        ptr += sizeof(APICScalarBindingRecord);
+
+        binding.type = rec->type;
+        binding.param_index = rec->param_index;
+        binding.scalar_value.resize(rec->size);
+        memcpy(binding.scalar_value.data(), rec->value, rec->size);
+
+    } else {
+        return false;  // Unknown param type
     }
 
     return true;
 }
 
-// Parse operations section
+// Parse operations section (version 2 format using APICOpHeader with total_size)
 static bool apic_parse_operations(const uint8_t* data, size_t size, APICGraphInternal* graph)
 {
     if (!data || size < 4)
@@ -5692,27 +5680,40 @@ static bool apic_parse_operations(const uint8_t* data, size_t size, APICGraphInt
     uint32_t num_ops = apic_read_value<uint32_t>(ptr);
 
     for (uint32_t i = 0; i < num_ops && ptr < end; i++) {
-        uint8_t op_type = apic_read_value<uint8_t>(ptr);
+        // Read the operation header
+        if (ptr + sizeof(APICOpHeader) > end)
+            return false;
 
-        if (op_type == 1) {  // KERNEL_LAUNCH
+        const APICOpHeader* header = reinterpret_cast<const APICOpHeader*>(ptr);
+        const uint8_t* op_start = ptr;
+        uint8_t op_type = header->op_type;
+
+        if (op_type == APIC_OP_KERNEL_LAUNCH) {
+            // Read APICLaunchRecord header
+            if (ptr + sizeof(APICLaunchRecord) > end)
+                return false;
+
+            const APICLaunchRecord* rec = reinterpret_cast<const APICLaunchRecord*>(ptr);
+            const uint8_t* var_data = ptr + sizeof(APICLaunchRecord);
+
             APICKernelLaunch launch;
+            launch.dim = rec->dim;
+            launch.max_blocks = rec->max_blocks;
+            launch.block_dim = rec->block_dim;
+            launch.smem_bytes = rec->smem_bytes;
+            launch.is_forward = rec->is_forward != 0;
 
-            uint16_t key_len = apic_read_value<uint16_t>(ptr);
-            launch.kernel_key = apic_read_string(ptr, key_len);
+            // Read variable-length strings
+            launch.kernel_key = std::string(reinterpret_cast<const char*>(var_data), rec->kernel_key_len);
+            var_data += rec->kernel_key_len;
+            launch.module_hash = std::string(reinterpret_cast<const char*>(var_data), rec->module_hash_len);
+            var_data += rec->module_hash_len;
 
-            uint16_t hash_len = apic_read_value<uint16_t>(ptr);
-            launch.module_hash = apic_read_string(ptr, hash_len);
-
-            launch.dim = apic_read_value<uint64_t>(ptr);
-            launch.max_blocks = apic_read_value<int32_t>(ptr);
-            launch.block_dim = apic_read_value<int32_t>(ptr);
-            launch.smem_bytes = apic_read_value<int32_t>(ptr);
-            launch.is_forward = apic_read_value<uint8_t>(ptr) != 0;
-
-            uint16_t num_params = apic_read_value<uint16_t>(ptr);
-            launch.param_bindings.resize(num_params);
-            for (uint16_t j = 0; j < num_params; j++) {
-                if (!apic_parse_param_binding(ptr, end, launch.param_bindings[j])) {
+            // Read parameter bindings
+            const uint8_t* params_ptr = var_data;
+            launch.param_bindings.resize(rec->num_params);
+            for (uint16_t j = 0; j < rec->num_params; j++) {
+                if (!apic_parse_param_binding(params_ptr, end, launch.param_bindings[j])) {
                     return false;
                 }
             }
@@ -5732,15 +5733,21 @@ static bool apic_parse_operations(const uint8_t* data, size_t size, APICGraphInt
             entry.index = graph->launches.size() - 1;
             graph->operations.push_back(entry);
 
-        } else if (op_type == 2) {  // MEMCPY_H2D
+        } else if (op_type == APIC_OP_MEMCPY_H2D) {
+            // Read APICMemcpyH2DRecord
+            if (ptr + sizeof(APICMemcpyH2DRecord) > end)
+                return false;
+
+            const APICMemcpyH2DRecord* rec = reinterpret_cast<const APICMemcpyH2DRecord*>(ptr);
+            const uint8_t* data_ptr = ptr + sizeof(APICMemcpyH2DRecord);
+
             APICMemoryOp op;
-            op.type = 2;
-            op.dst_region_id = apic_read_value<int32_t>(ptr);
-            op.dst_offset = apic_read_value<uint64_t>(ptr);
-            op.size = apic_read_value<uint64_t>(ptr);
+            op.type = APIC_OP_MEMCPY_H2D;
+            op.dst_region_id = rec->dst_region_id;
+            op.dst_offset = rec->dst_offset;
+            op.size = rec->size;
             op.src_data.resize(op.size);
-            memcpy(op.src_data.data(), ptr, op.size);
-            ptr += op.size;
+            memcpy(op.src_data.data(), data_ptr, op.size);
             op.dst_ptr = nullptr;
             op.src_ptr = nullptr;
 
@@ -5751,14 +5758,20 @@ static bool apic_parse_operations(const uint8_t* data, size_t size, APICGraphInt
             entry.index = graph->memory_ops.size() - 1;
             graph->operations.push_back(entry);
 
-        } else if (op_type == 4) {  // MEMCPY_D2D
+        } else if (op_type == APIC_OP_MEMCPY_D2D) {
+            // Read APICMemcpyD2DRecord
+            if (ptr + sizeof(APICMemcpyD2DRecord) > end)
+                return false;
+
+            const APICMemcpyD2DRecord* rec = reinterpret_cast<const APICMemcpyD2DRecord*>(ptr);
+
             APICMemoryOp op;
-            op.type = 4;
-            op.dst_region_id = apic_read_value<int32_t>(ptr);
-            op.dst_offset = apic_read_value<uint64_t>(ptr);
-            op.src_region_id = apic_read_value<int32_t>(ptr);
-            op.src_offset = apic_read_value<uint64_t>(ptr);
-            op.size = apic_read_value<uint64_t>(ptr);
+            op.type = APIC_OP_MEMCPY_D2D;
+            op.dst_region_id = rec->dst_region_id;
+            op.src_region_id = rec->src_region_id;
+            op.dst_offset = rec->dst_offset;
+            op.src_offset = rec->src_offset;
+            op.size = rec->size;
             op.dst_ptr = nullptr;
             op.src_ptr = nullptr;
 
@@ -5769,13 +5782,19 @@ static bool apic_parse_operations(const uint8_t* data, size_t size, APICGraphInt
             entry.index = graph->memory_ops.size() - 1;
             graph->operations.push_back(entry);
 
-        } else if (op_type == 5) {  // MEMSET
+        } else if (op_type == APIC_OP_MEMSET) {
+            // Read APICMemsetRecord
+            if (ptr + sizeof(APICMemsetRecord) > end)
+                return false;
+
+            const APICMemsetRecord* rec = reinterpret_cast<const APICMemsetRecord*>(ptr);
+
             APICMemoryOp op;
-            op.type = 5;
-            op.dst_region_id = apic_read_value<int32_t>(ptr);
-            op.dst_offset = apic_read_value<uint64_t>(ptr);
-            op.value = apic_read_value<int32_t>(ptr);
-            op.size = apic_read_value<uint64_t>(ptr);
+            op.type = APIC_OP_MEMSET;
+            op.dst_region_id = rec->region_id;
+            op.dst_offset = rec->offset;
+            op.value = rec->value;
+            op.size = rec->size;
             op.dst_ptr = nullptr;
 
             graph->memory_ops.push_back(std::move(op));
@@ -5784,39 +5803,65 @@ static bool apic_parse_operations(const uint8_t* data, size_t size, APICGraphInt
             entry.is_launch = false;
             entry.index = graph->memory_ops.size() - 1;
             graph->operations.push_back(entry);
+
+        } else if (op_type == APIC_OP_ALLOC) {
+            // Read APICAllocRecord - allocations are handled via memory_regions metadata
+            // Just skip for now
         }
+
+        // Advance to next operation using total_size
+        ptr = op_start + header->total_size;
     }
 
     return true;
 }
 
-// Initialize memory regions with saved data
+// Initialize memory regions with saved data (version 2 format using APICMemoryRegionRecord)
 static bool apic_init_memory(const uint8_t* data, size_t size, APICGraphInternal* graph)
 {
     if (!data || size < 4)
         return true;  // Empty is OK
 
     const uint8_t* ptr = data;
+    const uint8_t* end = data + size;
 
     uint32_t region_count = apic_read_value<uint32_t>(ptr);
 
     for (uint32_t i = 0; i < region_count; i++) {
-        uint32_t region_id = apic_read_value<uint32_t>(ptr);
-        uint64_t data_size = apic_read_value<uint64_t>(ptr);
+        if (ptr + sizeof(APICMemoryRegionRecord) > end)
+            return false;
 
-        auto it = graph->regions.find(region_id);
-        if (it != graph->regions.end() && it->second.ptr) {
-            // Copy data to device using runtime API
-            cudaError_t err = cudaMemcpy(it->second.ptr, ptr, data_size, cudaMemcpyHostToDevice);
-            if (err != cudaSuccess) {
-                wp::set_error_string("Failed to initialize memory region %u", region_id);
-                return false;
+        const APICMemoryRegionRecord* rec = reinterpret_cast<const APICMemoryRegionRecord*>(ptr);
+        ptr += sizeof(APICMemoryRegionRecord);
+
+        if (rec->has_initial_data) {
+            auto it = graph->regions.find(rec->region_id);
+            if (it != graph->regions.end() && it->second.ptr) {
+                // Copy data to device using runtime API
+                cudaError_t err = cudaMemcpy(it->second.ptr, ptr, rec->size, cudaMemcpyHostToDevice);
+                if (err != cudaSuccess) {
+                    wp::set_error_string("Failed to initialize memory region %u", rec->region_id);
+                    return false;
+                }
             }
+            ptr += rec->size;
         }
-        ptr += data_size;
     }
 
     return true;
+}
+
+// Helper to create launch bounds for APIC replay
+static apic_launch_bounds_t apic_make_launch_bounds(uint64_t dim)
+{
+    apic_launch_bounds_t bounds;
+    bounds.ndim = 1;
+    bounds.size = dim;
+    bounds.shape[0] = (int)dim;
+    for (int i = 1; i < APIC_LAUNCH_MAX_DIMS; i++) {
+        bounds.shape[i] = 1;
+    }
+    return bounds;
 }
 
 // Resolve all pointers based on current region allocations
@@ -5901,7 +5946,7 @@ static bool apic_rebuild_cuda_graph(APICGraphInternal* graph, CUstream stream)
 
             // Build launch bounds and arguments
             // First arg is always launch_bounds_t
-            apic_launch_bounds_t bounds(launch.dim);
+            apic_launch_bounds_t bounds = apic_make_launch_bounds(launch.dim);
 
             std::vector<void*> args;
             std::vector<std::unique_ptr<uint8_t[]>> arg_storage;
@@ -5918,9 +5963,9 @@ static bool apic_rebuild_cuda_graph(APICGraphInternal* graph, CUstream stream)
                     arr_ptr->data = (uint64_t)binding.resolved_ptr;
                     arr_ptr->grad = 0;
                     arr_ptr->ndim = binding.ndim;
-                    for (int d = 0; d < binding.ndim && d < APIC_ARRAY_MAX_DIMS; d++) {
-                        arr_ptr->shape[d] = (int32_t)binding.shape[d];
-                        arr_ptr->strides[d] = (int32_t)binding.strides[d];
+                    for (int d = 0; d < binding.ndim && d < APIC_MAX_DIMS; d++) {
+                        arr_ptr->shape[d] = (int)binding.shape[d];
+                        arr_ptr->strides[d] = (int)binding.strides[d];
                     }
 
                     args.push_back(arr_ptr);

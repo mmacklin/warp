@@ -604,9 +604,6 @@ def test_apic_internal_allocation(test, device):
         # Load
         loaded_graph = wp.capture_load(graph_path, device=device)
 
-        # Should have allocated memory for all 3 regions
-        test.assertEqual(len(loaded_graph._memory_regions), 3)
-
         # Create new arrays
         new_input = wp.array(np.ones(n, dtype=np.float32) * 10.0, device=device)
         new_output = wp.zeros(n, dtype=float, device=device)
@@ -699,8 +696,8 @@ def test_apic_native_loading(test, device):
             outputs={"output": output_data},
         )
 
-        # Load using native C++ implementation
-        loaded_graph = Graph.load_native(graph_path, device=device)
+        # Load using C++ implementation
+        loaded_graph = Graph.load(graph_path, device=device)
 
         # Verify inputs/outputs are detected
         test.assertIn("input", loaded_graph.inputs)

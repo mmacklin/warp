@@ -25,7 +25,7 @@ This module provides functionality to:
 
 from .capture import APICapture, KernelInfo, MemoryRegion, MemoryRole, ModuleInfo
 from .format import WGFReader, WGFWriter
-from .serialize import load_graph, save_graph
+from .serialize import save_graph
 
 __all__ = [
     "APICapture",
@@ -35,6 +35,5 @@ __all__ = [
     "ModuleInfo",
     "WGFReader",
     "WGFWriter",
-    "load_graph",
     "save_graph",
 ]

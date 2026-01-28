@@ -3794,46 +3794,14 @@ class Graph:
         self.apic_capture = apic_capture
 
         # APIC loaded state (populated when loaded from file)
-        self._loaded_modules: dict = {}  # module_hash -> cuda_module info
-        self._memory_regions: dict = {}  # region_id -> region info
-        self._launches: list = []  # parsed launch records
-        self._memory_ops: list = []  # parsed memory operations
-        self._operations: list = []  # ordered list of ("launch", idx) or ("memop", idx)
-        self._input_bindings: dict = {}  # name -> region_id
-        self._output_bindings: dict = {}  # name -> region_id
+        self._input_bindings: dict = {}  # name -> binding info
+        self._output_bindings: dict = {}  # name -> binding info
         self._source_path: str | None = None  # path if loaded from file
-        self._kernel_cache: dict = {}  # (kernel_name, module_hash) -> kernel function
-        self._metadata: dict = {}  # metadata from loaded file
-        self._needs_rebuild: bool = False  # True if bindings changed and graph needs rebuild
-        self._native_graph = None  # Native C++ APIC graph handle (when loaded via load_native)
+        self._native_graph = None  # Native C++ APIC graph handle
 
     @classmethod
     def load(cls, path: str, device: Device = None) -> Graph:
         """Load a graph from a .wgf file.
-
-        Args:
-            path: Path to the .wgf file
-            device: Target device (default: current CUDA device)
-
-        Returns:
-            Graph object ready for binding and execution
-        """
-        from warp._src.apic.serialize import load_graph_into
-
-        if device is None:
-            device = warp.get_device()
-
-        graph = cls(device)
-        graph._source_path = path
-        load_graph_into(graph, path)
-        return graph
-
-    @classmethod
-    def load_native(cls, path: str, device: Device = None) -> Graph:
-        """Load a graph from a .wgf file using native C++ implementation.
-
-        This uses the C++ APIC graph loading which is suitable for testing
-        the native code path that can also be used from pure C++ applications.
 
         Args:
             path: Path to the .wgf file
@@ -3900,11 +3868,6 @@ class Graph:
                     runtime.core.wp_cuda_graph_destroy(self.device.context, self.graph)
                 if hasattr(self, "graph_exec") and self.graph_exec is not None:
                     runtime.core.wp_cuda_graph_exec_destroy(self.device.context, self.graph_exec)
-                # Free loaded memory regions
-                if hasattr(self, "_memory_regions"):
-                    for region in self._memory_regions.values():
-                        if "ptr" in region and region["ptr"] and not region.get("external", False):
-                            runtime.core.wp_free_device_default(self.device.context, ctypes.c_void_p(region["ptr"]))
         except (TypeError, AttributeError):
             # Suppress TypeError and AttributeError when callables become None during shutdown
             pass
@@ -3926,41 +3889,23 @@ class Graph:
         if name not in self._input_bindings:
             raise ValueError(f"Unknown input binding: {name}")
 
-        # Handle native graph binding
-        if self._native_graph is not None:
-            binding_info = self._input_bindings[name]
-            expected_size = binding_info["size"]
-            if arr.capacity != expected_size:
-                raise ValueError(f"Input array size mismatch: expected {expected_size}, got {arr.capacity}")
+        if self._native_graph is None:
+            raise RuntimeError("Cannot bind input on a graph that was not loaded from file")
 
-            result = runtime.core.wp_apic_bind_input(
-                self._native_graph, name.encode("utf-8"), ctypes.c_void_p(arr.ptr), arr.capacity
-            )
-            if result == 0:
-                raise RuntimeError(f"Failed to bind input '{name}': {runtime.get_error_string()}")
+        binding_info = self._input_bindings[name]
+        expected_size = binding_info["size"]
+        if arr.capacity != expected_size:
+            raise ValueError(f"Input array size mismatch: expected {expected_size}, got {arr.capacity}")
 
-            # Update cached graph handles (they may be rebuilt)
-            self.graph = runtime.core.wp_apic_get_cuda_graph(self._native_graph)
-            self.graph_exec = runtime.core.wp_apic_get_cuda_graph_exec(self._native_graph)
-            return
+        result = runtime.core.wp_apic_bind_input(
+            self._native_graph, name.encode("utf-8"), ctypes.c_void_p(arr.ptr), arr.capacity
+        )
+        if result == 0:
+            raise RuntimeError(f"Failed to bind input '{name}': {runtime.get_error_string()}")
 
-        # Python-side binding
-        region_id = self._input_bindings[name]
-        if region_id not in self._memory_regions:
-            raise ValueError(f"Input region {region_id} not allocated")
-
-        region = self._memory_regions[region_id]
-
-        # Verify size matches
-        if arr.capacity != region["size"]:
-            raise ValueError(f"Input array size mismatch: expected {region['size']}, got {arr.capacity}")
-
-        # Update region pointer to point to the provided array
-        region["ptr"] = arr.ptr
-        region["external"] = True  # Mark as externally owned (don't free on destruction)
-
-        # Update all parameter bindings that reference this region
-        self._update_region_bindings(region_id, arr.ptr)
+        # Update cached graph handles (they may be rebuilt)
+        self.graph = runtime.core.wp_apic_get_cuda_graph(self._native_graph)
+        self.graph_exec = runtime.core.wp_apic_get_cuda_graph_exec(self._native_graph)
 
     def bind_output(self, name: str, arr) -> None:
         """Bind an output array to a named output slot.
@@ -3975,73 +3920,23 @@ class Graph:
         if name not in self._output_bindings:
             raise ValueError(f"Unknown output binding: {name}")
 
-        # Handle native graph binding
-        if self._native_graph is not None:
-            binding_info = self._output_bindings[name]
-            expected_size = binding_info["size"]
-            if arr.capacity != expected_size:
-                raise ValueError(f"Output array size mismatch: expected {expected_size}, got {arr.capacity}")
+        if self._native_graph is None:
+            raise RuntimeError("Cannot bind output on a graph that was not loaded from file")
 
-            result = runtime.core.wp_apic_bind_output(
-                self._native_graph, name.encode("utf-8"), ctypes.c_void_p(arr.ptr), arr.capacity
-            )
-            if result == 0:
-                raise RuntimeError(f"Failed to bind output '{name}': {runtime.get_error_string()}")
+        binding_info = self._output_bindings[name]
+        expected_size = binding_info["size"]
+        if arr.capacity != expected_size:
+            raise ValueError(f"Output array size mismatch: expected {expected_size}, got {arr.capacity}")
 
-            # Update cached graph handles (they may be rebuilt)
-            self.graph = runtime.core.wp_apic_get_cuda_graph(self._native_graph)
-            self.graph_exec = runtime.core.wp_apic_get_cuda_graph_exec(self._native_graph)
-            return
+        result = runtime.core.wp_apic_bind_output(
+            self._native_graph, name.encode("utf-8"), ctypes.c_void_p(arr.ptr), arr.capacity
+        )
+        if result == 0:
+            raise RuntimeError(f"Failed to bind output '{name}': {runtime.get_error_string()}")
 
-        # Python-side binding
-        region_id = self._output_bindings[name]
-        if region_id not in self._memory_regions:
-            raise ValueError(f"Output region {region_id} not allocated")
-
-        region = self._memory_regions[region_id]
-
-        # Verify size matches
-        if arr.capacity != region["size"]:
-            raise ValueError(f"Output array size mismatch: expected {region['size']}, got {arr.capacity}")
-
-        # Update region pointer
-        region["ptr"] = arr.ptr
-        region["external"] = True  # Mark as externally owned (don't free on destruction)
-
-        # Update all parameter bindings that reference this region
-        self._update_region_bindings(region_id, arr.ptr)
-
-    def _update_region_bindings(self, region_id: int, new_ptr: int):
-        """Update all parameter bindings and memory operations that reference a region."""
-        # Mark graph for rebuild since bindings changed
-        if self.is_loaded:
-            self._needs_rebuild = True
-            # Invalidate existing graph exec
-            if self.graph_exec is not None:
-                runtime.core.wp_cuda_graph_exec_destroy(self.device.context, self.graph_exec)
-                self.graph_exec = None
-
-        # Update kernel parameter bindings
-        for launch in self._launches:
-            for binding in launch["param_bindings"]:
-                if binding["type"] == "array" and binding["region_id"] == region_id:
-                    # Recalculate pointer using stored byte offset
-                    byte_offset = binding.get("byte_offset", 0)
-                    binding["ptr"] = new_ptr + byte_offset if new_ptr else None
-
-        # Update memory operations
-        for op in self._memory_ops:
-            if op["type"] == "memcpy_d2d":
-                if op.get("dst_region_id") == region_id:
-                    op["dst_ptr"] = new_ptr + op.get("dst_offset", 0) if new_ptr else None
-                if op.get("src_region_id") == region_id:
-                    op["src_ptr"] = new_ptr + op.get("src_offset", 0) if new_ptr else None
-            elif op["type"] == "memcpy_h2d":
-                if op.get("dst_region_id") == region_id:
-                    op["dst_ptr"] = new_ptr + op.get("dst_offset", 0) if new_ptr else None
-            elif op["type"] == "memset":
-                if op.get("region_id") == region_id:
-                    op["ptr"] = new_ptr + op.get("offset", 0) if new_ptr else None
+        # Update cached graph handles (they may be rebuilt)
+        self.graph = runtime.core.wp_apic_get_cuda_graph(self._native_graph)
+        self.graph_exec = runtime.core.wp_apic_get_cuda_graph_exec(self._native_graph)
 
     @property
     def inputs(self) -> dict:
@@ -4057,155 +3952,6 @@ class Graph:
     def is_loaded(self) -> bool:
         """True if this graph was loaded from a file."""
         return self._source_path is not None
-
-    def _get_kernel_function(self, kernel_name: str, module_hash: str):
-        """Get a kernel function pointer from the loaded modules."""
-        cache_key = (kernel_name, module_hash)
-        if cache_key in self._kernel_cache:
-            return self._kernel_cache[cache_key]
-
-        if module_hash not in self._loaded_modules:
-            raise ValueError(f"Module {module_hash} not loaded")
-
-        module_info = self._loaded_modules[module_hash]
-        cuda_module = module_info["cuda_module"]
-
-        kernel_func = runtime.core.wp_cuda_get_kernel(self.device.context, cuda_module, kernel_name.encode("utf-8"))
-
-        if kernel_func is None:
-            raise ValueError(f"Kernel {kernel_name} not found in module")
-
-        self._kernel_cache[cache_key] = kernel_func
-        return kernel_func
-
-    def _execute_loaded(self, stream=None):
-        """Execute a loaded graph by replaying operations."""
-        from warp._src.types import ARRAY_MAX_DIMS, array_t, launch_bounds_t
-
-        if stream is None:
-            stream = self.device.stream
-
-        cuda_stream = stream.cuda_stream
-
-        # Execute operations in the order they were captured
-        for op_type, idx in self._operations:
-            if op_type == "memop":
-                op = self._memory_ops[idx]
-                if op["type"] == "memcpy_h2d":
-                    src_ptr = (ctypes.c_uint8 * len(op["src_data"])).from_buffer_copy(op["src_data"])
-                    runtime.core.wp_memcpy_h2d(
-                        self.device.context,
-                        ctypes.c_void_p(op["dst_ptr"]),
-                        ctypes.cast(src_ptr, ctypes.c_void_p),
-                        op["size"],
-                        cuda_stream,
-                    )
-                elif op["type"] == "memcpy_d2d":
-                    runtime.core.wp_memcpy_d2d(
-                        self.device.context,
-                        ctypes.c_void_p(op["dst_ptr"]),
-                        ctypes.c_void_p(op["src_ptr"]),
-                        op["size"],
-                        cuda_stream,
-                    )
-                elif op["type"] == "memset":
-                    runtime.core.wp_memset_device(
-                        self.device.context,
-                        ctypes.c_void_p(op["ptr"]),
-                        op["value"],
-                        op["size"],
-                    )
-            elif op_type == "launch":
-                launch = self._launches[idx]
-                kernel_func = self._get_kernel_function(launch["kernel_name"], launch["module_hash"])
-
-                # Build argument array
-                keep_alive = []
-
-                # First argument is always the bounds
-                bounds = launch_bounds_t(launch["dim"])
-                keep_alive.append(bounds)
-
-                args = []
-                args.append(ctypes.c_void_p(ctypes.addressof(bounds)))
-
-                for binding in launch["param_bindings"]:
-                    if binding["type"] == "array":
-                        # Create array descriptor
-                        arr = array_t()
-                        arr.data = binding["ptr"] if binding["ptr"] else 0
-                        arr.grad = 0
-                        arr.ndim = binding["ndim"]
-
-                        for i in range(ARRAY_MAX_DIMS):
-                            if i < len(binding["shape"]):
-                                arr.shape[i] = binding["shape"][i]
-                                arr.strides[i] = binding["strides"][i]
-                            else:
-                                arr.shape[i] = 0
-                                arr.strides[i] = 0
-
-                        keep_alive.append(arr)
-                        args.append(ctypes.c_void_p(ctypes.addressof(arr)))
-                    else:
-                        # Scalar value
-                        value = (ctypes.c_uint8 * binding["size"]).from_buffer_copy(binding["value"])
-                        keep_alive.append(value)
-                        args.append(ctypes.c_void_p(ctypes.addressof(value)))
-
-                # Convert to void** array
-                arg_ptrs = (ctypes.c_void_p * len(args))(*args)
-                keep_alive.append(arg_ptrs)
-
-                # Launch kernel
-                runtime.core.wp_cuda_launch_kernel(
-                    self.device.context,
-                    kernel_func,
-                    launch["dim"],
-                    launch["max_blocks"],
-                    launch["block_dim"],
-                    launch["smem_bytes"],
-                    arg_ptrs,
-                    cuda_stream,
-                )
-
-    def _rebuild_cuda_graph(self):
-        """Rebuild the CUDA graph by replaying operations during capture.
-
-        This is called when bindings change on a loaded graph to create a new
-        CUDA graph with the updated memory pointers.
-        """
-        # Destroy old graph if it exists
-        if self.graph is not None:
-            runtime.core.wp_cuda_graph_destroy(self.device.context, self.graph)
-            self.graph = None
-        if self.graph_exec is not None:
-            runtime.core.wp_cuda_graph_exec_destroy(self.device.context, self.graph_exec)
-            self.graph_exec = None
-
-        stream = self.device.stream
-
-        # Start CUDA graph capture (external=0 means we're starting a new capture)
-        if not runtime.core.wp_cuda_graph_begin_capture(self.device.context, stream.cuda_stream, 0):
-            raise RuntimeError(f"Failed to begin graph capture: {runtime.get_error_string()}")
-
-        try:
-            # Replay all operations (they will be captured into the graph)
-            self._execute_loaded(stream)
-
-            # End capture and get the graph
-            g = ctypes.c_void_p()
-            if not runtime.core.wp_cuda_graph_end_capture(self.device.context, stream.cuda_stream, ctypes.byref(g)):
-                raise RuntimeError(f"Failed to end graph capture: {runtime.get_error_string()}")
-
-            self.graph = g
-            self._needs_rebuild = False
-
-        except Exception:
-            # Clean up capture state on failure
-            g = ctypes.c_void_p()
-            runtime.core.wp_cuda_graph_end_capture(self.device.context, stream.cuda_stream, ctypes.byref(g))
-            raise
 
 
 class Runtime:
@@ -8685,10 +8431,6 @@ def capture_launch(graph: Graph, stream: Stream | None = None):
         device = graph.device
         stream = device.stream
 
-    # Rebuild graph if bindings changed (for loaded graphs)
-    if graph._needs_rebuild:
-        graph._rebuild_cuda_graph()
-
     if graph.graph_exec is None:
         g = ctypes.c_void_p()
         result = runtime.core.wp_cuda_graph_create_exec(
@@ -8756,14 +8498,12 @@ def capture_load(path: str, device: DeviceLike = None):
         graph.bind_output("b", my_output_array)
         wp.capture_launch(graph)
     """
-    from warp._src.apic import load_graph
-
     if device is None:
         device = runtime.get_device()
     else:
         device = runtime.get_device(device)
 
-    return load_graph(path, device)
+    return Graph.load(path, device)
 
 
 def copy(

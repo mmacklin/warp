@@ -20,6 +20,8 @@
 // defines all crt + builtin types
 #include "builtin.h"
 
+#include "apic_types.h"
+
 #include <cstdint>
 
 #define WP_CURRENT_STREAM ((void*)0xffffffffffffffff)
@@ -664,13 +666,7 @@ WP_API float wp_balance_coloring(
 // Opaque handle to APIC state
 typedef struct APICStateInternal* APICState;
 
-// Memory region roles
-enum APICMemoryRole : uint8_t {
-    APIC_ROLE_INTERNAL = 0,
-    APIC_ROLE_INPUT = 1,
-    APIC_ROLE_OUTPUT = 2,
-    APIC_ROLE_INPUT_OUTPUT = 3,
-};
+// Memory region roles - defined in apic_types.h
 
 // APIC State Management
 WP_API APICState wp_apic_create_state();

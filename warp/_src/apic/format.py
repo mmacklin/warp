@@ -30,7 +30,7 @@ from dataclasses import dataclass
 
 # Magic number: "WGF1" in little-endian
 WGF_MAGIC = b"WGF1"
-WGF_VERSION = 1
+WGF_VERSION = 2  # Version 2 uses ctypes struct-based serialization
 
 # Section types
 SECTION_METADATA = 0x01
