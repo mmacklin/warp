@@ -149,8 +149,6 @@ class APICapture:
         self.output_bindings: dict[str, int] = {}  # name -> region_id
 
         # Internal tracking
-        self._ptr_to_region_id: dict[int, int] = {}  # any ptr -> region_id
-        self._next_region_id: int = 0
         self._recording: bool = False
 
     def begin(self):
@@ -256,8 +254,6 @@ class APICapture:
             role=role,
         )
         self.memory_regions[base_ptr] = region
-        self._ptr_to_region_id[arr.ptr] = region_id
-        self._next_region_id = max(self._next_region_id, region_id + 1)
 
         return region_id, offset
 
@@ -360,15 +356,6 @@ class APICapture:
             info.num_params = 0
 
         return info
-
-    def record_launch(self, launch, inputs=None, outputs=None):
-        """Record a kernel launch (deprecated - use build_launch_info instead).
-
-        This method exists for backward compatibility. New code should use
-        build_launch_info() and pass the result to wp_cuda_launch_kernel().
-        """
-        # Just build the info - recording happens in native code during launch
-        self.build_launch_info(launch, inputs, outputs)
 
     def _build_param_bindings(self, launch, inputs=None, outputs=None):
         """Build parameter bindings array for native code."""
