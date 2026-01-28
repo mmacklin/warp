@@ -33,14 +33,6 @@ ARRAY_MAX_DIMS = warp._src.types.ARRAY_MAX_DIMS
 LAUNCH_MAX_DIMS = warp._src.types.LAUNCH_MAX_DIMS
 
 
-# Memory region roles (must match C++ APICMemoryRole enum)
-class MemoryRole:
-    INTERNAL = 0
-    INPUT = 1
-    OUTPUT = 2
-    INPUT_OUTPUT = 3
-
-
 class APICParamBindingInfo(ctypes.Structure):
     """Parameter binding info for array or scalar parameters - matches C struct in apic_types.h.
 
@@ -89,16 +81,6 @@ class MemoryRegion:
     size: int  # Size in bytes
     device_ptr: int  # Original device pointer
     element_size: int  # Size of one element in bytes
-    role: int = MemoryRole.INTERNAL
-
-    def update_role(self, new_role: int):
-        """Update role, preferring higher priority roles."""
-        if new_role > self.role:
-            self.role = new_role
-        elif self.role == MemoryRole.INPUT and new_role == MemoryRole.OUTPUT:
-            self.role = MemoryRole.INPUT_OUTPUT
-        elif self.role == MemoryRole.OUTPUT and new_role == MemoryRole.INPUT:
-            self.role = MemoryRole.INPUT_OUTPUT
 
 
 @dataclass
@@ -210,7 +192,7 @@ class APICapture:
         """Get the number of unique kernels recorded."""
         return len(self.kernels)
 
-    def track_array(self, arr, role: int = MemoryRole.INTERNAL) -> tuple[int, int]:
+    def track_array(self, arr) -> tuple[int, int]:
         """
         Track an array, resolving to its base allocation.
         Registers the region with native code if new.
@@ -234,7 +216,6 @@ class APICapture:
         # Check if we already have this region
         if base_ptr in self.memory_regions:
             region = self.memory_regions[base_ptr]
-            region.update_role(role)
             return region.region_id, offset
 
         # Register with native code
@@ -244,7 +225,6 @@ class APICapture:
             base_ptr,
             base_size,
             element_size,
-            role,
         )
 
         # Track in Python for metadata
@@ -253,7 +233,6 @@ class APICapture:
             size=base_size,
             device_ptr=base_ptr,
             element_size=element_size,
-            role=role,
         )
         self.memory_regions[base_ptr] = region
 
@@ -442,14 +421,14 @@ class APICapture:
 
     def set_input_binding(self, name: str, arr):
         """Mark an array as an input binding."""
-        region_id, offset = self.track_array(arr, MemoryRole.INPUT)
+        region_id, offset = self.track_array(arr)
         if offset != 0:
             raise ValueError(f"Input binding '{name}' must be a base array, not a slice")
         self.input_bindings[name] = region_id
 
     def set_output_binding(self, name: str, arr):
         """Mark an array as an output binding."""
-        region_id, offset = self.track_array(arr, MemoryRole.OUTPUT)
+        region_id, offset = self.track_array(arr)
         if offset != 0:
             raise ValueError(f"Output binding '{name}' must be a base array, not a slice")
         self.output_bindings[name] = region_id

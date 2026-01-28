@@ -4901,7 +4901,6 @@ class Runtime:
                 ctypes.c_uint64,  # base_ptr
                 ctypes.c_uint64,  # size
                 ctypes.c_uint32,  # element_size
-                ctypes.c_int,  # role (APICMemoryRole)
             ]
             self.core.wp_apic_register_memory_region.restype = ctypes.c_uint32
 
@@ -8651,11 +8650,9 @@ def copy(
                 capture_id = runtime.core.wp_cuda_stream_get_capture_id(stream.cuda_stream)
                 graph = runtime.captures.get(capture_id)
                 if graph is not None and graph.apic_capture is not None:
-                    from warp._src.apic.capture import MemoryRole
-
-                    graph.apic_capture.track_array(dest, MemoryRole.OUTPUT)
+                    graph.apic_capture.track_array(dest)
                     if src.device.is_cuda:
-                        graph.apic_capture.track_array(src, MemoryRole.INPUT)
+                        graph.apic_capture.track_array(src)
 
             if src.device.is_cuda:
                 if src.device == dest.device:

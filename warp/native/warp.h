@@ -683,9 +683,8 @@ WP_API uint32_t wp_apic_get_module_count(APICState state);
 WP_API uint32_t wp_apic_get_kernel_count(APICState state);
 
 // Memory Region Registration
-WP_API uint32_t wp_apic_register_memory_region(
-    APICState state, uint64_t base_ptr, uint64_t size, uint32_t element_size, APICMemoryRole role
-);
+WP_API uint32_t
+wp_apic_register_memory_region(APICState state, uint64_t base_ptr, uint64_t size, uint32_t element_size);
 
 // Save APIC state to a WGF file
 // Serializes directly from the APICState - Python just passes metadata JSON

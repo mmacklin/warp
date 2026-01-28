@@ -86,9 +86,7 @@ uint32_t wp_apic_get_kernel_count(APICState state)
     return 0;
 }
 
-uint32_t wp_apic_register_memory_region(
-    APICState state, uint64_t base_ptr, uint64_t size, uint32_t element_size, APICMemoryRole role
-)
+uint32_t wp_apic_register_memory_region(APICState state, uint64_t base_ptr, uint64_t size, uint32_t element_size)
 {
     if (!state)
         return UINT32_MAX;
@@ -96,10 +94,6 @@ uint32_t wp_apic_register_memory_region(
     // Check if region already exists
     auto it = state->memory_regions.find(base_ptr);
     if (it != state->memory_regions.end()) {
-        // Update role if needed (e.g., internal -> input)
-        if (role > it->second.role) {
-            it->second.role = role;
-        }
         return it->second.region_id;
     }
 
@@ -110,7 +104,6 @@ uint32_t wp_apic_register_memory_region(
     region.base_ptr = base_ptr;
     region.size = size;
     region.element_size = element_size;
-    region.role = role;
 
     state->memory_regions[base_ptr] = region;
     return region_id;
@@ -281,7 +274,6 @@ void apic_record_alloc(APICState state, void* ptr, size_t size)
     region.base_ptr = reinterpret_cast<uint64_t>(ptr);
     region.size = size;
     region.element_size = 1;  // Unknown at alloc time
-    region.role = APIC_ROLE_INTERNAL;
 
     state->memory_regions[region.base_ptr] = region;
 
@@ -327,7 +319,6 @@ int wp_apic_state_save(
             rec.region_id = region.region_id;
             rec.element_size = region.element_size;
             rec.size = region.size;
-            rec.role = static_cast<uint8_t>(region.role);
             rec.has_initial_data = region.initial_data.empty() ? 0 : 1;
 
             size_t offset = memory_section.size();
@@ -440,7 +431,6 @@ struct APICLoadedRegion {
     uint32_t region_id;
     uint64_t size;
     uint32_t element_size;
-    uint8_t role;
     void* ptr;  // Allocated device pointer
 };
 
@@ -828,15 +818,6 @@ static bool apic_parse_metadata(const std::string& json, APICGraphInternal* grap
             region.size = size_str.empty() ? 0 : std::stoull(size_str);
             std::string elem_str = find_in_obj("element_size");
             region.element_size = elem_str.empty() ? 0 : std::stoul(elem_str);
-            std::string role_str = find_in_obj("role");
-            if (role_str == "input" || role_str == "INPUT")
-                region.role = APIC_ROLE_INPUT;
-            else if (role_str == "output" || role_str == "OUTPUT")
-                region.role = APIC_ROLE_OUTPUT;
-            else if (role_str == "input_output" || role_str == "INPUT_OUTPUT")
-                region.role = APIC_ROLE_INPUT_OUTPUT;
-            else
-                region.role = APIC_ROLE_INTERNAL;
 
             graph->regions[region_id] = region;
 
@@ -935,7 +916,6 @@ static bool apic_parse_memory_regions(const uint8_t* data, size_t size, APICGrap
             region.region_id = rec->region_id;
             region.size = rec->size;
             region.element_size = rec->element_size;
-            region.role = rec->role;
             region.ptr = nullptr;  // Will be allocated later
             graph->regions[rec->region_id] = region;
         }

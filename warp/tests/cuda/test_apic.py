@@ -162,7 +162,7 @@ def test_apic_save_load_basic(test, device):
 
 def test_apic_capture_class(test, device):
     """Test APICapture class directly."""
-    from warp._src.apic import APICapture, MemoryRole
+    from warp._src.apic import APICapture
 
     n = 512
 
@@ -173,8 +173,8 @@ def test_apic_capture_class(test, device):
     apic = APICapture(device)
 
     # Track arrays
-    _region_id_in, offset_in = apic.track_array(input_arr, MemoryRole.INPUT)
-    _region_id_out, offset_out = apic.track_array(output_arr, MemoryRole.OUTPUT)
+    _region_id_in, offset_in = apic.track_array(input_arr)
+    _region_id_out, offset_out = apic.track_array(output_arr)
 
     test.assertEqual(offset_in, 0)  # Base array, no offset
     test.assertEqual(offset_out, 0)  # Base array, no offset
@@ -184,7 +184,7 @@ def test_apic_capture_class(test, device):
 
 def test_apic_array_slicing(test, device):
     """Test APIC handles array slicing/aliasing correctly."""
-    from warp._src.apic import APICapture, MemoryRole
+    from warp._src.apic import APICapture
 
     n = 1024
 
@@ -196,9 +196,9 @@ def test_apic_array_slicing(test, device):
     apic = APICapture(device)
 
     # Track slices - they should resolve to the same region with different offsets
-    region_id_base, offset_base = apic.track_array(base_arr, MemoryRole.INTERNAL)
-    region_id_1, offset_1 = apic.track_array(slice1, MemoryRole.INPUT)
-    region_id_2, offset_2 = apic.track_array(slice2, MemoryRole.OUTPUT)
+    region_id_base, offset_base = apic.track_array(base_arr)
+    region_id_1, offset_1 = apic.track_array(slice1)
+    region_id_2, offset_2 = apic.track_array(slice2)
 
     # All should map to the same region
     test.assertEqual(region_id_base, region_id_1)
@@ -212,7 +212,7 @@ def test_apic_array_slicing(test, device):
 
 def test_apic_input_output_bindings(test, device):
     """Test input/output binding functionality."""
-    from warp._src.apic import APICapture, MemoryRole
+    from warp._src.apic import APICapture
 
     n = 256
 
@@ -229,12 +229,9 @@ def test_apic_input_output_bindings(test, device):
     test.assertIn("my_input", apic.input_bindings)
     test.assertIn("my_output", apic.output_bindings)
 
-    # Check roles were updated
-    input_region = apic.memory_regions[input_arr.ptr]
-    output_region = apic.memory_regions[output_arr.ptr]
-
-    test.assertEqual(input_region.role, MemoryRole.INPUT)
-    test.assertEqual(output_region.role, MemoryRole.OUTPUT)
+    # Check regions were tracked
+    test.assertIn(input_arr.ptr, apic.memory_regions)
+    test.assertIn(output_arr.ptr, apic.memory_regions)
 
 
 def test_apic_kernel_info_tracking(test, device):

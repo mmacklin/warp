@@ -22,14 +22,13 @@ This module provides functionality to:
 3. Load and execute serialized graphs
 """
 
-from .capture import APICapture, KernelInfo, MemoryRegion, MemoryRole, ModuleInfo
+from .capture import APICapture, KernelInfo, MemoryRegion, ModuleInfo
 from .serialize import save_graph
 
 __all__ = [
     "APICapture",
     "KernelInfo",
     "MemoryRegion",
-    "MemoryRole",
     "ModuleInfo",
     "save_graph",
 ]

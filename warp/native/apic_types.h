@@ -48,13 +48,6 @@ typedef enum {
     // APIC_OP_BVH_CREATE = 12,
 } APICOpType;
 
-// Memory region roles
-typedef enum {
-    APIC_ROLE_INTERNAL = 0,
-    APIC_ROLE_INPUT = 1,
-    APIC_ROLE_OUTPUT = 2,
-    APIC_ROLE_INPUT_OUTPUT = 3,
-} APICMemoryRole;
 
 // =============================================================================
 // WGF File Header
@@ -199,9 +192,8 @@ typedef struct {
     uint32_t region_id;
     uint32_t element_size;
     uint64_t size;  // Size in bytes
-    uint8_t role;  // APICMemoryRole
     uint8_t has_initial_data;  // 1 if initial_data follows
-    uint8_t _pad[6];
+    uint8_t _pad[7];
     // If has_initial_data: uint8_t initial_data[size] follows
 } APICMemoryRegionRecord;  // 24 bytes fixed
 

@@ -292,7 +292,6 @@ struct APICRecordedRegion {
     uint64_t base_ptr;
     uint64_t size;
     uint32_t element_size;
-    APICMemoryRole role;
     std::vector<uint8_t> initial_data;  // For internal regions
 };
 
