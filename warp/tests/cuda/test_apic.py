@@ -210,8 +210,8 @@ def test_apic_array_slicing(test, device):
     test.assertEqual(offset_2, 512 * 4)  # slice2 starts at 512 * sizeof(float)
 
 
-def test_apic_input_output_bindings(test, device):
-    """Test input/output binding functionality."""
+def test_apic_bindings(test, device):
+    """Test parameter binding functionality."""
     from warp._src.apic import APICapture
 
     n = 256
@@ -222,12 +222,12 @@ def test_apic_input_output_bindings(test, device):
     apic = APICapture(device)
 
     # Set bindings
-    apic.set_input_binding("my_input", input_arr)
-    apic.set_output_binding("my_output", output_arr)
+    apic.set_binding("my_input", input_arr)
+    apic.set_binding("my_output", output_arr)
 
     # Verify bindings
-    test.assertIn("my_input", apic.input_bindings)
-    test.assertIn("my_output", apic.output_bindings)
+    test.assertIn("my_input", apic.bindings)
+    test.assertIn("my_output", apic.bindings)
 
     # Check regions were tracked
     test.assertIn(input_arr.ptr, apic.memory_regions)
@@ -710,7 +710,7 @@ add_function_test(TestApic, "test_apic_memory_regions", test_apic_memory_regions
 add_function_test(TestApic, "test_apic_save_load_basic", test_apic_save_load_basic, devices=devices)
 add_function_test(TestApic, "test_apic_capture_class", test_apic_capture_class, devices=devices)
 add_function_test(TestApic, "test_apic_array_slicing", test_apic_array_slicing, devices=devices)
-add_function_test(TestApic, "test_apic_input_output_bindings", test_apic_input_output_bindings, devices=devices)
+add_function_test(TestApic, "test_apic_bindings", test_apic_bindings, devices=devices)
 add_function_test(TestApic, "test_apic_kernel_info_tracking", test_apic_kernel_info_tracking, devices=devices)
 add_function_test(TestApic, "test_apic_launch_record", test_apic_launch_record, devices=devices)
 add_function_test(TestApic, "test_apic_graph_execution_unchanged", test_apic_graph_execution_unchanged, devices=devices)

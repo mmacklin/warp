@@ -131,6 +131,5 @@ def _build_metadata(capture: APICapture) -> dict:
         "target_arch": capture.device.arch,
         "modules": modules,
         "kernels": kernels,
-        "input_bindings": dict(capture.input_bindings),
-        "output_bindings": dict(capture.output_bindings),
+        "bindings": dict(capture.bindings),
     }

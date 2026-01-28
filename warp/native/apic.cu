@@ -863,9 +863,8 @@ static bool apic_parse_metadata(const std::string& json, APICGraphInternal* grap
         }
     };
 
-    // Parse input_bindings and output_bindings into unified params map
-    parse_bindings("input_bindings");
-    parse_bindings("output_bindings");
+    // Parse bindings into params map
+    parse_bindings("bindings");
 
     return true;
 }

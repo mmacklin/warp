@@ -128,9 +128,8 @@ class APICapture:
         self.modules: dict[str, ModuleInfo] = {}  # module_hash -> ModuleInfo
         self.kernels: dict[str, KernelInfo] = {}  # kernel_key -> KernelInfo
 
-        # Input/output bindings (set during save)
-        self.input_bindings: dict[str, int] = {}  # name -> region_id
-        self.output_bindings: dict[str, int] = {}  # name -> region_id
+        # Named parameter bindings (set during save)
+        self.bindings: dict[str, int] = {}  # name -> region_id
 
         # Internal tracking
         self._recording: bool = False
@@ -419,16 +418,9 @@ class APICapture:
         arr = (APICParamBindingInfo * len(bindings))(*bindings)
         return arr
 
-    def set_input_binding(self, name: str, arr):
-        """Mark an array as an input binding."""
+    def set_binding(self, name: str, arr):
+        """Mark an array as a named parameter binding."""
         region_id, offset = self.track_array(arr)
         if offset != 0:
-            raise ValueError(f"Input binding '{name}' must be a base array, not a slice")
-        self.input_bindings[name] = region_id
-
-    def set_output_binding(self, name: str, arr):
-        """Mark an array as an output binding."""
-        region_id, offset = self.track_array(arr)
-        if offset != 0:
-            raise ValueError(f"Output binding '{name}' must be a base array, not a slice")
-        self.output_bindings[name] = region_id
+            raise ValueError(f"Binding '{name}' must be a base array, not a slice")
+        self.bindings[name] = region_id

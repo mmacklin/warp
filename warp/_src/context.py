@@ -8504,14 +8504,14 @@ def capture_save(
 
     from warp._src.apic import save_graph
 
-    # Set input/output bindings
+    # Set parameter bindings
     if inputs:
         for name, arr in inputs.items():
-            graph.apic_capture.set_input_binding(name, arr)
+            graph.apic_capture.set_binding(name, arr)
 
     if outputs:
         for name, arr in outputs.items():
-            graph.apic_capture.set_output_binding(name, arr)
+            graph.apic_capture.set_binding(name, arr)
 
     save_graph(graph.apic_capture, path)
 

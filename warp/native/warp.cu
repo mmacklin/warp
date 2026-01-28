@@ -314,10 +314,6 @@ struct APICStateInternal {
     std::unordered_map<std::string, APICRecordedModule> modules;
     std::unordered_map<std::string, APICRecordedKernel> kernels;
 
-    // Input/output bindings (name -> region_id)
-    std::vector<std::pair<std::string, int32_t>> input_bindings;
-    std::vector<std::pair<std::string, int32_t>> output_bindings;
-
     // Helper: append bytes to operation stream
     void append_bytes(const void* data, size_t size)
     {
