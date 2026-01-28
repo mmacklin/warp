@@ -32,6 +32,8 @@ void apic_record_kernel_launch(
     APICStateInternal* state,
     void* kernel,
     size_t dim,
+    const int* shape,
+    int ndim,
     int max_blocks,
     int block_dim,
     int smem_bytes,

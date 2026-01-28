@@ -26,12 +26,11 @@ Recording is done natively in C++ (warp.cu/apic.cu). Python's role is to:
 import ctypes
 from dataclasses import dataclass
 
-# Constants from apic_types.h
-APIC_MAX_DIMS = 4
-APIC_LAUNCH_MAX_DIMS = 4
-APIC_MAX_SCALAR_SIZE = 128
-APIC_PARAM_ARRAY = 1
-APIC_PARAM_SCALAR = 2
+import warp._src.types
+
+# Use constants from types.py
+ARRAY_MAX_DIMS = warp._src.types.ARRAY_MAX_DIMS
+LAUNCH_MAX_DIMS = warp._src.types.LAUNCH_MAX_DIMS
 
 
 # Memory region roles (must match C++ APICMemoryRole enum)
@@ -43,21 +42,23 @@ class MemoryRole:
 
 
 class APICParamBindingInfo(ctypes.Structure):
-    """Parameter binding info - matches C struct in apic_types.h."""
+    """Parameter binding info for array or scalar parameters - matches C struct in apic_types.h.
+
+    For arrays: uses region_id, byte_offset, shape, strides, element_size
+    For scalars: is_array=0, scalar_size in byte_offset, value bytes in shape[] and strides[]
+    """
 
     _pack_ = 1
     _fields_ = [  # noqa: RUF012
-        ("type", ctypes.c_uint8),
-        ("ndim", ctypes.c_uint8),
+        ("is_array", ctypes.c_uint8),  # 1 for array, 0 for scalar
+        ("ndim", ctypes.c_uint8),  # Number of dimensions (arrays only)
         ("param_index", ctypes.c_uint16),
-        ("region_id", ctypes.c_int32),
-        ("byte_offset", ctypes.c_uint64),
-        ("shape", ctypes.c_int64 * APIC_MAX_DIMS),
-        ("strides", ctypes.c_int64 * APIC_MAX_DIMS),
-        ("element_size", ctypes.c_uint32),
-        ("scalar_size", ctypes.c_uint16),
-        ("_pad", ctypes.c_uint8 * 2),
-        ("scalar_value", ctypes.c_uint8 * APIC_MAX_SCALAR_SIZE),
+        ("region_id", ctypes.c_int32),  # For arrays, -1 for null. Ignored for scalars.
+        ("byte_offset", ctypes.c_uint64),  # Byte offset (arrays) or scalar_size (scalars)
+        ("shape", ctypes.c_int64 * ARRAY_MAX_DIMS),  # Array shape or first 32 bytes of scalar
+        ("strides", ctypes.c_int64 * ARRAY_MAX_DIMS),  # Array strides or next 32 bytes of scalar
+        ("element_size", ctypes.c_uint32),  # Element size (arrays only)
+        ("_pad1", ctypes.c_uint32),
     ]
 
 
@@ -349,7 +350,11 @@ class APICapture:
         return info
 
     def _build_param_bindings(self, launch, inputs=None, outputs=None):
-        """Build parameter bindings array for native code."""
+        """Build parameter bindings array for all parameters (arrays and scalars).
+
+        Launch bounds (shape/ndim/size) are embedded directly in the launch record,
+        not as a parameter binding. All other parameters starting from index 1 are captured.
+        """
         import warp
 
         original_arrays = []
@@ -361,18 +366,7 @@ class APICapture:
         kernel = launch.kernel
         bindings = []
 
-        # Capture bounds (param 0) as a scalar - contains shape/ndim/size
-        bounds_binding = APICParamBindingInfo()
-        bounds_binding.type = APIC_PARAM_SCALAR
-        bounds_binding.param_index = 0
-        bounds_bytes = bytes(launch.params[0])
-        bounds_binding.scalar_size = len(bounds_bytes)
-        for k, b in enumerate(bounds_bytes):
-            if k < APIC_MAX_SCALAR_SIZE:
-                bounds_binding.scalar_value[k] = b
-        bindings.append(bounds_binding)
-
-        # Capture remaining parameters (starting from index 1)
+        # Capture all parameters (starting from index 1, param 0 is launch_bounds)
         array_idx = 0
         for i, arg in enumerate(kernel.adj.args):
             param_idx = i + 1
@@ -380,8 +374,12 @@ class APICapture:
             arg_type = arg.type
 
             binding = APICParamBindingInfo()
+            binding.param_index = param_idx
 
             if isinstance(arg_type, warp._src.types.array):
+                # Array parameter
+                binding.is_array = 1
+
                 arr = None
                 if array_idx < len(original_arrays):
                     candidate = original_arrays[array_idx]
@@ -389,16 +387,13 @@ class APICapture:
                         arr = candidate
                     array_idx += 1
 
-                binding.type = APIC_PARAM_ARRAY
-                binding.param_index = param_idx
-
                 if arr is not None and arr.ptr:
                     region_id, offset = self.track_array(arr)
                     binding.region_id = region_id
                     binding.byte_offset = offset
                     binding.ndim = arr.ndim
                     binding.element_size = self._get_element_size(arr)
-                    for d in range(min(arr.ndim, APIC_MAX_DIMS)):
+                    for d in range(min(arr.ndim, ARRAY_MAX_DIMS)):
                         binding.shape[d] = arr.shape[d]
                         binding.strides[d] = arr.strides[d]
                 else:
@@ -407,13 +402,34 @@ class APICapture:
                     binding.ndim = 0
                     binding.element_size = 0
             else:
-                binding.type = APIC_PARAM_SCALAR
-                binding.param_index = param_idx
+                # Scalar parameter - store value bytes in shape[] and strides[]
+                binding.is_array = 0
+                binding.ndim = 0
+                binding.region_id = -1
+                binding.element_size = 0
+
+                # Get scalar bytes
                 value_bytes = bytes(param)
-                binding.scalar_size = len(value_bytes)
-                for k, b in enumerate(value_bytes):
-                    if k < APIC_MAX_SCALAR_SIZE:
-                        binding.scalar_value[k] = b
+                scalar_size = len(value_bytes)
+                binding.byte_offset = scalar_size  # Store size in byte_offset
+
+                # Store value bytes in shape[] (32 bytes) and strides[] (32 bytes)
+                # Total 64 bytes available
+                max_scalar_size = ARRAY_MAX_DIMS * 8 * 2  # 64 bytes
+                if scalar_size > max_scalar_size:
+                    raise ValueError(f"Scalar parameter too large: {scalar_size} bytes (max {max_scalar_size})")
+
+                # Copy bytes into shape[] and strides[] arrays
+                shape_bytes = (ctypes.c_uint8 * (ARRAY_MAX_DIMS * 8)).from_buffer_copy(
+                    value_bytes[: min(scalar_size, ARRAY_MAX_DIMS * 8)].ljust(ARRAY_MAX_DIMS * 8, b"\x00")
+                )
+                binding.shape = (ctypes.c_int64 * ARRAY_MAX_DIMS).from_buffer_copy(shape_bytes)
+
+                if scalar_size > ARRAY_MAX_DIMS * 8:
+                    strides_bytes = (ctypes.c_uint8 * (ARRAY_MAX_DIMS * 8)).from_buffer_copy(
+                        value_bytes[ARRAY_MAX_DIMS * 8 :].ljust(ARRAY_MAX_DIMS * 8, b"\x00")
+                    )
+                    binding.strides = (ctypes.c_int64 * ARRAY_MAX_DIMS).from_buffer_copy(strides_bytes)
 
             bindings.append(binding)
 

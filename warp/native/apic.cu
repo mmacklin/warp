@@ -124,6 +124,8 @@ void apic_record_kernel_launch(
     APICState state,
     void* kernel,
     size_t dim,
+    const int* shape,
+    int ndim,
     int max_blocks,
     int block_dim,
     int smem_bytes,
@@ -137,45 +139,40 @@ void apic_record_kernel_launch(
     if (!state || !state->recording)
         return;
 
-    // Build param bindings data
+    // Build param bindings data (arrays and scalars)
     std::vector<uint8_t> params_data;
     for (int i = 0; i < num_params; i++) {
         const APICParamBindingInfo& param = params[i];
-        if (param.type == APIC_PARAM_ARRAY) {
-            APICArrayBindingRecord rec = {};
-            rec.type = APIC_PARAM_ARRAY;
-            rec.ndim = param.ndim;
-            rec.param_index = param.param_index;
-            rec.region_id = param.region_id;
-            rec.byte_offset = param.byte_offset;
-            for (int d = 0; d < APIC_MAX_DIMS; d++) {
-                rec.shape[d] = param.shape[d];
-                rec.strides[d] = param.strides[d];
-            }
-            rec.element_size = param.element_size;
-            size_t off = params_data.size();
-            params_data.resize(off + sizeof(rec));
-            memcpy(params_data.data() + off, &rec, sizeof(rec));
-        } else {
-            APICScalarBindingRecord rec = {};
-            rec.type = APIC_PARAM_SCALAR;
-            rec.param_index = param.param_index;
-            rec.size = param.scalar_size;
-            memcpy(rec.value, param.scalar_value, param.scalar_size);
-            size_t off = params_data.size();
-            params_data.resize(off + sizeof(rec));
-            memcpy(params_data.data() + off, &rec, sizeof(rec));
+        APICParamBindingRecord rec = {};
+        rec.is_array = param.is_array;
+        rec.ndim = param.ndim;
+        rec.param_index = param.param_index;
+        rec.region_id = param.region_id;
+        rec.byte_offset = param.byte_offset;
+        for (int d = 0; d < APIC_MAX_DIMS; d++) {
+            rec.shape[d] = param.shape[d];
+            rec.strides[d] = param.strides[d];
         }
+        rec.element_size = param.element_size;
+        size_t off = params_data.size();
+        params_data.resize(off + sizeof(rec));
+        memcpy(params_data.data() + off, &rec, sizeof(rec));
     }
 
     size_t key_len = kernel_key ? strlen(kernel_key) : 0;
     size_t hash_len = module_hash ? strlen(module_hash) : 0;
     uint32_t total_size = sizeof(APICLaunchRecord) + key_len + hash_len + params_data.size();
 
-    // Build launch record (shape/ndim are stored in params[0] as launch_bounds_t)
+    // Build launch record with embedded launch bounds
     APICLaunchRecord rec = {};
     rec.header.op_type = APIC_OP_KERNEL_LAUNCH;
     rec.header.total_size = total_size;
+    // Embed launch bounds (shape/ndim/size)
+    rec.ndim = ndim;
+    rec.size = dim;
+    for (int d = 0; d < ndim && d < APIC_LAUNCH_MAX_DIMS; d++) {
+        rec.shape[d] = shape[d];
+    }
     rec.dim = dim;
     rec.max_blocks = max_blocks;
     rec.block_dim = block_dim;
@@ -1093,14 +1090,25 @@ static bool apic_rebuild_cuda_graph(APICGraphInternal* graph, CUstream stream)
             std::vector<void*> args;
             std::vector<std::unique_ptr<uint8_t[]>> arg_storage;
 
-            // Parse param bindings - param[0] is launch_bounds_t, rest are kernel args
-            for (uint16_t j = 0; j < rec->num_params; j++) {
-                uint8_t param_type = *params_ptr;
-                if (param_type == APIC_PARAM_ARRAY) {
-                    const APICArrayBindingRecord* binding = reinterpret_cast<const APICArrayBindingRecord*>(params_ptr);
-                    params_ptr += sizeof(APICArrayBindingRecord);
+            // Create launch_bounds_t as param[0] from embedded data in record
+            auto bounds = std::make_unique<uint8_t[]>(sizeof(apic_launch_bounds_t));
+            apic_launch_bounds_t* bounds_ptr = reinterpret_cast<apic_launch_bounds_t*>(bounds.get());
+            memset(bounds_ptr, 0, sizeof(apic_launch_bounds_t));
+            bounds_ptr->ndim = rec->ndim;
+            bounds_ptr->size = rec->size;
+            for (int d = 0; d < rec->ndim && d < APIC_LAUNCH_MAX_DIMS; d++) {
+                bounds_ptr->shape[d] = rec->shape[d];
+            }
+            args.push_back(bounds_ptr);
+            arg_storage.push_back(std::move(bounds));
 
-                    // Create array_t structure
+            // Parse param bindings (arrays and scalars, starting from param_index 1)
+            for (uint16_t j = 0; j < rec->num_params; j++) {
+                const APICParamBindingRecord* binding = reinterpret_cast<const APICParamBindingRecord*>(params_ptr);
+                params_ptr += sizeof(APICParamBindingRecord);
+
+                if (binding->is_array) {
+                    // Array parameter - create array_t structure
                     auto arr = std::make_unique<uint8_t[]>(sizeof(apic_array_t));
                     apic_array_t* arr_ptr = reinterpret_cast<apic_array_t*>(arr.get());
                     memset(arr_ptr, 0, sizeof(apic_array_t));
@@ -1116,13 +1124,22 @@ static bool apic_rebuild_cuda_graph(APICGraphInternal* graph, CUstream stream)
 
                     args.push_back(arr_ptr);
                     arg_storage.push_back(std::move(arr));
-                } else {  // SCALAR (including launch_bounds_t at param 0)
-                    const APICScalarBindingRecord* binding
-                        = reinterpret_cast<const APICScalarBindingRecord*>(params_ptr);
-                    params_ptr += sizeof(APICScalarBindingRecord);
+                } else {
+                    // Scalar parameter - value bytes are stored in shape[] and strides[]
+                    // byte_offset contains the scalar size
+                    size_t scalar_size = binding->byte_offset;
+                    auto scalar = std::make_unique<uint8_t[]>(scalar_size);
 
-                    auto scalar = std::make_unique<uint8_t[]>(binding->size);
-                    memcpy(scalar.get(), binding->value, binding->size);
+                    // Copy from shape[] (first 32 bytes) and strides[] (next 32 bytes)
+                    const uint8_t* shape_bytes = reinterpret_cast<const uint8_t*>(binding->shape);
+                    const uint8_t* strides_bytes = reinterpret_cast<const uint8_t*>(binding->strides);
+
+                    size_t first_part = std::min(scalar_size, (size_t)(APIC_MAX_DIMS * sizeof(int64_t)));
+                    memcpy(scalar.get(), shape_bytes, first_part);
+                    if (scalar_size > first_part) {
+                        memcpy(scalar.get() + first_part, strides_bytes, scalar_size - first_part);
+                    }
+
                     args.push_back(scalar.get());
                     arg_storage.push_back(std::move(scalar));
                 }

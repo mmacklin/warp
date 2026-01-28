@@ -25,8 +25,6 @@ extern "C" {
 // Maximum array dimensions (matches Warp's ARRAY_MAX_DIMS)
 #define APIC_MAX_DIMS 4
 
-// Maximum scalar parameter size (covers mat44d = 128 bytes)
-#define APIC_MAX_SCALAR_SIZE 128
 
 // Maximum launch dimensions (must match LAUNCH_MAX_DIMS in builtin.h)
 #define APIC_LAUNCH_MAX_DIMS 4
@@ -49,12 +47,6 @@ typedef enum {
     // APIC_OP_VOLUME_CREATE = 11,
     // APIC_OP_BVH_CREATE = 12,
 } APICOpType;
-
-// Parameter binding types
-typedef enum {
-    APIC_PARAM_ARRAY = 1,
-    APIC_PARAM_SCALAR = 2,
-} APICParamType;
 
 // Memory region roles
 typedef enum {
@@ -117,6 +109,11 @@ typedef struct {
 typedef struct {
     APICOpHeader header;  // op_type = APIC_OP_KERNEL_LAUNCH
 
+    // Launch bounds (embedded, was previously param[0])
+    int32_t shape[APIC_LAUNCH_MAX_DIMS];  // Launch shape
+    int32_t ndim;  // Number of dimensions
+    uint64_t size;  // Total threads (same as dim below, for launch_bounds_t compatibility)
+
     // Launch parameters
     uint64_t dim;  // Total threads
     int32_t max_blocks;  // Maximum blocks
@@ -128,38 +125,29 @@ typedef struct {
     // Variable data sizes
     uint16_t kernel_key_len;  // Length of kernel_key string
     uint16_t module_hash_len;  // Length of module_hash string
-    uint16_t num_params;  // Number of parameter bindings
+    uint16_t num_params;  // Number of parameter bindings (array params only, starting from index 1)
     uint16_t _pad2;
 
     // Variable data follows in order:
     // 1. char kernel_key[kernel_key_len]
     // 2. char module_hash[module_hash_len]
-    // 3. Parameter bindings (APICArrayBindingRecord or APICScalarBindingRecord)
-    //    - param[0] is always launch_bounds_t (contains shape/ndim/size)
-} APICLaunchRecord;  // 40 bytes fixed
+    // 3. Parameter bindings (APICParamBindingRecord for each array param)
+} APICLaunchRecord;
 
-// Array parameter binding (fixed size)
+// Parameter binding record (for array or scalar parameters, param_index >= 1)
+// For arrays: uses region_id, byte_offset, shape, strides, element_size
+// For scalars: scalar_size is in byte_offset, value bytes in shape[] and strides[]
 typedef struct {
-    uint8_t type;  // APIC_PARAM_ARRAY
-    uint8_t ndim;  // Number of dimensions
-    uint16_t param_index;  // Parameter index in kernel signature
-    int32_t region_id;  // Memory region ID (-1 for null array)
-    uint64_t byte_offset;  // Byte offset within region
-    int64_t shape[APIC_MAX_DIMS];  // Array shape
-    int64_t strides[APIC_MAX_DIMS];  // Array strides
-    uint32_t element_size;  // Element size in bytes
-    uint32_t _pad;
-} APICArrayBindingRecord;  // 88 bytes
-
-// Scalar parameter binding (fixed max size)
-typedef struct {
-    uint8_t type;  // APIC_PARAM_SCALAR
-    uint8_t _pad1;
-    uint16_t param_index;  // Parameter index in kernel signature
-    uint16_t size;  // Actual size of scalar value
-    uint16_t _pad2;
-    uint8_t value[APIC_MAX_SCALAR_SIZE];  // Scalar value bytes
-} APICScalarBindingRecord;  // 136 bytes
+    uint8_t is_array;  // 1 for array, 0 for scalar
+    uint8_t ndim;  // Number of dimensions (arrays only)
+    uint16_t param_index;  // Parameter index in kernel signature (1-based, 0 is launch_bounds)
+    int32_t region_id;  // Memory region ID (-1 for null array, ignored for scalars)
+    uint64_t byte_offset;  // Byte offset within region (arrays) or scalar_size (scalars)
+    int64_t shape[APIC_MAX_DIMS];  // Array shape, or first 32 bytes of scalar value
+    int64_t strides[APIC_MAX_DIMS];  // Array strides, or next 32 bytes of scalar value
+    uint32_t element_size;  // Element size in bytes (arrays only)
+    uint32_t _pad1;
+} APICParamBindingRecord;  // 88 bytes
 
 // -----------------------------------------------------------------------------
 // Memory Operations
@@ -221,20 +209,8 @@ typedef struct {
 // Recording API Structures (for passing info from Python to C++)
 // =============================================================================
 
-// Parameter binding info for recording (passed from Python during kernel launch)
-typedef struct {
-    uint8_t type;  // APIC_PARAM_ARRAY or APIC_PARAM_SCALAR
-    uint8_t ndim;  // For arrays: number of dimensions
-    uint16_t param_index;
-    int32_t region_id;  // For arrays: memory region ID (-1 for null)
-    uint64_t byte_offset;  // For arrays: byte offset within region
-    int64_t shape[APIC_MAX_DIMS];
-    int64_t strides[APIC_MAX_DIMS];
-    uint32_t element_size;  // For arrays: element size in bytes
-    uint16_t scalar_size;  // For scalars: size of scalar value
-    uint8_t _pad[2];
-    uint8_t scalar_value[APIC_MAX_SCALAR_SIZE];  // For scalars: raw value bytes
-} APICParamBindingInfo;  // 216 bytes
+// APICParamBindingInfo is the same as APICParamBindingRecord
+typedef APICParamBindingRecord APICParamBindingInfo;
 
 // Launch info passed to wp_cuda_launch_kernel() for APIC recording
 // Only includes fields needed to identify the kernel - other launch parameters
