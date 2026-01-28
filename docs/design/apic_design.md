@@ -970,8 +970,8 @@ wp.capture_save(capture.graph, "my_computation",
 
 # Load and execute
 loaded_graph = wp.capture_load("my_computation")
-loaded_graph.bind_input("positions", new_positions)
-loaded_graph.bind_output("results", new_results)
+loaded_graph.set_param("positions", new_positions)
+loaded_graph.set_param("results", new_results)
 wp.capture_launch(loaded_graph)
 ```
 
@@ -1079,25 +1079,23 @@ class Graph:
 
 **Native Graph Handling:**
 
-When a graph is loaded via `load_native()`, operations delegate to C++ functions:
+When a graph is loaded via C++, parameter updates use memcpy to the pre-allocated memory regions:
 
 ```python
-def bind_input(self, name: str, arr) -> None:
+def set_param(self, name: str, arr) -> None:
     if self._native_graph is not None:
-        # Use C++ binding
-        result = runtime.core.wp_apic_bind_input(
+        # Use C++ memcpy-based parameter setting
+        result = runtime.core.wp_apic_set_param(
             self._native_graph, name.encode(), arr.ptr, arr.capacity
         )
         if result == 0:
-            raise RuntimeError(f"Failed to bind input: {runtime.get_error_string()}")
+            raise RuntimeError(f"Failed to set param: {runtime.get_error_string()}")
         return
-    # ... Python path ...
 
 def __del__(self):
     if self._native_graph is not None:
         runtime.core.wp_apic_destroy_graph(self._native_graph)
         self._native_graph = None
-    # ... cleanup Python resources ...
 ```
 
 ### 5.4 C++ Native Loading API
@@ -1117,19 +1115,21 @@ WP_API wp_apic_graph_t wp_apic_load_graph(void* context, const char* path);
 // Destroy a loaded graph and free all associated resources
 WP_API void wp_apic_destroy_graph(wp_apic_graph_t graph);
 
-// Bind an input array to a named slot
+// Set parameter data by copying to the pre-allocated memory region
+// No graph rebuild is needed - data is copied directly via memcpy
 // Returns: 1 on success, 0 on failure
-WP_API int wp_apic_bind_input(wp_apic_graph_t graph, const char* name,
-                              void* ptr, size_t size);
+WP_API int wp_apic_set_param(wp_apic_graph_t graph, const char* name,
+                              const void* data, size_t size);
 
-// Bind an output array to a named slot
-// Returns: 1 on success, 0 on failure
-WP_API int wp_apic_bind_output(wp_apic_graph_t graph, const char* name,
-                               void* ptr, size_t size);
+// Get the device pointer for a parameter's pre-allocated region
+// Returns: Device pointer or nullptr if not found
+WP_API void* wp_apic_get_param_ptr(wp_apic_graph_t graph, const char* name);
 
-// Launch the graph on a stream
-// Returns: 1 on success, 0 on failure
-WP_API int wp_apic_launch(wp_apic_graph_t graph, void* stream);
+// Get the CUDA graph (builds on first access)
+WP_API void* wp_apic_get_cuda_graph(wp_apic_graph_t graph);
+
+// Get the instantiated CUDA graph exec
+WP_API void* wp_apic_get_cuda_graph_exec(wp_apic_graph_t graph);
 ```
 
 **Python ctypes Bindings (warp/_src/context.py):**
@@ -1142,16 +1142,12 @@ self.core.wp_apic_load_graph.restype = ctypes.c_void_p
 self.core.wp_apic_destroy_graph.argtypes = [ctypes.c_void_p]
 self.core.wp_apic_destroy_graph.restype = None
 
-self.core.wp_apic_bind_input.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
-                                          ctypes.c_void_p, ctypes.c_size_t]
-self.core.wp_apic_bind_input.restype = ctypes.c_int
+self.core.wp_apic_set_param.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
+                                         ctypes.c_void_p, ctypes.c_size_t]
+self.core.wp_apic_set_param.restype = ctypes.c_int
 
-self.core.wp_apic_bind_output.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
-                                           ctypes.c_void_p, ctypes.c_size_t]
-self.core.wp_apic_bind_output.restype = ctypes.c_int
-
-self.core.wp_apic_launch.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-self.core.wp_apic_launch.restype = ctypes.c_int
+self.core.wp_apic_get_param_ptr.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+self.core.wp_apic_get_param_ptr.restype = ctypes.c_void_p
 ```
 
 **Graph.load_native() Method:**
@@ -1275,11 +1271,11 @@ def capture_launch(graph: Graph, stream: Stream = None) -> None:
 
 1. **Binding specification** - Mark arrays as inputs/outputs via `set_input_binding()`/`set_output_binding()` during capture
 2. **Region-based tracking** - Bindings map names to region IDs (simple dict[str, int])
-3. **Graph rebuild on binding change** - When bindings change, `_rebuild_cuda_graph()` replays all operations during capture to create a new CUDA graph with updated pointers
+3. **Memcpy-based parameter updates** - When parameters change, data is copied directly to the pre-allocated memory region via `cudaMemcpy`. No graph rebuild is needed since the graph uses the same fixed memory addresses.
 4. **Validation** - Size checking for bound arrays (capacity must match region size)
-5. **Graph.bind_input/output()** - Update region pointers and mark graph for rebuild
+5. **Graph.set_param()** - Copy data to the pre-allocated region
 
-**Note:** The original design proposed using `cudaGraphExecKernelNodeSetParams` for efficient in-place updates. The current implementation rebuilds the entire graph, which is simpler but less efficient for frequent binding changes. This trade-off was made to reduce implementation complexity.
+**Design note:** The simplified approach uses fixed memory allocations and memcpy for parameter updates. This avoids the complexity of graph rebuilding and is efficient for frequent parameter changes.
 
 ### 6.4 Phase 4: C++ Native Loading (Implemented)
 
@@ -1325,7 +1321,7 @@ def capture_launch(graph: Graph, stream: Stream = None) -> None:
 - Added `apic_capture` field to `Graph.__init__()`
 - Modified `launch()` to call `apic_capture.record_launch()` when APIC active
 - Added `Graph.load()` class method (internal, called by `wp.capture_load()`)
-- Added `Graph.bind_input()`, `Graph.bind_output()`, `Graph._rebuild_cuda_graph()`, `Graph._execute_loaded()` methods
+- Added `Graph.set_param()`, `Graph.get_param_ptr()` methods for parameter access
 - Added `Graph.is_loaded` property
 - Added public APIs: `wp.capture_save()`, `wp.capture_load()`
 
@@ -1335,9 +1331,10 @@ def capture_launch(graph: Graph, stream: Stream = None) -> None:
 **warp/native/warp.h (C++ API):**
 - Added `wp_apic_load_graph()` - Load graph from .wgf file
 - Added `wp_apic_destroy_graph()` - Free graph resources
-- Added `wp_apic_bind_input()` - Bind input array by name
-- Added `wp_apic_bind_output()` - Bind output array by name
-- Added `wp_apic_launch()` - Launch graph on stream
+- Added `wp_apic_set_param()` - Set parameter data via memcpy (no graph rebuild needed)
+- Added `wp_apic_get_param_ptr()` - Get device pointer for a parameter
+- Added `wp_apic_get_cuda_graph()` - Get CUDA graph (builds on first access)
+- Added `wp_apic_get_cuda_graph_exec()` - Get instantiated CUDA graph exec
 
 **warp/native/warp.cu (C++ Implementation):**
 - Added `LoadedApicGraph` structure with module map, memory regions, kernel cache, bindings, operations
@@ -1705,9 +1702,9 @@ def test_apic_native_loading():
     """Test loading a graph using the native C++ implementation.
 
     Verifies:
-    - Graph.load_native() successfully loads a .wgf file via C++ code path
-    - wp_apic_bind_input() and wp_apic_bind_output() work correctly
-    - wp_apic_launch() executes the graph and produces correct results
+    - wp.capture_load() successfully loads a .wgf file via C++ code path
+    - set_param() copies data to pre-allocated memory via memcpy
+    - wp.capture_launch() executes the graph and produces correct results
     - Graph cleanup via wp_apic_destroy_graph() works without errors
     """
 ```
@@ -1715,10 +1712,9 @@ def test_apic_native_loading():
 **Test Coverage (19 tests total):**
 - Basic capture/save/load roundtrips
 - Array aliasing and slicing
-- Input/output bindings
+- Input/output bindings via set_param()
 - Multiple kernels and modules
 - Memory operations (memcpy, memset, allocations)
-- Graph rebuild on binding changes
 - C++ native loading path
 
 ---

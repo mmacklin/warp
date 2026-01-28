@@ -445,7 +445,6 @@ struct APICLoadedRegion {
     uint32_t element_size;
     uint8_t role;
     void* ptr;  // Allocated device pointer
-    bool external;  // True if bound to external array
 };
 
 // Loaded module
@@ -482,21 +481,18 @@ struct APICGraphInternal {
     // Memory regions
     std::unordered_map<uint32_t, APICLoadedRegion> regions;
 
-    // Input/output bindings (name -> region_id)
-    std::unordered_map<std::string, uint32_t> input_bindings;
-    std::unordered_map<std::string, uint32_t> output_bindings;
-    std::vector<std::string> input_names;  // Ordered list for indexing
-    std::vector<std::string> output_names;
+    // Parameter bindings (name -> region_id) - unified for inputs and outputs
+    std::unordered_map<std::string, uint32_t> params;
+    std::vector<std::string> param_names;  // Ordered list for indexing
 
     // Operation stream - stored directly in serialized format
     // Iterate through using APICOpHeader to dispatch
     std::vector<uint8_t> operation_stream;
     uint32_t operation_count;
 
-    // CUDA graph
+    // CUDA graph (built once on first access)
     CUgraph cuda_graph;
     CUgraphExec cuda_graph_exec;
-    bool needs_rebuild;
 
     // Base path for modules directory
     std::string base_path;
@@ -507,7 +503,6 @@ struct APICGraphInternal {
         , operation_count(0)
         , cuda_graph(nullptr)
         , cuda_graph_exec(nullptr)
-        , needs_rebuild(true)
     {
     }
 
@@ -522,7 +517,7 @@ struct APICGraphInternal {
         }
         // Free allocated memory regions using runtime API
         for (auto& pair : regions) {
-            if (pair.second.ptr && !pair.second.external) {
+            if (pair.second.ptr) {
                 cudaFree(pair.second.ptr);
             }
         }
@@ -808,7 +803,6 @@ static bool apic_parse_metadata(const std::string& json, APICGraphInternal* grap
             APICLoadedRegion region;
             region.region_id = region_id;
             region.ptr = nullptr;
-            region.external = false;
 
             auto find_in_obj = [&region_obj](const std::string& key) -> std::string {
                 std::string search = "\"" + key + "\":";
@@ -853,75 +847,47 @@ static bool apic_parse_metadata(const std::string& json, APICGraphInternal* grap
         }
     }
 
-    // Parse input_bindings
-    std::string inputs_json = find_value("input_bindings");
-    if (!inputs_json.empty() && inputs_json[0] == '{') {
-        size_t pos = 1;
-        while (pos < inputs_json.length()) {
-            size_t key_start = inputs_json.find('"', pos);
-            if (key_start == std::string::npos)
-                break;
-            key_start++;
-            size_t key_end = inputs_json.find('"', key_start);
-            if (key_end == std::string::npos)
-                break;
-            std::string name = inputs_json.substr(key_start, key_end - key_start);
+    // Helper lambda to parse a bindings object and add to params
+    auto parse_bindings = [&](const std::string& key) {
+        std::string bindings_json = find_value(key);
+        if (!bindings_json.empty() && bindings_json[0] == '{') {
+            size_t pos = 1;
+            while (pos < bindings_json.length()) {
+                size_t key_start = bindings_json.find('"', pos);
+                if (key_start == std::string::npos)
+                    break;
+                key_start++;
+                size_t key_end = bindings_json.find('"', key_start);
+                if (key_end == std::string::npos)
+                    break;
+                std::string name = bindings_json.substr(key_start, key_end - key_start);
 
-            size_t val_start = inputs_json.find(':', key_end);
-            if (val_start == std::string::npos)
-                break;
-            val_start++;
-            while (val_start < inputs_json.length() && inputs_json[val_start] == ' ')
+                size_t val_start = bindings_json.find(':', key_end);
+                if (val_start == std::string::npos)
+                    break;
                 val_start++;
-            size_t val_end = val_start;
-            while (val_end < inputs_json.length() && inputs_json[val_end] != ',' && inputs_json[val_end] != '}')
-                val_end++;
-            std::string val_str = inputs_json.substr(val_start, val_end - val_start);
-            while (!val_str.empty() && (val_str.back() == ' ' || val_str.back() == '\t'))
-                val_str.pop_back();
-            uint32_t region_id = std::stoul(val_str);
+                while (val_start < bindings_json.length() && bindings_json[val_start] == ' ')
+                    val_start++;
+                size_t val_end = val_start;
+                while (val_end < bindings_json.length() && bindings_json[val_end] != ','
+                       && bindings_json[val_end] != '}')
+                    val_end++;
+                std::string val_str = bindings_json.substr(val_start, val_end - val_start);
+                while (!val_str.empty() && (val_str.back() == ' ' || val_str.back() == '\t'))
+                    val_str.pop_back();
+                uint32_t region_id = std::stoul(val_str);
 
-            graph->input_bindings[name] = region_id;
-            graph->input_names.push_back(name);
+                graph->params[name] = region_id;
+                graph->param_names.push_back(name);
 
-            pos = val_end;
+                pos = val_end;
+            }
         }
-    }
+    };
 
-    // Parse output_bindings
-    std::string outputs_json = find_value("output_bindings");
-    if (!outputs_json.empty() && outputs_json[0] == '{') {
-        size_t pos = 1;
-        while (pos < outputs_json.length()) {
-            size_t key_start = outputs_json.find('"', pos);
-            if (key_start == std::string::npos)
-                break;
-            key_start++;
-            size_t key_end = outputs_json.find('"', key_start);
-            if (key_end == std::string::npos)
-                break;
-            std::string name = outputs_json.substr(key_start, key_end - key_start);
-
-            size_t val_start = outputs_json.find(':', key_end);
-            if (val_start == std::string::npos)
-                break;
-            val_start++;
-            while (val_start < outputs_json.length() && inputs_json[val_start] == ' ')
-                val_start++;
-            size_t val_end = val_start;
-            while (val_end < outputs_json.length() && outputs_json[val_end] != ',' && outputs_json[val_end] != '}')
-                val_end++;
-            std::string val_str = outputs_json.substr(val_start, val_end - val_start);
-            while (!val_str.empty() && (val_str.back() == ' ' || val_str.back() == '\t'))
-                val_str.pop_back();
-            uint32_t region_id = std::stoul(val_str);
-
-            graph->output_bindings[name] = region_id;
-            graph->output_names.push_back(name);
-
-            pos = val_end;
-        }
-    }
+    // Parse input_bindings and output_bindings into unified params map
+    parse_bindings("input_bindings");
+    parse_bindings("output_bindings");
 
     return true;
 }
@@ -974,7 +940,6 @@ static bool apic_parse_memory_regions(const uint8_t* data, size_t size, APICGrap
             region.element_size = rec->element_size;
             region.role = rec->role;
             region.ptr = nullptr;  // Will be allocated later
-            region.external = false;
             graph->regions[rec->region_id] = region;
         }
 
@@ -1247,7 +1212,6 @@ static bool apic_rebuild_cuda_graph(APICGraphInternal* graph, CUstream stream)
     }
 
     graph->cuda_graph = (CUgraph)captured_graph;
-    graph->needs_rebuild = false;
 
     return true;
 }
@@ -1409,68 +1373,97 @@ void wp_apic_destroy_graph(APICGraph graph)
     }
 }
 
-int wp_apic_bind_input(APICGraph graph, const char* name, void* ptr, size_t size)
+int wp_apic_set_param(APICGraph graph, const char* name, const void* data, size_t size)
 {
-    if (!graph || !name)
+    if (!graph || !name || !data)
         return 0;
 
-    auto it = graph->input_bindings.find(name);
-    if (it == graph->input_bindings.end()) {
-        wp::set_error_string("Unknown input binding: %s", name);
+    ContextGuard guard(graph->cuda_context);
+
+    // Look up in params
+    auto param_it = graph->params.find(name);
+    if (param_it == graph->params.end()) {
+        wp::set_error_string("Unknown parameter: %s", name);
         return 0;
     }
+    uint32_t region_id = param_it->second;
 
-    uint32_t region_id = it->second;
     auto region_it = graph->regions.find(region_id);
-    if (region_it == graph->regions.end()) {
-        wp::set_error_string("Input region not found: %u", region_id);
+    if (region_it == graph->regions.end() || !region_it->second.ptr) {
+        wp::set_error_string("Parameter region not found: %s", name);
         return 0;
     }
 
     if (size != region_it->second.size) {
         wp::set_error_string(
-            "Size mismatch for input %s: expected %llu, got %llu", name, (unsigned long long)region_it->second.size,
+            "Size mismatch for parameter %s: expected %llu, got %llu", name, (unsigned long long)region_it->second.size,
             (unsigned long long)size
         );
         return 0;
     }
 
-    region_it->second.ptr = ptr;
-    region_it->second.external = true;
-    graph->needs_rebuild = true;
+    // Copy data to the pre-allocated device memory (device-to-device async copy since input is a device pointer)
+    cudaError_t err = cudaMemcpyAsync(region_it->second.ptr, data, size, cudaMemcpyDeviceToDevice, 0);
+    if (err != cudaSuccess) {
+        wp::set_error_string("Failed to copy parameter data: %d", err);
+        return 0;
+    }
 
     return 1;
 }
 
-int wp_apic_bind_output(APICGraph graph, const char* name, void* ptr, size_t size)
+void* wp_apic_get_param_ptr(APICGraph graph, const char* name)
 {
     if (!graph || !name)
+        return nullptr;
+
+    // Look up in params
+    auto param_it = graph->params.find(name);
+    if (param_it == graph->params.end())
+        return nullptr;
+
+    auto region_it = graph->regions.find(param_it->second);
+    if (region_it == graph->regions.end())
+        return nullptr;
+
+    return region_it->second.ptr;
+}
+
+int wp_apic_get_param(APICGraph graph, const char* name, void* data, size_t size)
+{
+    if (!graph || !name || !data)
         return 0;
 
-    auto it = graph->output_bindings.find(name);
-    if (it == graph->output_bindings.end()) {
-        wp::set_error_string("Unknown output binding: %s", name);
+    ContextGuard guard(graph->cuda_context);
+
+    // Look up in params
+    auto param_it = graph->params.find(name);
+    if (param_it == graph->params.end()) {
+        wp::set_error_string("Unknown parameter: %s", name);
         return 0;
     }
+    uint32_t region_id = param_it->second;
 
-    uint32_t region_id = it->second;
     auto region_it = graph->regions.find(region_id);
-    if (region_it == graph->regions.end()) {
-        wp::set_error_string("Output region not found: %u", region_id);
+    if (region_it == graph->regions.end() || !region_it->second.ptr) {
+        wp::set_error_string("Parameter region not found: %s", name);
         return 0;
     }
 
     if (size != region_it->second.size) {
         wp::set_error_string(
-            "Size mismatch for output %s: expected %llu, got %llu", name, (unsigned long long)region_it->second.size,
+            "Size mismatch for parameter %s: expected %llu, got %llu", name, (unsigned long long)region_it->second.size,
             (unsigned long long)size
         );
         return 0;
     }
 
-    region_it->second.ptr = ptr;
-    region_it->second.external = true;
-    graph->needs_rebuild = true;
+    // Copy data from the pre-allocated device memory to the destination (device-to-device async)
+    cudaError_t err = cudaMemcpyAsync(data, region_it->second.ptr, size, cudaMemcpyDeviceToDevice, 0);
+    if (err != cudaSuccess) {
+        wp::set_error_string("Failed to copy parameter data: %d", err);
+        return 0;
+    }
 
     return 1;
 }
@@ -1482,8 +1475,8 @@ void* wp_apic_get_cuda_graph(APICGraph graph)
 
     ContextGuard guard(graph->cuda_context);
 
-    if (graph->needs_rebuild || !graph->cuda_graph) {
-        // Get default stream using wrapper function
+    // Build graph once on first access
+    if (!graph->cuda_graph) {
         CUstream stream;
         cuStreamCreate_f(&stream, CU_STREAM_DEFAULT);
 
@@ -1523,43 +1516,21 @@ void* wp_apic_get_cuda_graph_exec(APICGraph graph)
     return graph->cuda_graph_exec;
 }
 
-int wp_apic_get_num_inputs(APICGraph graph) { return graph ? (int)graph->input_names.size() : 0; }
+int wp_apic_get_num_params(APICGraph graph) { return graph ? (int)graph->param_names.size() : 0; }
 
-int wp_apic_get_num_outputs(APICGraph graph) { return graph ? (int)graph->output_names.size() : 0; }
-
-const char* wp_apic_get_input_name(APICGraph graph, int index)
+const char* wp_apic_get_param_name(APICGraph graph, int index)
 {
-    if (!graph || index < 0 || index >= (int)graph->input_names.size())
+    if (!graph || index < 0 || index >= (int)graph->param_names.size())
         return nullptr;
-    return graph->input_names[index].c_str();
+    return graph->param_names[index].c_str();
 }
 
-const char* wp_apic_get_output_name(APICGraph graph, int index)
-{
-    if (!graph || index < 0 || index >= (int)graph->output_names.size())
-        return nullptr;
-    return graph->output_names[index].c_str();
-}
-
-size_t wp_apic_get_input_size(APICGraph graph, const char* name)
+size_t wp_apic_get_param_size(APICGraph graph, const char* name)
 {
     if (!graph || !name)
         return 0;
-    auto it = graph->input_bindings.find(name);
-    if (it == graph->input_bindings.end())
-        return 0;
-    auto region_it = graph->regions.find(it->second);
-    if (region_it == graph->regions.end())
-        return 0;
-    return region_it->second.size;
-}
-
-size_t wp_apic_get_output_size(APICGraph graph, const char* name)
-{
-    if (!graph || !name)
-        return 0;
-    auto it = graph->output_bindings.find(name);
-    if (it == graph->output_bindings.end())
+    auto it = graph->params.find(name);
+    if (it == graph->params.end())
         return 0;
     auto region_it = graph->regions.find(it->second);
     if (region_it == graph->regions.end())

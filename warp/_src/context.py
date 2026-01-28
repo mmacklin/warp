@@ -3794,8 +3794,7 @@ class Graph:
         self.apic_capture = apic_capture
 
         # APIC loaded state (populated when loaded from file)
-        self._input_bindings: dict = {}  # name -> binding info
-        self._output_bindings: dict = {}  # name -> binding info
+        self._params: dict = {}  # name -> binding info (size, etc.)
         self._source_path: str | None = None  # path if loaded from file
         self._native_graph = None  # Native C++ APIC graph handle
 
@@ -3828,22 +3827,14 @@ class Graph:
         graph._source_path = str(base_path)
         graph._native_graph = native_graph
 
-        # Populate input/output bindings from native graph
-        num_inputs = runtime.core.wp_apic_get_num_inputs(native_graph)
-        for i in range(num_inputs):
-            name = runtime.core.wp_apic_get_input_name(native_graph, i)
+        # Populate params from native graph
+        num_params = runtime.core.wp_apic_get_num_params(native_graph)
+        for i in range(num_params):
+            name = runtime.core.wp_apic_get_param_name(native_graph, i)
             if name:
                 name = name.decode("utf-8")
-                size = runtime.core.wp_apic_get_input_size(native_graph, name.encode("utf-8"))
-                graph._input_bindings[name] = {"size": size}
-
-        num_outputs = runtime.core.wp_apic_get_num_outputs(native_graph)
-        for i in range(num_outputs):
-            name = runtime.core.wp_apic_get_output_name(native_graph, i)
-            if name:
-                name = name.decode("utf-8")
-                size = runtime.core.wp_apic_get_output_size(native_graph, name.encode("utf-8"))
-                graph._output_bindings[name] = {"size": size}
+                size = runtime.core.wp_apic_get_param_size(native_graph, name.encode("utf-8"))
+                graph._params[name] = {"size": size}
 
         # Get the CUDA graph handles from native
         graph.graph = runtime.core.wp_apic_get_cuda_graph(native_graph)
@@ -3876,77 +3867,83 @@ class Graph:
     def retain_module_exec(self, module_exec: ModuleExec):
         self.module_execs.add(module_exec)
 
-    def bind_input(self, name: str, arr) -> None:
-        """Bind an input array to a named input slot.
+    def set_param(self, name: str, arr) -> None:
+        """Set parameter data by copying array contents to the pre-allocated region.
+
+        This copies the array data directly to the memory region that was allocated
+        when the graph was loaded. No graph rebuild is needed.
 
         Args:
-            name: Name of the input binding (as specified during capture_save)
-            arr: Array to bind
+            name: Name of the parameter (input or output, as specified during capture_save)
+            arr: Array whose data will be copied
 
         Raises:
-            ValueError: If the binding name is unknown or array size doesn't match
+            ValueError: If the parameter name is unknown or array size doesn't match
         """
-        if name not in self._input_bindings:
-            raise ValueError(f"Unknown input binding: {name}")
-
         if self._native_graph is None:
-            raise RuntimeError("Cannot bind input on a graph that was not loaded from file")
+            raise RuntimeError("Cannot set param on a graph that was not loaded from file")
 
-        binding_info = self._input_bindings[name]
-        expected_size = binding_info["size"]
+        # Check if it's a known param
+        if name not in self._params:
+            raise ValueError(f"Unknown parameter: {name}")
+
+        expected_size = self._params[name]["size"]
         if arr.capacity != expected_size:
-            raise ValueError(f"Input array size mismatch: expected {expected_size}, got {arr.capacity}")
+            raise ValueError(f"Parameter array size mismatch: expected {expected_size}, got {arr.capacity}")
 
-        result = runtime.core.wp_apic_bind_input(
+        result = runtime.core.wp_apic_set_param(
             self._native_graph, name.encode("utf-8"), ctypes.c_void_p(arr.ptr), arr.capacity
         )
         if result == 0:
-            raise RuntimeError(f"Failed to bind input '{name}': {runtime.get_error_string()}")
+            raise RuntimeError(f"Failed to set param '{name}': {runtime.get_error_string()}")
 
-        # Update cached graph handles (they may be rebuilt)
-        self.graph = runtime.core.wp_apic_get_cuda_graph(self._native_graph)
-        self.graph_exec = runtime.core.wp_apic_get_cuda_graph_exec(self._native_graph)
+    def get_param(self, name: str, arr) -> None:
+        """Get parameter data by copying from the pre-allocated region to the array.
 
-    def bind_output(self, name: str, arr) -> None:
-        """Bind an output array to a named output slot.
+        This copies data from the internal memory region to the provided array.
+        Typically used after graph execution to retrieve output data.
 
         Args:
-            name: Name of the output binding (as specified during capture_save)
-            arr: Array to bind
+            name: Name of the parameter (as specified during capture_save)
+            arr: Array to copy data into
 
         Raises:
-            ValueError: If the binding name is unknown or array size doesn't match
+            ValueError: If the parameter name is unknown or array size doesn't match
         """
-        if name not in self._output_bindings:
-            raise ValueError(f"Unknown output binding: {name}")
-
         if self._native_graph is None:
-            raise RuntimeError("Cannot bind output on a graph that was not loaded from file")
+            raise RuntimeError("Cannot get param on a graph that was not loaded from file")
 
-        binding_info = self._output_bindings[name]
-        expected_size = binding_info["size"]
+        # Check if it's a known param
+        if name not in self._params:
+            raise ValueError(f"Unknown parameter: {name}")
+
+        expected_size = self._params[name]["size"]
         if arr.capacity != expected_size:
-            raise ValueError(f"Output array size mismatch: expected {expected_size}, got {arr.capacity}")
+            raise ValueError(f"Parameter array size mismatch: expected {expected_size}, got {arr.capacity}")
 
-        result = runtime.core.wp_apic_bind_output(
+        result = runtime.core.wp_apic_get_param(
             self._native_graph, name.encode("utf-8"), ctypes.c_void_p(arr.ptr), arr.capacity
         )
         if result == 0:
-            raise RuntimeError(f"Failed to bind output '{name}': {runtime.get_error_string()}")
+            raise RuntimeError(f"Failed to get param '{name}': {runtime.get_error_string()}")
 
-        # Update cached graph handles (they may be rebuilt)
-        self.graph = runtime.core.wp_apic_get_cuda_graph(self._native_graph)
-        self.graph_exec = runtime.core.wp_apic_get_cuda_graph_exec(self._native_graph)
+    def get_param_ptr(self, name: str):
+        """Get the device pointer for a parameter's pre-allocated region.
+
+        Args:
+            name: Name of the parameter
+
+        Returns:
+            The device pointer (as an integer) or None if not found
+        """
+        if self._native_graph is None:
+            return None
+        return runtime.core.wp_apic_get_param_ptr(self._native_graph, name.encode("utf-8"))
 
     @property
-    def inputs(self) -> dict:
-        """Get input binding information."""
-        return dict(self._input_bindings)
-
-    @property
-    def outputs(self) -> dict:
-        """Get output binding information."""
-        return dict(self._output_bindings)
+    def params(self) -> dict:
+        """Get parameter binding information."""
+        return dict(self._params)
 
     @property
     def is_loaded(self) -> bool:
@@ -4925,16 +4922,14 @@ class Runtime:
             self.core.wp_apic_destroy_graph.argtypes = [ctypes.c_void_p]
             self.core.wp_apic_destroy_graph.restype = None
 
-            self.core.wp_apic_bind_input.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t]
-            self.core.wp_apic_bind_input.restype = ctypes.c_int
+            self.core.wp_apic_set_param.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t]
+            self.core.wp_apic_set_param.restype = ctypes.c_int
 
-            self.core.wp_apic_bind_output.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_char_p,
-                ctypes.c_void_p,
-                ctypes.c_size_t,
-            ]
-            self.core.wp_apic_bind_output.restype = ctypes.c_int
+            self.core.wp_apic_get_param.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t]
+            self.core.wp_apic_get_param.restype = ctypes.c_int
+
+            self.core.wp_apic_get_param_ptr.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+            self.core.wp_apic_get_param_ptr.restype = ctypes.c_void_p
 
             self.core.wp_apic_get_cuda_graph.argtypes = [ctypes.c_void_p]
             self.core.wp_apic_get_cuda_graph.restype = ctypes.c_void_p
@@ -4942,23 +4937,14 @@ class Runtime:
             self.core.wp_apic_get_cuda_graph_exec.argtypes = [ctypes.c_void_p]
             self.core.wp_apic_get_cuda_graph_exec.restype = ctypes.c_void_p
 
-            self.core.wp_apic_get_num_inputs.argtypes = [ctypes.c_void_p]
-            self.core.wp_apic_get_num_inputs.restype = ctypes.c_int
+            self.core.wp_apic_get_num_params.argtypes = [ctypes.c_void_p]
+            self.core.wp_apic_get_num_params.restype = ctypes.c_int
 
-            self.core.wp_apic_get_num_outputs.argtypes = [ctypes.c_void_p]
-            self.core.wp_apic_get_num_outputs.restype = ctypes.c_int
+            self.core.wp_apic_get_param_name.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            self.core.wp_apic_get_param_name.restype = ctypes.c_char_p
 
-            self.core.wp_apic_get_input_name.argtypes = [ctypes.c_void_p, ctypes.c_int]
-            self.core.wp_apic_get_input_name.restype = ctypes.c_char_p
-
-            self.core.wp_apic_get_output_name.argtypes = [ctypes.c_void_p, ctypes.c_int]
-            self.core.wp_apic_get_output_name.restype = ctypes.c_char_p
-
-            self.core.wp_apic_get_input_size.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-            self.core.wp_apic_get_input_size.restype = ctypes.c_size_t
-
-            self.core.wp_apic_get_output_size.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-            self.core.wp_apic_get_output_size.restype = ctypes.c_size_t
+            self.core.wp_apic_get_param_size.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+            self.core.wp_apic_get_param_size.restype = ctypes.c_size_t
 
             self.core.wp_cuda_compile_program.argtypes = [
                 ctypes.c_char_p,  # cuda_src
@@ -8544,9 +8530,9 @@ def capture_load(path: str, device: DeviceLike = None):
     Example::
 
         graph = wp.capture_load("my_graph")
-        graph.bind_input("a", my_input_array)
-        graph.bind_output("b", my_output_array)
+        graph.set_param("input", my_input_array)  # Copy input data to internal region
         wp.capture_launch(graph)
+        graph.get_param("output", my_output_array)  # Copy output data from internal region
     """
     if device is None:
         device = runtime.get_device()

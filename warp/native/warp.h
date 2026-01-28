@@ -708,29 +708,32 @@ WP_API APICGraph wp_apic_load_graph(void* context, const char* path);
 // Destroy a loaded graph and free all resources
 WP_API void wp_apic_destroy_graph(APICGraph graph);
 
-// Bind an input array by name
-// Returns 1 on success, 0 on failure
-WP_API int wp_apic_bind_input(APICGraph graph, const char* name, void* ptr, size_t size);
+// Set a named parameter by copying data to the pre-allocated region
+// This copies host data to the device memory region associated with the parameter
+// Returns 1 on success, 0 on failure (name not found or size mismatch)
+WP_API int wp_apic_set_param(APICGraph graph, const char* name, const void* data, size_t size);
 
-// Bind an output array by name
-// Returns 1 on success, 0 on failure
-WP_API int wp_apic_bind_output(APICGraph graph, const char* name, void* ptr, size_t size);
+// Get a named parameter by copying data from the pre-allocated region
+// This copies device data from the memory region to the destination pointer
+// Returns 1 on success, 0 on failure (name not found or size mismatch)
+WP_API int wp_apic_get_param(APICGraph graph, const char* name, void* data, size_t size);
 
-// Get the CUDA graph handle (rebuilds if bindings changed)
+// Get a named parameter's device pointer (for direct access)
+// Returns the device pointer, or NULL if not found
+WP_API void* wp_apic_get_param_ptr(APICGraph graph, const char* name);
+
+// Get the CUDA graph handle
 // Returns the cudaGraph_t handle, or NULL on failure
 WP_API void* wp_apic_get_cuda_graph(APICGraph graph);
 
-// Get the instantiated CUDA graph executable (creates if needed, rebuilds if bindings changed)
+// Get the instantiated CUDA graph executable (creates if needed)
 // Returns the cudaGraphExec_t handle, or NULL on failure
 // Users should call wp_cuda_graph_launch() with the returned exec to launch
 WP_API void* wp_apic_get_cuda_graph_exec(APICGraph graph);
 
 // Query functions
-WP_API int wp_apic_get_num_inputs(APICGraph graph);
-WP_API int wp_apic_get_num_outputs(APICGraph graph);
-WP_API const char* wp_apic_get_input_name(APICGraph graph, int index);
-WP_API const char* wp_apic_get_output_name(APICGraph graph, int index);
-WP_API size_t wp_apic_get_input_size(APICGraph graph, const char* name);
-WP_API size_t wp_apic_get_output_size(APICGraph graph, const char* name);
+WP_API int wp_apic_get_num_params(APICGraph graph);
+WP_API const char* wp_apic_get_param_name(APICGraph graph, int index);
+WP_API size_t wp_apic_get_param_size(APICGraph graph, const char* name);
 
 }  // extern "C"

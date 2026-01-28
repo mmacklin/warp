@@ -336,13 +336,15 @@ def test_apic_save_load_execute(test, device):
         new_input = wp.array(np.ones(n, dtype=np.float32) * 10.0, device=device)
         new_output = wp.zeros(n, dtype=float, device=device)
 
-        # Bind the new arrays
-        loaded_graph.bind_input("input", new_input)
-        loaded_graph.bind_output("output", new_output)
+        # Set input parameter (copies data to internal region)
+        loaded_graph.set_param("input", new_input)
 
         # Execute using capture_launch (works with both captured and loaded graphs)
         wp.capture_launch(loaded_graph)
         wp.synchronize_device(device)
+
+        # Get output parameter (copies data from internal region)
+        loaded_graph.get_param("output", new_output)
 
         # Verify result: 10.0 * 3.0 = 30.0
         expected = np.ones(n, dtype=np.float32) * 30.0
@@ -383,15 +385,17 @@ def test_apic_load_execute_multiple_kernels(test, device):
         new_c = wp.zeros(n, dtype=float, device=device)
         new_d = wp.zeros(n, dtype=float, device=device)
 
-        # Bind
-        loaded_graph.bind_input("a", new_a)
-        loaded_graph.bind_input("b", new_b)
-        loaded_graph.bind_output("c", new_c)
-        loaded_graph.bind_output("d", new_d)
+        # Set input parameters
+        loaded_graph.set_param("a", new_a)
+        loaded_graph.set_param("b", new_b)
 
         # Execute using capture_launch (works with both captured and loaded graphs)
         wp.capture_launch(loaded_graph)
         wp.synchronize_device(device)
+
+        # Get output parameters
+        loaded_graph.get_param("c", new_c)
+        loaded_graph.get_param("d", new_d)
 
         # Verify: c = 5 + 7 = 12, d = 12 * 2 = 24
         np.testing.assert_array_almost_equal(new_c.numpy(), np.ones(n) * 12.0)
@@ -444,13 +448,15 @@ def test_apic_with_memory_ops(test, device):
         new_src = wp.array(np.ones(n, dtype=np.float32) * 10.0, device=device)
         new_dst = wp.zeros(n, dtype=float, device=device)
 
-        # Bind the new arrays
-        loaded_graph.bind_input("src", new_src)
-        loaded_graph.bind_output("dst", new_dst)
+        # Set input parameter
+        loaded_graph.set_param("src", new_src)
 
         # Execute
         wp.capture_launch(loaded_graph)
         wp.synchronize_device(device)
+
+        # Get output parameter
+        loaded_graph.get_param("dst", new_dst)
 
         # new_dst should be (10.0 * 2.0) = 20.0
         expected = np.ones(n, dtype=np.float32) * 20.0
@@ -515,14 +521,16 @@ def test_apic_complex_pipeline(test, device):
         new_b = wp.array(np.ones(n, dtype=np.float32) * 5.0, device=device)
         new_g = wp.zeros(n, dtype=float, device=device)
 
-        # Bind
-        loaded_graph.bind_input("a", new_a)
-        loaded_graph.bind_input("b", new_b)
-        loaded_graph.bind_output("g", new_g)
+        # Set input parameters
+        loaded_graph.set_param("a", new_a)
+        loaded_graph.set_param("b", new_b)
 
         # Execute
         wp.capture_launch(loaded_graph)
         wp.synchronize_device(device)
+
+        # Get output parameter
+        loaded_graph.get_param("g", new_g)
 
         # Expected: c = 10 + 5 = 15, e = 15 * 2 = 30, g = 30 + 15 = 45
         expected_g = np.ones(n, dtype=np.float32) * 45.0
@@ -574,13 +582,15 @@ def test_apic_internal_allocation(test, device):
         new_input = wp.array(np.ones(n, dtype=np.float32) * 10.0, device=device)
         new_output = wp.zeros(n, dtype=float, device=device)
 
-        # Bind
-        loaded_graph.bind_input("input", new_input)
-        loaded_graph.bind_output("output", new_output)
+        # Set input parameter
+        loaded_graph.set_param("input", new_input)
 
         # Execute
         wp.capture_launch(loaded_graph)
         wp.synchronize_device(device)
+
+        # Get output parameter
+        loaded_graph.get_param("output", new_output)
 
         # tmp = 10 * 2 = 20, output = tmp + input = 20 + 10 = 30
         expected = np.ones(n, dtype=np.float32) * 30.0
@@ -626,11 +636,12 @@ def test_apic_multiple_internal_allocations(test, device):
         new_input = wp.array(np.ones(n, dtype=np.float32) * 5.0, device=device)
         new_output = wp.zeros(n, dtype=float, device=device)
 
-        loaded_graph.bind_input("input", new_input)
-        loaded_graph.bind_output("output", new_output)
+        loaded_graph.set_param("input", new_input)
 
         wp.capture_launch(loaded_graph)
         wp.synchronize_device(device)
+
+        loaded_graph.get_param("output", new_output)
 
         # t1 = 5 * 2 = 10, t2 = 10 * 3 = 30, t3 = 10 + 30 = 40, output = 40 + 5 = 45
         expected = np.ones(n, dtype=np.float32) * 45.0
@@ -666,20 +677,22 @@ def test_apic_native_loading(test, device):
         loaded_graph = Graph.load(graph_path, device=device)
 
         # Verify inputs/outputs are detected
-        test.assertIn("input", loaded_graph.inputs)
-        test.assertIn("output", loaded_graph.outputs)
+        test.assertIn("input", loaded_graph.params)
+        test.assertIn("output", loaded_graph.params)
 
         # Create new arrays for execution
         new_input = wp.array(np.ones(n, dtype=np.float32) * 10.0, device=device)
         new_output = wp.zeros(n, dtype=float, device=device)
 
-        # Bind the new arrays
-        loaded_graph.bind_input("input", new_input)
-        loaded_graph.bind_output("output", new_output)
+        # Set input parameter
+        loaded_graph.set_param("input", new_input)
 
         # Execute using capture_launch
         wp.capture_launch(loaded_graph)
         wp.synchronize_device(device)
+
+        # Get output parameter
+        loaded_graph.get_param("output", new_output)
 
         # Verify result: 10.0 * 3.0 = 30.0
         expected = np.ones(n, dtype=np.float32) * 30.0
