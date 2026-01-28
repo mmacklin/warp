@@ -680,6 +680,19 @@ WP_API uint32_t wp_apic_register_memory_region(
     APICState state, uint64_t base_ptr, uint64_t size, uint32_t element_size, APICMemoryRole role
 );
 
+// Write a WGF file with pre-built section data
+// Returns 1 on success, 0 on failure
+WP_API int wp_apic_write_wgf(
+    const char* path,
+    uint32_t target_arch,
+    const char* metadata_json,
+    size_t metadata_len,
+    const void* memory_section,
+    size_t memory_len,
+    const void* operations_section,
+    size_t operations_len
+);
+
 // =============================================================================
 // APIC Graph Loading - Load and execute serialized graphs from .wgf files
 // =============================================================================

@@ -4872,6 +4872,19 @@ class Runtime:
             ]
             self.core.wp_cuda_graph_update_memcpy_batch.restype = ctypes.c_bool
 
+            # APIC WGF file writing
+            self.core.wp_apic_write_wgf.argtypes = [
+                ctypes.c_char_p,  # path
+                ctypes.c_uint32,  # target_arch
+                ctypes.c_char_p,  # metadata_json
+                ctypes.c_size_t,  # metadata_len
+                ctypes.c_void_p,  # memory_section
+                ctypes.c_size_t,  # memory_len
+                ctypes.c_void_p,  # operations_section
+                ctypes.c_size_t,  # operations_len
+            ]
+            self.core.wp_apic_write_wgf.restype = ctypes.c_int
+
             # APIC graph loading functions
             self.core.wp_apic_load_graph.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
             self.core.wp_apic_load_graph.restype = ctypes.c_void_p

@@ -211,6 +211,106 @@ void apic_record_alloc(APICState state, void* ptr, size_t size)
 }
 
 // =============================================================================
+// APIC WGF File Writing
+// =============================================================================
+
+int wp_apic_write_wgf(
+    const char* path,
+    uint32_t target_arch,
+    const char* metadata_json,
+    size_t metadata_len,
+    const void* memory_section,
+    size_t memory_len,
+    const void* operations_section,
+    size_t operations_len
+)
+{
+    FILE* f = fopen(path, "wb");
+    if (!f) {
+        fprintf(stderr, "APIC: Failed to open file for writing: %s\n", path);
+        return 0;
+    }
+
+    // Build section entries
+    const uint32_t HEADER_SIZE = 64;
+    const uint32_t SECTION_ENTRY_SIZE = 32;
+    uint32_t num_sections = 3;  // metadata, memory, operations
+
+    uint64_t section_table_offset = HEADER_SIZE;
+    uint64_t data_offset = section_table_offset + num_sections * SECTION_ENTRY_SIZE;
+
+    // Section offsets
+    uint64_t metadata_offset = data_offset;
+    uint64_t memory_offset = metadata_offset + metadata_len;
+    uint64_t operations_offset = memory_offset + memory_len;
+
+    // Write header (64 bytes)
+    APICFileHeader header = {};
+    header.magic[0] = 'W';
+    header.magic[1] = 'G';
+    header.magic[2] = 'F';
+    header.magic[3] = '1';
+    header.version = APIC_FORMAT_VERSION;
+    header.flags = 0;
+    header.num_sections = num_sections;
+    header.section_table_offset = section_table_offset;
+    header.target_arch = target_arch;
+
+    if (fwrite(&header, sizeof(header), 1, f) != 1) {
+        fclose(f);
+        return 0;
+    }
+
+    // Write section table entries
+    APICSectionEntry entries[3];
+
+    // Metadata section
+    entries[0].type = APIC_SECTION_METADATA;
+    entries[0].flags = 0;
+    entries[0].offset = metadata_offset;
+    entries[0].size = static_cast<int64_t>(metadata_len);
+    entries[0].uncompressed_size = static_cast<int64_t>(metadata_len);
+
+    // Memory section
+    entries[1].type = APIC_SECTION_MEMORY;
+    entries[1].flags = 0;
+    entries[1].offset = memory_offset;
+    entries[1].size = static_cast<int64_t>(memory_len);
+    entries[1].uncompressed_size = static_cast<int64_t>(memory_len);
+
+    // Operations section
+    entries[2].type = APIC_SECTION_OPERATIONS;
+    entries[2].flags = 0;
+    entries[2].offset = operations_offset;
+    entries[2].size = static_cast<int64_t>(operations_len);
+    entries[2].uncompressed_size = static_cast<int64_t>(operations_len);
+
+    if (fwrite(entries, sizeof(APICSectionEntry), 3, f) != 3) {
+        fclose(f);
+        return 0;
+    }
+
+    // Write section data
+    if (metadata_len > 0 && fwrite(metadata_json, 1, metadata_len, f) != metadata_len) {
+        fclose(f);
+        return 0;
+    }
+
+    if (memory_len > 0 && fwrite(memory_section, 1, memory_len, f) != memory_len) {
+        fclose(f);
+        return 0;
+    }
+
+    if (operations_len > 0 && fwrite(operations_section, 1, operations_len, f) != operations_len) {
+        fclose(f);
+        return 0;
+    }
+
+    fclose(f);
+    return 1;
+}
+
+// =============================================================================
 // APIC Graph Loading Implementation
 // =============================================================================
 // Uses POD structs from apic_types.h for version 2 format

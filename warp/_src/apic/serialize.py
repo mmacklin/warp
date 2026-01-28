@@ -8,17 +8,19 @@
 """
 Serialization of captured CUDA graphs to WGF format.
 
-Loading is handled by the native C++ implementation in warp.cu.
+Uses native C++ for WGF file writing. Serialization of individual records
+is done using ctypes structures that match the C++ POD structs.
 """
 
 import ctypes
+import json
 import os
 import struct
 from pathlib import Path
 
 from .capture import APICapture, ModuleInfo
-from .format import WGFWriter
 from .types import (
+    APIC_FORMAT_VERSION,
     APIC_LAUNCH_MAX_DIMS,
     APIC_MAX_DIMS,
     APIC_OP_ALLOC,
@@ -51,6 +53,7 @@ def save_graph(capture: APICapture, path: str):
         - {path}.wgf: The main graph file
         - {path}_modules/: Directory containing .cubin files
     """
+    import warp
 
     base_path = Path(path)
     wgf_path = base_path.with_suffix(".wgf")
@@ -67,8 +70,9 @@ def save_graph(capture: APICapture, path: str):
         cubin_path = modules_dir / module_info.cubin_filename
         _export_module_cubin(module_info, cubin_path)
 
-    # Build metadata
+    # Build metadata JSON
     metadata = _build_metadata(capture)
+    metadata_json = json.dumps(metadata, indent=2).encode("utf-8")
 
     # Build memory section
     memory_data = _build_memory_section(capture)
@@ -76,12 +80,20 @@ def save_graph(capture: APICapture, path: str):
     # Build operations section
     operations_data = _build_operations_section(capture)
 
-    # Write .wgf file
-    writer = WGFWriter(str(wgf_path), capture.device.arch)
-    writer.add_metadata(metadata)
-    writer.add_memory(memory_data)
-    writer.add_operations(operations_data)
-    writer.write()
+    # Write .wgf file using native C++ function
+    result = warp._src.context.runtime.core.wp_apic_write_wgf(
+        str(wgf_path).encode("utf-8"),
+        capture.device.arch,
+        metadata_json,
+        len(metadata_json),
+        memory_data if memory_data else None,
+        len(memory_data) if memory_data else 0,
+        operations_data if operations_data else None,
+        len(operations_data) if operations_data else 0,
+    )
+
+    if not result:
+        raise RuntimeError(f"Failed to write WGF file: {wgf_path}")
 
 
 def _export_module_cubin(module_info: ModuleInfo, cubin_path: Path):
@@ -133,8 +145,6 @@ def _export_module_cubin(module_info: ModuleInfo, cubin_path: Path):
 
 def _build_metadata(capture: APICapture) -> dict:
     """Build the metadata dictionary."""
-    from .types import APIC_FORMAT_VERSION
-
     # Convert modules
     modules = {}
     for module_hash, info in capture.modules.items():
