@@ -160,33 +160,6 @@ def test_apic_save_load_basic(test, device):
         test.assertTrue(os.path.exists(graph_path + "_modules"))
 
 
-def test_apic_wgf_format(test, device):
-    """Test WGF file format reading and writing."""
-    from warp._src.apic import WGFReader, WGFWriter
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        wgf_path = os.path.join(tmpdir, "test.wgf")
-
-        # Write a test file
-        writer = WGFWriter(wgf_path, device.arch)
-        writer.add_metadata({"test_key": "test_value", "version": 1})
-        writer.add_memory(b"test memory data")
-        writer.add_operations(b"test operations data")
-        writer.write()
-
-        # Read it back
-        reader = WGFReader(wgf_path)
-
-        test.assertEqual(reader.target_arch, device.arch)
-
-        metadata = reader.get_metadata()
-        test.assertEqual(metadata["test_key"], "test_value")
-        test.assertEqual(metadata["version"], 1)
-
-        test.assertEqual(reader.get_memory(), b"test memory data")
-        test.assertEqual(reader.get_operations(), b"test operations data")
-
-
 def test_apic_capture_class(test, device):
     """Test APICapture class directly."""
     from warp._src.apic import APICapture, MemoryRole
@@ -725,7 +698,6 @@ add_function_test(TestApic, "test_apic_scoped_capture", test_apic_scoped_capture
 add_function_test(TestApic, "test_apic_multiple_launches", test_apic_multiple_launches, devices=devices)
 add_function_test(TestApic, "test_apic_memory_regions", test_apic_memory_regions, devices=devices)
 add_function_test(TestApic, "test_apic_save_load_basic", test_apic_save_load_basic, devices=devices)
-add_function_test(TestApic, "test_apic_wgf_format", test_apic_wgf_format, devices=devices)
 add_function_test(TestApic, "test_apic_capture_class", test_apic_capture_class, devices=devices)
 add_function_test(TestApic, "test_apic_array_slicing", test_apic_array_slicing, devices=devices)
 add_function_test(TestApic, "test_apic_input_output_bindings", test_apic_input_output_bindings, devices=devices)

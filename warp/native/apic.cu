@@ -130,8 +130,6 @@ void apic_record_kernel_launch(
     bool is_forward,
     const char* kernel_key,
     const char* module_hash,
-    const int32_t* shape,
-    int32_t ndim,
     const APICParamBindingInfo* params,
     int num_params
 )
@@ -174,15 +172,11 @@ void apic_record_kernel_launch(
     size_t hash_len = module_hash ? strlen(module_hash) : 0;
     uint32_t total_size = sizeof(APICLaunchRecord) + key_len + hash_len + params_data.size();
 
-    // Build launch record
+    // Build launch record (shape/ndim are stored in params[0] as launch_bounds_t)
     APICLaunchRecord rec = {};
     rec.header.op_type = APIC_OP_KERNEL_LAUNCH;
     rec.header.total_size = total_size;
     rec.dim = dim;
-    rec.ndim = ndim;
-    for (int d = 0; d < APIC_LAUNCH_MAX_DIMS; d++) {
-        rec.shape[d] = (shape && d < ndim) ? shape[d] : 1;
-    }
     rec.max_blocks = max_blocks;
     rec.block_dim = block_dim;
     rec.smem_bytes = smem_bytes;
@@ -1029,18 +1023,6 @@ static bool apic_init_memory(const uint8_t* data, size_t size, APICGraphInternal
     return true;
 }
 
-// Helper to create launch bounds for APIC replay
-static apic_launch_bounds_t apic_make_launch_bounds(uint64_t dim, const int32_t* shape, int32_t ndim)
-{
-    apic_launch_bounds_t bounds;
-    bounds.ndim = ndim;
-    bounds.size = dim;
-    for (int i = 0; i < APIC_LAUNCH_MAX_DIMS; i++) {
-        bounds.shape[i] = (i < ndim) ? shape[i] : 1;
-    }
-    return bounds;
-}
-
 // Helper: resolve region_id + offset to a pointer
 static void* apic_resolve_region_ptr(APICGraphInternal* graph, int32_t region_id, uint64_t offset)
 {
@@ -1143,14 +1125,10 @@ static bool apic_rebuild_cuda_graph(APICGraphInternal* graph, CUstream stream)
             // Skip past strings to param bindings
             const uint8_t* params_ptr = var_data + rec->kernel_key_len + rec->module_hash_len;
 
-            // Build launch bounds and arguments
-            apic_launch_bounds_t bounds = apic_make_launch_bounds(rec->dim, rec->shape, rec->ndim);
-
             std::vector<void*> args;
             std::vector<std::unique_ptr<uint8_t[]>> arg_storage;
-            args.push_back(&bounds);
 
-            // Parse and resolve param bindings
+            // Parse param bindings - param[0] is launch_bounds_t, rest are kernel args
             for (uint16_t j = 0; j < rec->num_params; j++) {
                 uint8_t param_type = *params_ptr;
                 if (param_type == APIC_PARAM_ARRAY) {
@@ -1173,7 +1151,7 @@ static bool apic_rebuild_cuda_graph(APICGraphInternal* graph, CUstream stream)
 
                     args.push_back(arr_ptr);
                     arg_storage.push_back(std::move(arr));
-                } else {  // SCALAR
+                } else {  // SCALAR (including launch_bounds_t at param 0)
                     const APICScalarBindingRecord* binding
                         = reinterpret_cast<const APICScalarBindingRecord*>(params_ptr);
                     params_ptr += sizeof(APICScalarBindingRecord);

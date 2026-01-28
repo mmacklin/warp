@@ -4616,9 +4616,8 @@ size_t wp_cuda_launch_kernel(
     // APIC hook: record kernel launch with full parameter info if provided
     if (g_apic_state && g_apic_state->recording && apic_info) {
         apic_record_kernel_launch(
-            g_apic_state, kernel, dim, max_blocks, apic_info->block_dim, apic_info->smem_bytes,
-            apic_info->is_forward != 0, apic_info->kernel_key, apic_info->module_hash, apic_info->shape,
-            apic_info->ndim, apic_info->params, apic_info->num_params
+            g_apic_state, kernel, dim, max_blocks, block_dim, shared_memory_bytes, apic_info->is_forward != 0,
+            apic_info->kernel_key, apic_info->module_hash, apic_info->params, apic_info->num_params
         );
     }
 

@@ -38,8 +38,6 @@ void apic_record_kernel_launch(
     bool is_forward,
     const char* kernel_key,
     const char* module_hash,
-    const int32_t* shape,
-    int32_t ndim,
     const APICParamBindingInfo* params,
     int num_params
 );

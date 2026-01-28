@@ -62,16 +62,17 @@ class APICParamBindingInfo(ctypes.Structure):
 
 
 class APICLaunchInfo(ctypes.Structure):
-    """Launch info passed to wp_cuda_launch_kernel() - matches C struct in apic_types.h."""
+    """Launch info passed to wp_cuda_launch_kernel() - matches C struct in apic_types.h.
+
+    Only includes fields needed to identify the kernel. Other launch parameters
+    (dim, block_dim, smem_bytes) are passed directly to wp_cuda_launch_kernel(),
+    and shape/ndim are in launch_bounds_t which is always args[0].
+    """
 
     _pack_ = 1
     _fields_ = [  # noqa: RUF012
         ("kernel_key", ctypes.c_char_p),
         ("module_hash", ctypes.c_char_p),
-        ("shape", ctypes.c_int32 * APIC_LAUNCH_MAX_DIMS),
-        ("ndim", ctypes.c_int32),
-        ("block_dim", ctypes.c_int32),
-        ("smem_bytes", ctypes.c_int32),
         ("is_forward", ctypes.c_uint8),
         ("_pad", ctypes.c_uint8 * 3),
         ("params", ctypes.POINTER(APICParamBindingInfo)),
@@ -334,16 +335,6 @@ class APICapture:
         info = APICLaunchInfo()
         info.kernel_key = self._kernel_key_bytes
         info.module_hash = self._module_hash_bytes
-
-        bounds = launch.bounds
-        for i in range(min(bounds.ndim, APIC_LAUNCH_MAX_DIMS)):
-            info.shape[i] = bounds.shape[i]
-        for i in range(bounds.ndim, APIC_LAUNCH_MAX_DIMS):
-            info.shape[i] = 1
-
-        info.ndim = bounds.ndim
-        info.block_dim = launch.block_dim
-        info.smem_bytes = launch.hooks.forward_smem_bytes if not launch.adjoint else launch.hooks.backward_smem_bytes
         info.is_forward = 1 if not launch.adjoint else 0
 
         if param_bindings:
@@ -370,9 +361,21 @@ class APICapture:
         kernel = launch.kernel
         bindings = []
 
+        # Capture bounds (param 0) as a scalar - contains shape/ndim/size
+        bounds_binding = APICParamBindingInfo()
+        bounds_binding.type = APIC_PARAM_SCALAR
+        bounds_binding.param_index = 0
+        bounds_bytes = bytes(launch.params[0])
+        bounds_binding.scalar_size = len(bounds_bytes)
+        for k, b in enumerate(bounds_bytes):
+            if k < APIC_MAX_SCALAR_SIZE:
+                bounds_binding.scalar_value[k] = b
+        bindings.append(bounds_binding)
+
+        # Capture remaining parameters (starting from index 1)
         array_idx = 0
         for i, arg in enumerate(kernel.adj.args):
-            param_idx = i + 1  # Skip bounds at index 0
+            param_idx = i + 1
             param = launch.params[param_idx]
             arg_type = arg.type
 

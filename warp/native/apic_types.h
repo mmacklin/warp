@@ -113,13 +113,12 @@ typedef struct {
 
 // Kernel launch record (fixed part)
 // Variable data follows: kernel_key, module_hash, param_bindings[]
+// Note: shape/ndim are stored in the launch_bounds_t which is param[0]
 typedef struct {
     APICOpHeader header;  // op_type = APIC_OP_KERNEL_LAUNCH
 
     // Launch parameters
     uint64_t dim;  // Total threads
-    int32_t shape[APIC_LAUNCH_MAX_DIMS];  // Shape of each dimension
-    int32_t ndim;  // Number of dimensions (1-4)
     int32_t max_blocks;  // Maximum blocks
     int32_t block_dim;  // Threads per block
     int32_t smem_bytes;  // Shared memory bytes
@@ -136,7 +135,8 @@ typedef struct {
     // 1. char kernel_key[kernel_key_len]
     // 2. char module_hash[module_hash_len]
     // 3. Parameter bindings (APICArrayBindingRecord or APICScalarBindingRecord)
-} APICLaunchRecord;  // 60 bytes fixed
+    //    - param[0] is always launch_bounds_t (contains shape/ndim/size)
+} APICLaunchRecord;  // 40 bytes fixed
 
 // Array parameter binding (fixed size)
 typedef struct {
@@ -237,13 +237,12 @@ typedef struct {
 } APICParamBindingInfo;  // 216 bytes
 
 // Launch info passed to wp_cuda_launch_kernel() for APIC recording
+// Only includes fields needed to identify the kernel - other launch parameters
+// (dim, block_dim, smem_bytes) are passed directly to wp_cuda_launch_kernel(),
+// and shape/ndim are in launch_bounds_t which is always args[0].
 typedef struct {
     const char* kernel_key;  // Kernel identifier string
     const char* module_hash;  // Module hash string
-    int32_t shape[APIC_LAUNCH_MAX_DIMS];  // Launch shape
-    int32_t ndim;  // Number of dimensions
-    int32_t block_dim;  // Threads per block
-    int32_t smem_bytes;  // Shared memory bytes
     uint8_t is_forward;  // 1 for forward, 0 for backward
     uint8_t _pad[3];
     const APICParamBindingInfo* params;  // Array of parameter bindings

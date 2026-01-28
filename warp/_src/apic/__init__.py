@@ -20,11 +20,9 @@ This module provides functionality to:
 1. Capture Warp kernel launches and memory operations
 2. Serialize captured graphs to disk (.wgf format)
 3. Load and execute serialized graphs
-4. Generate C++ headers for native application embedding
 """
 
 from .capture import APICapture, KernelInfo, MemoryRegion, MemoryRole, ModuleInfo
-from .format import WGFReader, WGFWriter
 from .serialize import save_graph
 
 __all__ = [
@@ -33,7 +31,5 @@ __all__ = [
     "MemoryRegion",
     "MemoryRole",
     "ModuleInfo",
-    "WGFReader",
-    "WGFWriter",
     "save_graph",
 ]
