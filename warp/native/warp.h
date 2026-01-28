@@ -663,10 +663,8 @@ WP_API float wp_balance_coloring(
 );
 
 // APIC (API Capture) - Records Warp API calls for serialization and replay
-// Opaque handle to APIC state
+// Opaque handle to APIC state (used internally during CUDA graph capture)
 typedef struct APICStateInternal* APICState;
-
-// Memory region roles - defined in apic_types.h
 
 // APIC State Management
 WP_API APICState wp_apic_create_state();
@@ -681,19 +679,6 @@ WP_API int wp_apic_is_recording(APICState state);
 WP_API uint32_t wp_apic_register_memory_region(
     APICState state, uint64_t base_ptr, uint64_t size, uint32_t element_size, APICMemoryRole role
 );
-
-// Query recorded data
-WP_API size_t wp_apic_get_num_operations(APICState state);
-WP_API size_t wp_apic_get_num_memory_regions(APICState state);
-WP_API size_t wp_apic_get_num_kernels(APICState state);
-
-// Serialization helpers
-WP_API size_t wp_apic_get_operations_data_size(APICState state);
-WP_API void wp_apic_get_operations_data(APICState state, void* buffer, size_t buffer_size);
-WP_API size_t wp_apic_get_memory_regions_data_size(APICState state);
-WP_API void wp_apic_get_memory_regions_data(APICState state, void* buffer, size_t buffer_size);
-WP_API size_t wp_apic_get_kernel_names_size(APICState state);
-WP_API void wp_apic_get_kernel_names(APICState state, char* buffer, size_t buffer_size);
 
 // =============================================================================
 // APIC Graph Loading - Load and execute serialized graphs from .wgf files

@@ -217,6 +217,25 @@ typedef struct {
     // If has_initial_data: uint8_t initial_data[size] follows
 } APICMemoryRegionRecord;  // 24 bytes fixed
 
+// =============================================================================
+// Recording API Structures (for passing info from Python to C++)
+// =============================================================================
+
+// Parameter binding info for recording (passed from Python during kernel launch)
+typedef struct {
+    uint8_t type;  // APIC_PARAM_ARRAY or APIC_PARAM_SCALAR
+    uint8_t ndim;  // For arrays: number of dimensions
+    uint16_t param_index;
+    int32_t region_id;  // For arrays: memory region ID (-1 for null)
+    uint64_t byte_offset;  // For arrays: byte offset within region
+    int64_t shape[APIC_MAX_DIMS];
+    int64_t strides[APIC_MAX_DIMS];
+    uint32_t element_size;  // For arrays: element size in bytes
+    uint16_t scalar_size;  // For scalars: size of scalar value
+    uint8_t _pad[2];
+    uint8_t scalar_value[APIC_MAX_SCALAR_SIZE];  // For scalars: raw value bytes
+} APICParamBindingInfo;  // 216 bytes
+
 #pragma pack(pop)
 
 // =============================================================================

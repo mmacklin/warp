@@ -13,25 +13,6 @@
 // APIC (API Capture) Implementation
 // ============================================================================
 
-// Internal recording structs (use raw pointers, converted to region_ids during serialization)
-struct APICRecordMemcpy {
-    uint64_t dst_ptr;
-    uint64_t src_ptr;
-    uint64_t size;
-};
-
-struct APICRecordMemset {
-    uint64_t dst_ptr;
-    int32_t value;
-    uint32_t _pad;
-    uint64_t size;
-};
-
-struct APICRecordAlloc {
-    uint64_t ptr;
-    uint64_t size;
-};
-
 APICState wp_apic_create_state() { return new APICStateInternal(); }
 
 void wp_apic_destroy_state(APICState state)
@@ -90,7 +71,7 @@ uint32_t wp_apic_register_memory_region(
 
     // Create new region
     uint32_t region_id = state->next_region_id++;
-    APICMemoryRegion region;
+    APICRecordedRegion region;
     region.region_id = region_id;
     region.base_ptr = base_ptr;
     region.size = size;
@@ -101,123 +82,9 @@ uint32_t wp_apic_register_memory_region(
     return region_id;
 }
 
-size_t wp_apic_get_num_operations(APICState state)
-{
-    if (!state)
-        return 0;
-    return state->operations.size();
-}
-
-size_t wp_apic_get_num_memory_regions(APICState state)
-{
-    if (!state)
-        return 0;
-    return state->memory_regions.size();
-}
-
-size_t wp_apic_get_num_kernels(APICState state)
-{
-    if (!state)
-        return 0;
-    return state->kernel_names.size();
-}
-
-size_t wp_apic_get_operations_data_size(APICState state)
-{
-    if (!state)
-        return 0;
-
-    size_t total = 0;
-    for (const auto& op : state->operations) {
-        // Header: type (1 byte) + data size (4 bytes) + data
-        total += 1 + 4 + op.data.size();
-    }
-    return total;
-}
-
-void wp_apic_get_operations_data(APICState state, void* buffer, size_t buffer_size)
-{
-    if (!state || !buffer)
-        return;
-
-    uint8_t* ptr = static_cast<uint8_t*>(buffer);
-    uint8_t* end = ptr + buffer_size;
-
-    for (const auto& op : state->operations) {
-        size_t op_size = 1 + 4 + op.data.size();
-        if (ptr + op_size > end)
-            break;
-
-        // Write type
-        *ptr++ = static_cast<uint8_t>(op.type);
-
-        // Write data size (little-endian)
-        uint32_t data_size = static_cast<uint32_t>(op.data.size());
-        memcpy(ptr, &data_size, 4);
-        ptr += 4;
-
-        // Write data
-        if (!op.data.empty()) {
-            memcpy(ptr, op.data.data(), op.data.size());
-            ptr += op.data.size();
-        }
-    }
-}
-
-size_t wp_apic_get_memory_regions_data_size(APICState state)
-{
-    if (!state)
-        return 0;
-    return state->memory_regions.size() * sizeof(APICMemoryRegion);
-}
-
-void wp_apic_get_memory_regions_data(APICState state, void* buffer, size_t buffer_size)
-{
-    if (!state || !buffer)
-        return;
-
-    uint8_t* ptr = static_cast<uint8_t*>(buffer);
-    uint8_t* end = ptr + buffer_size;
-
-    for (const auto& pair : state->memory_regions) {
-        if (ptr + sizeof(APICMemoryRegion) > end)
-            break;
-
-        memcpy(ptr, &pair.second, sizeof(APICMemoryRegion));
-        ptr += sizeof(APICMemoryRegion);
-    }
-}
-
-size_t wp_apic_get_kernel_names_size(APICState state)
-{
-    if (!state)
-        return 0;
-
-    size_t total = 0;
-    for (const auto& name : state->kernel_names) {
-        total += name.size() + 1;  // Include null terminator
-    }
-    return total;
-}
-
-void wp_apic_get_kernel_names(APICState state, char* buffer, size_t buffer_size)
-{
-    if (!state || !buffer)
-        return;
-
-    char* ptr = buffer;
-    char* end = buffer + buffer_size;
-
-    for (const auto& name : state->kernel_names) {
-        size_t len = name.size() + 1;
-        if (ptr + len > end)
-            break;
-        memcpy(ptr, name.c_str(), len);
-        ptr += len;
-    }
-}
-
 // Internal recording functions
+// Note: These are called during CUDA graph capture from wp_cuda_launch_kernel, etc.
+// They record raw pointer information which is later processed by Python for serialization.
 
 void apic_record_kernel_launch(
     APICState state,
@@ -242,58 +109,28 @@ void apic_record_kernel_launch(
         state->kernel_names.insert(kernel_name);
     }
 
-    // Create operation
-    APICOperation op;
-    op.type = APIC_OP_KERNEL_LAUNCH;
-
-    // Serialize launch data
-    // Format: kernel_name_len (4) + kernel_name + APICRecordLaunchParams (20)
-    //         + num_params (4) + [param_size (4) + param_data]...
-    size_t name_len = kernel_name.size();
-    size_t total_param_size = 0;
-    for (size_t i = 0; i < num_args; i++) {
-        total_param_size += 4 + arg_sizes[i];  // size prefix + data
+    // Record the launch using the new structure
+    // Note: This records raw data; Python will process it into full semantic records
+    APICRecordedLaunch launch;
+    launch.kernel_key = kernel_name;  // Will be updated by Python with proper kernel_key
+    launch.module_hash = "";  // Will be filled by Python
+    launch.dim = dim;
+    launch.ndim = 1;  // Will be updated by Python with proper ndim
+    launch.shape[0] = static_cast<int32_t>(dim);
+    for (int i = 1; i < APIC_LAUNCH_MAX_DIMS; i++) {
+        launch.shape[i] = 1;
     }
+    launch.max_blocks = max_blocks;
+    launch.block_dim = block_dim;
+    launch.smem_bytes = smem_bytes;
+    launch.is_forward = true;  // Will be updated by Python
 
-    size_t data_size = 4 + name_len + sizeof(APICRecordLaunchParams) + 4 + total_param_size;
-    op.data.resize(data_size);
-    uint8_t* ptr = op.data.data();
+    state->launches.push_back(std::move(launch));
 
-    // Write kernel name length and name
-    uint32_t name_len32 = static_cast<uint32_t>(name_len);
-    memcpy(ptr, &name_len32, sizeof(name_len32));
-    ptr += sizeof(name_len32);
-    if (name_len > 0) {
-        memcpy(ptr, kernel_name.c_str(), name_len);
-        ptr += name_len;
-    }
-
-    // Write launch params as a single struct
-    APICRecordLaunchParams params;
-    params.dim = dim;
-    params.max_blocks = max_blocks;
-    params.block_dim = block_dim;
-    params.smem_bytes = smem_bytes;
-    memcpy(ptr, &params, sizeof(params));
-    ptr += sizeof(params);
-
-    // Write num_params
-    uint32_t num_params32 = static_cast<uint32_t>(num_args);
-    memcpy(ptr, &num_params32, sizeof(num_params32));
-    ptr += sizeof(num_params32);
-
-    // Write each parameter
-    for (size_t i = 0; i < num_args; i++) {
-        uint32_t arg_size32 = static_cast<uint32_t>(arg_sizes[i]);
-        memcpy(ptr, &arg_size32, 4);
-        ptr += 4;
-        if (args[i] && arg_sizes[i] > 0) {
-            memcpy(ptr, args[i], arg_sizes[i]);
-            ptr += arg_sizes[i];
-        }
-    }
-
-    state->operations.push_back(std::move(op));
+    APICRecordedOperation op;
+    op.kind = APICRecordedOperation::OP_LAUNCH;
+    op.index = state->launches.size() - 1;
+    state->operations.push_back(op);
 }
 
 void apic_record_memcpy(APICState state, void* dst, void* src, size_t size, APICOpType kind)
@@ -301,16 +138,24 @@ void apic_record_memcpy(APICState state, void* dst, void* src, size_t size, APIC
     if (!state || !state->recording)
         return;
 
-    APICRecordMemcpy rec;
-    rec.dst_ptr = reinterpret_cast<uint64_t>(dst);
-    rec.src_ptr = reinterpret_cast<uint64_t>(src);
-    rec.size = size;
+    APICRecordedMemoryOp memop;
+    memop.type = kind;
+    memop.dst_region_id = -1;  // Will be resolved by Python using pointer mapping
+    memop.dst_offset = reinterpret_cast<uint64_t>(dst);  // Store raw ptr, Python will resolve
+    memop.src_region_id = -1;
+    memop.src_offset = reinterpret_cast<uint64_t>(src);
+    memop.size = size;
+    memop.value = 0;
 
-    APICOperation op;
-    op.type = kind;
-    op.data.resize(sizeof(rec));
-    memcpy(op.data.data(), &rec, sizeof(rec));
-    state->operations.push_back(std::move(op));
+    // For H2D, we'd need to copy the source data, but Python handles this
+    // by capturing the data directly during its recording
+
+    state->memory_ops.push_back(std::move(memop));
+
+    APICRecordedOperation op;
+    op.kind = APICRecordedOperation::OP_MEMOP;
+    op.index = state->memory_ops.size() - 1;
+    state->operations.push_back(op);
 }
 
 void apic_record_memset(APICState state, void* dst, int value, size_t size)
@@ -318,17 +163,21 @@ void apic_record_memset(APICState state, void* dst, int value, size_t size)
     if (!state || !state->recording)
         return;
 
-    APICRecordMemset rec;
-    rec.dst_ptr = reinterpret_cast<uint64_t>(dst);
-    rec.value = value;
-    rec._pad = 0;
-    rec.size = size;
+    APICRecordedMemoryOp memop;
+    memop.type = APIC_OP_MEMSET;
+    memop.dst_region_id = -1;  // Will be resolved by Python
+    memop.dst_offset = reinterpret_cast<uint64_t>(dst);  // Store raw ptr
+    memop.src_region_id = -1;
+    memop.src_offset = 0;
+    memop.size = size;
+    memop.value = value;
 
-    APICOperation op;
-    op.type = APIC_OP_MEMSET;
-    op.data.resize(sizeof(rec));
-    memcpy(op.data.data(), &rec, sizeof(rec));
-    state->operations.push_back(std::move(op));
+    state->memory_ops.push_back(std::move(memop));
+
+    APICRecordedOperation op;
+    op.kind = APICRecordedOperation::OP_MEMOP;
+    op.index = state->memory_ops.size() - 1;
+    state->operations.push_back(op);
 }
 
 void apic_record_alloc(APICState state, void* ptr, size_t size)
@@ -336,15 +185,29 @@ void apic_record_alloc(APICState state, void* ptr, size_t size)
     if (!state || !state->recording)
         return;
 
-    APICRecordAlloc rec;
-    rec.ptr = reinterpret_cast<uint64_t>(ptr);
-    rec.size = size;
+    // Register as a memory region with auto-generated ID
+    uint32_t region_id = state->next_region_id++;
 
-    APICOperation op;
-    op.type = APIC_OP_ALLOC;
-    op.data.resize(sizeof(rec));
-    memcpy(op.data.data(), &rec, sizeof(rec));
-    state->operations.push_back(std::move(op));
+    APICRecordedRegion region;
+    region.region_id = region_id;
+    region.base_ptr = reinterpret_cast<uint64_t>(ptr);
+    region.size = size;
+    region.element_size = 1;  // Unknown, Python may update
+    region.role = APIC_ROLE_INTERNAL;
+
+    state->memory_regions[region.base_ptr] = region;
+
+    // Record the allocation operation
+    APICRecordedAlloc alloc;
+    alloc.region_id = region_id;
+    alloc.size = size;
+
+    state->allocs.push_back(std::move(alloc));
+
+    APICRecordedOperation op;
+    op.kind = APICRecordedOperation::OP_ALLOC;
+    op.index = state->allocs.size() - 1;
+    state->operations.push_back(op);
 }
 
 // =============================================================================

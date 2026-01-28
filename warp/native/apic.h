@@ -24,25 +24,6 @@
 
 #include "apic_types.h"
 
-// Memory region structure for internal use during recording (packed for wire format)
-#pragma pack(push, 1)
-struct APICMemoryRegion {
-    uint32_t region_id;
-    uint64_t base_ptr;
-    uint64_t size;
-    uint32_t element_size;
-    uint8_t role;  // APICMemoryRole
-};  // 25 bytes
-
-// Launch params for apic_record_kernel_launch()
-struct APICRecordLaunchParams {
-    uint64_t dim;
-    int32_t max_blocks;
-    int32_t block_dim;
-    int32_t smem_bytes;
-};  // 20 bytes
-#pragma pack(pop)
-
 // Forward declaration of internal state (definition in warp.cu)
 struct APICStateInternal;
 

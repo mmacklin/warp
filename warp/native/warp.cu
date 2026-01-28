@@ -272,24 +272,91 @@ static std::mutex g_graph_destroy_mutex;
 // APIC (API Capture) State
 // ============================================================================
 
-// Internal APIC operation structure (stores all operation data)
-struct APICOperation {
-    APICOpType type;
-    std::vector<uint8_t> data;  // Serialized operation data
+// Recorded kernel launch (with full semantic info)
+struct APICRecordedLaunch {
+    std::string kernel_key;
+    std::string module_hash;
+    uint64_t dim;
+    int32_t shape[APIC_LAUNCH_MAX_DIMS];
+    int32_t ndim;
+    int32_t max_blocks;
+    int32_t block_dim;
+    int32_t smem_bytes;
+    bool is_forward;
+    std::vector<APICParamBindingInfo> param_bindings;
+};
+
+// Recorded memory operation
+struct APICRecordedMemoryOp {
+    APICOpType type;  // APIC_OP_MEMCPY_H2D, APIC_OP_MEMCPY_D2D, APIC_OP_MEMSET
+    int32_t dst_region_id;
+    uint64_t dst_offset;
+    int32_t src_region_id;  // For D2D only
+    uint64_t src_offset;  // For D2D only
+    uint64_t size;
+    int32_t value;  // For memset only
+    std::vector<uint8_t> src_data;  // For H2D only (inline data)
+};
+
+// Recorded allocation
+struct APICRecordedAlloc {
+    int32_t region_id;
+    uint64_t size;
+};
+
+// Operation entry (preserves order of operations)
+struct APICRecordedOperation {
+    enum { OP_LAUNCH, OP_MEMOP, OP_ALLOC } kind;
+    size_t index;  // Index into launches, memory_ops, or allocs
+};
+
+// Module info (for metadata)
+struct APICRecordedModule {
+    std::string module_hash;
+    std::string cubin_filename;
+};
+
+// Kernel info (for metadata)
+struct APICRecordedKernel {
+    std::string kernel_key;
+    std::string module_hash;
+    std::string forward_name;
+    std::string backward_name;
+};
+
+// Memory region info for recording
+struct APICRecordedRegion {
+    uint32_t region_id;
+    uint64_t base_ptr;
+    uint64_t size;
+    uint32_t element_size;
+    APICMemoryRole role;
+    std::vector<uint8_t> initial_data;  // For internal regions
 };
 
 // Internal APIC state structure
 struct APICStateInternal {
     bool recording = false;
 
-    // Recorded operations
-    std::vector<APICOperation> operations;
+    // Recorded operations (in order)
+    std::vector<APICRecordedOperation> operations;
+    std::vector<APICRecordedLaunch> launches;
+    std::vector<APICRecordedMemoryOp> memory_ops;
+    std::vector<APICRecordedAlloc> allocs;
 
-    // Memory regions (keyed by base pointer)
-    std::unordered_map<uint64_t, APICMemoryRegion> memory_regions;
+    // Memory regions (keyed by base pointer for lookup)
+    std::unordered_map<uint64_t, APICRecordedRegion> memory_regions;
     uint32_t next_region_id = 0;
 
-    // Unique kernel names encountered
+    // Module and kernel metadata
+    std::unordered_map<std::string, APICRecordedModule> modules;
+    std::unordered_map<std::string, APICRecordedKernel> kernels;
+
+    // Input/output bindings (name -> region_id)
+    std::vector<std::pair<std::string, int32_t>> input_bindings;
+    std::vector<std::pair<std::string, int32_t>> output_bindings;
+
+    // Unique kernel names encountered (legacy)
     std::unordered_set<std::string> kernel_names;
 };
 
