@@ -80,7 +80,8 @@ class LaunchRecord:
 
     kernel_key: str
     module_hash: str
-    dim: int
+    dim: int  # Total threads
+    shape: tuple  # Shape of each dimension (up to 4D)
     max_blocks: int
     block_dim: int
     smem_bytes: int
@@ -262,10 +263,13 @@ class APICapture:
             )
 
         # Record the launch
+        bounds = launch.bounds
+        shape = tuple(bounds.shape[i] for i in range(bounds.ndim))
         record = LaunchRecord(
             kernel_key=kernel.key,
             module_hash=module_hash,
-            dim=launch.bounds.size,
+            dim=bounds.size,
+            shape=shape,
             max_blocks=launch.max_blocks,
             block_dim=launch.block_dim,
             smem_bytes=(launch.hooks.backward_smem_bytes if launch.adjoint else launch.hooks.forward_smem_bytes),

@@ -723,11 +723,8 @@ WP_API void* wp_apic_get_cuda_graph(APICGraph graph);
 
 // Get the instantiated CUDA graph executable (creates if needed, rebuilds if bindings changed)
 // Returns the cudaGraphExec_t handle, or NULL on failure
+// Users should call wp_cuda_graph_launch() with the returned exec to launch
 WP_API void* wp_apic_get_cuda_graph_exec(APICGraph graph);
-
-// Launch the graph on a stream
-// Returns 1 on success, 0 on failure
-WP_API int wp_apic_launch_graph(APICGraph graph, void* stream);
 
 // Query functions
 WP_API int wp_apic_get_num_inputs(APICGraph graph);

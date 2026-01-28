@@ -168,8 +168,7 @@ size_t wp_apic_get_memory_regions_data_size(APICState state)
 {
     if (!state)
         return 0;
-    // Each region: region_id (4) + base_ptr (8) + size (8) + element_size (4) + role (1) = 25 bytes
-    return state->memory_regions.size() * 25;
+    return state->memory_regions.size() * sizeof(APICMemoryRegion);
 }
 
 void wp_apic_get_memory_regions_data(APICState state, void* buffer, size_t buffer_size)
@@ -181,20 +180,11 @@ void wp_apic_get_memory_regions_data(APICState state, void* buffer, size_t buffe
     uint8_t* end = ptr + buffer_size;
 
     for (const auto& pair : state->memory_regions) {
-        if (ptr + 25 > end)
+        if (ptr + sizeof(APICMemoryRegion) > end)
             break;
 
-        const APICMemoryRegion& region = pair.second;
-
-        memcpy(ptr, &region.region_id, 4);
-        ptr += 4;
-        memcpy(ptr, &region.base_ptr, 8);
-        ptr += 8;
-        memcpy(ptr, &region.size, 8);
-        ptr += 8;
-        memcpy(ptr, &region.element_size, 4);
-        ptr += 4;
-        *ptr++ = static_cast<uint8_t>(region.role);
+        memcpy(ptr, &pair.second, sizeof(APICMemoryRegion));
+        ptr += sizeof(APICMemoryRegion);
     }
 }
 
@@ -257,7 +247,7 @@ void apic_record_kernel_launch(
     op.type = APIC_OP_KERNEL_LAUNCH;
 
     // Serialize launch data
-    // Format: kernel_name_len (4) + kernel_name + dim (8) + max_blocks (4) + block_dim (4) + smem_bytes (4)
+    // Format: kernel_name_len (4) + kernel_name + APICRecordLaunchParams (20)
     //         + num_params (4) + [param_size (4) + param_data]...
     size_t name_len = kernel_name.size();
     size_t total_param_size = 0;
@@ -265,33 +255,32 @@ void apic_record_kernel_launch(
         total_param_size += 4 + arg_sizes[i];  // size prefix + data
     }
 
-    size_t data_size = 4 + name_len + 8 + 4 + 4 + 4 + 4 + total_param_size;
+    size_t data_size = 4 + name_len + sizeof(APICRecordLaunchParams) + 4 + total_param_size;
     op.data.resize(data_size);
     uint8_t* ptr = op.data.data();
 
-    // Write kernel name
+    // Write kernel name length and name
     uint32_t name_len32 = static_cast<uint32_t>(name_len);
-    memcpy(ptr, &name_len32, 4);
-    ptr += 4;
+    memcpy(ptr, &name_len32, sizeof(name_len32));
+    ptr += sizeof(name_len32);
     if (name_len > 0) {
         memcpy(ptr, kernel_name.c_str(), name_len);
         ptr += name_len;
     }
 
-    // Write launch params
-    memcpy(ptr, &dim, 8);
-    ptr += 8;
-    memcpy(ptr, &max_blocks, 4);
-    ptr += 4;
-    memcpy(ptr, &block_dim, 4);
-    ptr += 4;
-    memcpy(ptr, &smem_bytes, 4);
-    ptr += 4;
+    // Write launch params as a single struct
+    APICRecordLaunchParams params;
+    params.dim = dim;
+    params.max_blocks = max_blocks;
+    params.block_dim = block_dim;
+    params.smem_bytes = smem_bytes;
+    memcpy(ptr, &params, sizeof(params));
+    ptr += sizeof(params);
 
     // Write num_params
     uint32_t num_params32 = static_cast<uint32_t>(num_args);
-    memcpy(ptr, &num_params32, 4);
-    ptr += 4;
+    memcpy(ptr, &num_params32, sizeof(num_params32));
+    ptr += sizeof(num_params32);
 
     // Write each parameter
     for (size_t i = 0; i < num_args; i++) {
@@ -369,7 +358,6 @@ static const uint32_t WGF_VERSION = APIC_FORMAT_VERSION;
 static const uint32_t WGF_SECTION_METADATA = APIC_SECTION_METADATA;
 static const uint32_t WGF_SECTION_MEMORY = APIC_SECTION_MEMORY;
 static const uint32_t WGF_SECTION_OPERATIONS = APIC_SECTION_OPERATIONS;
-static const size_t WGF_HEADER_SIZE = 64;
 
 // Parameter binding for loaded graphs
 struct APICParamBinding {
@@ -393,6 +381,8 @@ struct APICKernelLaunch {
     std::string module_hash;
     std::string kernel_name;
     uint64_t dim;
+    int32_t shape[APIC_LAUNCH_MAX_DIMS];
+    int32_t ndim;
     int32_t max_blocks;
     int32_t block_dim;
     int32_t smem_bytes;
@@ -978,7 +968,6 @@ static bool apic_parse_operations(const uint8_t* data, size_t size, APICGraphInt
         const APICOpHeader* header = reinterpret_cast<const APICOpHeader*>(ptr);
         const uint8_t* op_start = ptr;
         uint8_t op_type = header->op_type;
-
         if (op_type == APIC_OP_KERNEL_LAUNCH) {
             // Read APICLaunchRecord header
             if (ptr + sizeof(APICLaunchRecord) > end)
@@ -989,6 +978,10 @@ static bool apic_parse_operations(const uint8_t* data, size_t size, APICGraphInt
 
             APICKernelLaunch launch;
             launch.dim = rec->dim;
+            launch.ndim = rec->ndim;
+            for (int i = 0; i < APIC_LAUNCH_MAX_DIMS; i++) {
+                launch.shape[i] = rec->shape[i];
+            }
             launch.max_blocks = rec->max_blocks;
             launch.block_dim = rec->block_dim;
             launch.smem_bytes = rec->smem_bytes;
@@ -1143,14 +1136,13 @@ static bool apic_init_memory(const uint8_t* data, size_t size, APICGraphInternal
 }
 
 // Helper to create launch bounds for APIC replay
-static apic_launch_bounds_t apic_make_launch_bounds(uint64_t dim)
+static apic_launch_bounds_t apic_make_launch_bounds(uint64_t dim, const int32_t* shape, int32_t ndim)
 {
     apic_launch_bounds_t bounds;
-    bounds.ndim = 1;
+    bounds.ndim = ndim;
     bounds.size = dim;
-    bounds.shape[0] = (int)dim;
-    for (int i = 1; i < APIC_LAUNCH_MAX_DIMS; i++) {
-        bounds.shape[i] = 1;
+    for (int i = 0; i < APIC_LAUNCH_MAX_DIMS; i++) {
+        bounds.shape[i] = (i < ndim) ? shape[i] : 1;
     }
     return bounds;
 }
@@ -1237,7 +1229,7 @@ static bool apic_rebuild_cuda_graph(APICGraphInternal* graph, CUstream stream)
 
             // Build launch bounds and arguments
             // First arg is always launch_bounds_t
-            apic_launch_bounds_t bounds = apic_make_launch_bounds(launch.dim);
+            apic_launch_bounds_t bounds = apic_make_launch_bounds(launch.dim, launch.shape, launch.ndim);
 
             std::vector<void*> args;
             std::vector<std::unique_ptr<uint8_t[]>> arg_storage;
@@ -1371,41 +1363,33 @@ APICGraph wp_apic_load_graph(void* context, const char* path)
         return nullptr;
     }
 
-    if (file_data.size() < WGF_HEADER_SIZE) {
+    if (file_data.size() < sizeof(APICFileHeader)) {
         wp::set_error_string("Invalid WGF file: too small");
         return nullptr;
     }
 
-    // Parse header
-    const uint8_t* ptr = file_data.data();
+    // Parse header using direct struct read
+    const APICFileHeader* header = reinterpret_cast<const APICFileHeader*>(file_data.data());
 
-    if (memcmp(ptr, WGF_MAGIC, 4) != 0) {
+    if (memcmp(header->magic, WGF_MAGIC, 4) != 0) {
         wp::set_error_string("Invalid WGF file: bad magic");
         return nullptr;
     }
-    ptr += 4;
 
-    uint32_t version = apic_read_value<uint32_t>(ptr);
-    if (version > WGF_VERSION) {
-        wp::set_error_string("Unsupported WGF version: %u", version);
+    if (header->version > WGF_VERSION) {
+        wp::set_error_string("Unsupported WGF version: %u", header->version);
         return nullptr;
     }
-
-    uint32_t flags = apic_read_value<uint32_t>(ptr);
-    (void)flags;  // Reserved for future use
-
-    uint32_t num_sections = apic_read_value<uint32_t>(ptr);
-    uint64_t section_table_offset = apic_read_value<uint64_t>(ptr);
-    uint32_t target_arch = apic_read_value<uint32_t>(ptr);
 
     // Create graph object
     APICGraphInternal* graph = new APICGraphInternal();
     graph->cuda_context = context;
-    graph->target_arch = target_arch;
+    graph->target_arch = header->target_arch;
     graph->base_path = base_name;
 
-    // Parse section table
-    ptr = file_data.data() + section_table_offset;
+    // Parse section table using direct struct reads
+    const APICSectionEntry* sections
+        = reinterpret_cast<const APICSectionEntry*>(file_data.data() + header->section_table_offset);
 
     const uint8_t* metadata_ptr = nullptr;
     size_t metadata_size = 0;
@@ -1414,24 +1398,18 @@ APICGraph wp_apic_load_graph(void* context, const char* path)
     const uint8_t* operations_ptr = nullptr;
     size_t operations_size = 0;
 
-    for (uint32_t i = 0; i < num_sections; i++) {
-        uint32_t section_type = apic_read_value<uint32_t>(ptr);
-        uint32_t section_flags = apic_read_value<uint32_t>(ptr);
-        (void)section_flags;
-        uint64_t section_offset = apic_read_value<uint64_t>(ptr);
-        int64_t section_size = apic_read_value<int64_t>(ptr);
-        int64_t uncompressed_size = apic_read_value<int64_t>(ptr);
-        (void)uncompressed_size;  // TODO: compression support
+    for (uint32_t i = 0; i < header->num_sections; i++) {
+        const APICSectionEntry& section = sections[i];
 
-        if (section_type == WGF_SECTION_METADATA) {
-            metadata_ptr = file_data.data() + section_offset;
-            metadata_size = section_size;
-        } else if (section_type == WGF_SECTION_MEMORY) {
-            memory_ptr = file_data.data() + section_offset;
-            memory_size = section_size;
-        } else if (section_type == WGF_SECTION_OPERATIONS) {
-            operations_ptr = file_data.data() + section_offset;
-            operations_size = section_size;
+        if (section.type == WGF_SECTION_METADATA) {
+            metadata_ptr = file_data.data() + section.offset;
+            metadata_size = section.size;
+        } else if (section.type == WGF_SECTION_MEMORY) {
+            memory_ptr = file_data.data() + section.offset;
+            memory_size = section.size;
+        } else if (section.type == WGF_SECTION_OPERATIONS) {
+            operations_ptr = file_data.data() + section.offset;
+            operations_size = section.size;
         }
     }
 
@@ -1620,26 +1598,6 @@ void* wp_apic_get_cuda_graph_exec(APICGraph graph)
     }
 
     return graph->cuda_graph_exec;
-}
-
-int wp_apic_launch_graph(APICGraph graph, void* stream)
-{
-    if (!graph)
-        return 0;
-
-    ContextGuard guard(graph->cuda_context);
-
-    cudaGraphExec_t exec = (cudaGraphExec_t)wp_apic_get_cuda_graph_exec(graph);
-    if (!exec)
-        return 0;
-
-    cudaError_t err = cudaGraphLaunch(exec, (cudaStream_t)stream);
-    if (err != cudaSuccess) {
-        wp::set_error_string("Failed to launch graph: %d", err);
-        return 0;
-    }
-
-    return 1;
 }
 
 int wp_apic_get_num_inputs(APICGraph graph) { return graph ? (int)graph->input_names.size() : 0; }

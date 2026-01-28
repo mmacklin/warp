@@ -1,0 +1,26 @@
+Metadata-Version: 2.1
+Name: UNKNOWN
+Version: 0.0.0
+Summary: UNKNOWN
+Home-page: UNKNOWN
+License: UNKNOWN
+Platform: UNKNOWN
+License-File: LICENSE.md
+License-File: licenses\Gaia-LICENSE.txt
+License-File: licenses\appdirs-LICENSE.txt
+License-File: licenses\asset_pixel_jpg-LICENSE.txt
+License-File: licenses\cuda-LICENSE.txt
+License-File: licenses\dlpack-LICENSE.txt
+License-File: licenses\fp16-LICENSE.txt
+License-File: licenses\libmathdx-LICENSE.txt
+License-File: licenses\llvm-LICENSE.txt
+License-File: licenses\moller-LICENSE.txt
+License-File: licenses\nanovdb-LICENSE.txt
+License-File: licenses\nvrtc-LICENSE.txt
+License-File: licenses\svd-LICENSE.txt
+License-File: licenses\unittest_parallel-LICENSE.txt
+License-File: licenses\usd-LICENSE.txt
+License-File: licenses\windingnumber-LICENSE.txt
+
+UNKNOWN
+

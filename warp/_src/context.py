@@ -4896,9 +4896,6 @@ class Runtime:
             self.core.wp_apic_get_cuda_graph_exec.argtypes = [ctypes.c_void_p]
             self.core.wp_apic_get_cuda_graph_exec.restype = ctypes.c_void_p
 
-            self.core.wp_apic_launch_graph.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-            self.core.wp_apic_launch_graph.restype = ctypes.c_int
-
             self.core.wp_apic_get_num_inputs.argtypes = [ctypes.c_void_p]
             self.core.wp_apic_get_num_inputs.restype = ctypes.c_int
 

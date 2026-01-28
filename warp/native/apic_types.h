@@ -68,6 +68,9 @@ typedef enum {
 // WGF File Header
 // =============================================================================
 
+// All serialization structs are packed to ensure binary compatibility with Python
+#pragma pack(push, 1)
+
 typedef struct {
     uint8_t magic[4];  // "WGF1"
     uint32_t version;  // APIC_FORMAT_VERSION
@@ -115,6 +118,8 @@ typedef struct {
 
     // Launch parameters
     uint64_t dim;  // Total threads
+    int32_t shape[APIC_LAUNCH_MAX_DIMS];  // Shape of each dimension
+    int32_t ndim;  // Number of dimensions (1-4)
     int32_t max_blocks;  // Maximum blocks
     int32_t block_dim;  // Threads per block
     int32_t smem_bytes;  // Shared memory bytes
@@ -131,7 +136,7 @@ typedef struct {
     // 1. char kernel_key[kernel_key_len]
     // 2. char module_hash[module_hash_len]
     // 3. Parameter bindings (APICArrayBindingRecord or APICScalarBindingRecord)
-} APICLaunchRecord;  // 40 bytes fixed
+} APICLaunchRecord;  // 60 bytes fixed
 
 // Array parameter binding (fixed size)
 typedef struct {
@@ -212,16 +217,7 @@ typedef struct {
     // If has_initial_data: uint8_t initial_data[size] follows
 } APICMemoryRegionRecord;  // 24 bytes fixed
 
-// =============================================================================
-// Binding Records (for metadata section, name -> region_id mapping)
-// =============================================================================
-
-typedef struct {
-    uint32_t region_id;
-    uint16_t name_len;
-    uint8_t _pad[2];
-    // char name[name_len] follows (NOT null-terminated in file)
-} APICBindingRecord;  // 8 bytes fixed
+#pragma pack(pop)
 
 // =============================================================================
 // Execution Structures (must match runtime types in builtin.h and array.h)

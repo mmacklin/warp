@@ -19,6 +19,7 @@ from pathlib import Path
 from .capture import APICapture, ModuleInfo
 from .format import WGFWriter
 from .types import (
+    APIC_LAUNCH_MAX_DIMS,
     APIC_MAX_DIMS,
     APIC_OP_ALLOC,
     APIC_OP_KERNEL_LAUNCH,
@@ -249,6 +250,11 @@ def _serialize_launch(launch) -> bytes:
     record.header.op_type = APIC_OP_KERNEL_LAUNCH
     record.header.total_size = total_size
     record.dim = launch.dim
+    # Set shape and ndim
+    ndim = len(launch.shape)
+    record.ndim = ndim
+    for i in range(APIC_LAUNCH_MAX_DIMS):
+        record.shape[i] = launch.shape[i] if i < ndim else 1
     record.max_blocks = launch.max_blocks
     record.block_dim = launch.block_dim
     record.smem_bytes = launch.smem_bytes
