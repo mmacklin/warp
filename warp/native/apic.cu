@@ -217,7 +217,6 @@ void apic_record_memcpy(APICState state, void* dst, void* src, size_t size, APIC
         rec.size = size;
 
         state->append_bytes(&rec, sizeof(rec));
-
     } else if (kind == APIC_OP_MEMCPY_H2D) {
         uint32_t total_size = sizeof(APICMemcpyH2DRecord) + size;
 
