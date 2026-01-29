@@ -25,8 +25,9 @@ find_package(CUDAToolkit REQUIRED)
 # Find OpenGL
 find_package(OpenGL REQUIRED)
 
-# Fetch GLFW
+# Fetch GLFW and GLAD
 include(FetchContent)
+
 FetchContent_Declare(
     glfw
     GIT_REPOSITORY https://github.com/glfw/glfw.git
@@ -35,7 +36,17 @@ FetchContent_Declare(
 set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(glfw)
+
+FetchContent_Declare(
+    glad
+    GIT_REPOSITORY https://github.com/Dav1dde/glad.git
+    GIT_TAG        v0.1.36
+)
+set(GLAD_PROFILE "core" CACHE STRING "" FORCE)
+set(GLAD_API "gl=3.3" CACHE STRING "" FORCE)
+set(GLAD_GENERATOR "c" CACHE STRING "" FORCE)
+
+FetchContent_MakeAvailable(glfw glad)
 
 # Check that the APIC graph exists
 if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/generated/wave_sim.wgf")
@@ -106,6 +117,7 @@ target_link_libraries(02_apic_visualization
     CUDA::cudart
     OpenGL::GL
     glfw
+    glad
     ${WARP_LIB}
 )
 

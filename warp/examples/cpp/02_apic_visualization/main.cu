@@ -35,125 +35,19 @@
  * See README.md for build instructions.
  */
 
-#include "warp.h"  // Warp C API including APIC functions
+// clang-format off
+// Include order matters: GLAD must come before other GL headers,
+// and aot.h (CUDA) must come after GLAD to avoid type conflicts
+#include <glad/glad.h>
+#include <GLFW/glfw3.h>
 
-#include "aot.h"  // Warp AOT utilities
+#include "aot.h"  // Warp AOT utilities (includes CUDA)
+#include "warp.h" // Warp C API including APIC functions
 
 #include <cmath>
 #include <cstdio>
 #include <vector>
-
-// OpenGL/GLFW
-#define GLFW_INCLUDE_NONE
-#include <GLFW/glfw3.h>
-
-// We'll use a minimal OpenGL loader - just the functions we need
-#ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#include <GL/gl.h>
-#include <windows.h>
-// Modern OpenGL constants not in Windows gl.h
-#define GL_ARRAY_BUFFER 0x8892
-#define GL_ELEMENT_ARRAY_BUFFER 0x8893
-#define GL_STATIC_DRAW 0x88E4
-#define GL_DYNAMIC_DRAW 0x88E8
-#define GL_FRAGMENT_SHADER 0x8B30
-#define GL_VERTEX_SHADER 0x8B31
-#define GL_COMPILE_STATUS 0x8B81
-#define GL_LINK_STATUS 0x8B82
-typedef char GLchar;
-typedef ptrdiff_t GLsizeiptr;
-typedef ptrdiff_t GLintptr;
-#else
-#include <GL/gl.h>
-#include <GL/glext.h>
-#endif
-
-// OpenGL function pointers (loaded at runtime)
-typedef void (*PFNGLGENBUFFERSPROC)(GLsizei, GLuint*);
-typedef void (*PFNGLDELETEBUFFERSPROC)(GLsizei, const GLuint*);
-typedef void (*PFNGLBINDBUFFERPROC)(GLenum, GLuint);
-typedef void (*PFNGLBUFFERDATAPROC)(GLenum, GLsizeiptr, const void*, GLenum);
-typedef void (*PFNGLBUFFERSUBDATAPROC)(GLenum, GLintptr, GLsizeiptr, const void*);
-typedef GLuint (*PFNGLCREATESHADERPROC)(GLenum);
-typedef void (*PFNGLDELETESHADERPROC)(GLuint);
-typedef void (*PFNGLSHADERSOURCEPROC)(GLuint, GLsizei, const GLchar**, const GLint*);
-typedef void (*PFNGLCOMPILESHADERPROC)(GLuint);
-typedef void (*PFNGLGETSHADERIVPROC)(GLuint, GLenum, GLint*);
-typedef void (*PFNGLGETSHADERINFOLOGPROC)(GLuint, GLsizei, GLsizei*, GLchar*);
-typedef GLuint (*PFNGLCREATEPROGRAMPROC)();
-typedef void (*PFNGLDELETEPROGRAMPROC)(GLuint);
-typedef void (*PFNGLATTACHSHADERPROC)(GLuint, GLuint);
-typedef void (*PFNGLLINKPROGRAMPROC)(GLuint);
-typedef void (*PFNGLGETPROGRAMIVPROC)(GLuint, GLenum, GLint*);
-typedef void (*PFNGLGETPROGRAMINFOLOGPROC)(GLuint, GLsizei, GLsizei*, GLchar*);
-typedef void (*PFNGLUSEPROGRAMPROC)(GLuint);
-typedef GLint (*PFNGLGETUNIFORMLOCATIONPROC)(GLuint, const GLchar*);
-typedef void (*PFNGLUNIFORMMATRIX4FVPROC)(GLint, GLsizei, GLboolean, const GLfloat*);
-typedef void (*PFNGLUNIFORM3FPROC)(GLint, GLfloat, GLfloat, GLfloat);
-typedef void (*PFNGLGENVERTEXARRAYSPROC)(GLsizei, GLuint*);
-typedef void (*PFNGLDELETEVERTEXARRAYSPROC)(GLsizei, const GLuint*);
-typedef void (*PFNGLBINDVERTEXARRAYPROC)(GLuint);
-typedef void (*PFNGLENABLEVERTEXATTRIBARRAYPROC)(GLuint);
-typedef void (*PFNGLVERTEXATTRIBPOINTERPROC)(GLuint, GLint, GLenum, GLboolean, GLsizei, const void*);
-
-// Global GL function pointers
-static PFNGLGENBUFFERSPROC glGenBuffers_;
-static PFNGLDELETEBUFFERSPROC glDeleteBuffers_;
-static PFNGLBINDBUFFERPROC glBindBuffer_;
-static PFNGLBUFFERDATAPROC glBufferData_;
-static PFNGLBUFFERSUBDATAPROC glBufferSubData_;
-static PFNGLCREATESHADERPROC glCreateShader_;
-static PFNGLDELETESHADERPROC glDeleteShader_;
-static PFNGLSHADERSOURCEPROC glShaderSource_;
-static PFNGLCOMPILESHADERPROC glCompileShader_;
-static PFNGLGETSHADERIVPROC glGetShaderiv_;
-static PFNGLGETSHADERINFOLOGPROC glGetShaderInfoLog_;
-static PFNGLCREATEPROGRAMPROC glCreateProgram_;
-static PFNGLDELETEPROGRAMPROC glDeleteProgram_;
-static PFNGLATTACHSHADERPROC glAttachShader_;
-static PFNGLLINKPROGRAMPROC glLinkProgram_;
-static PFNGLGETPROGRAMIVPROC glGetProgramiv_;
-static PFNGLGETPROGRAMINFOLOGPROC glGetProgramInfoLog_;
-static PFNGLUSEPROGRAMPROC glUseProgram_;
-static PFNGLGETUNIFORMLOCATIONPROC glGetUniformLocation_;
-static PFNGLUNIFORMMATRIX4FVPROC glUniformMatrix4fv_;
-static PFNGLUNIFORM3FPROC glUniform3f_;
-static PFNGLGENVERTEXARRAYSPROC glGenVertexArrays_;
-static PFNGLDELETEVERTEXARRAYSPROC glDeleteVertexArrays_;
-static PFNGLBINDVERTEXARRAYPROC glBindVertexArray_;
-static PFNGLENABLEVERTEXATTRIBARRAYPROC glEnableVertexAttribArray_;
-static PFNGLVERTEXATTRIBPOINTERPROC glVertexAttribPointer_;
-
-void load_gl_functions()
-{
-    glGenBuffers_ = (PFNGLGENBUFFERSPROC)glfwGetProcAddress("glGenBuffers");
-    glDeleteBuffers_ = (PFNGLDELETEBUFFERSPROC)glfwGetProcAddress("glDeleteBuffers");
-    glBindBuffer_ = (PFNGLBINDBUFFERPROC)glfwGetProcAddress("glBindBuffer");
-    glBufferData_ = (PFNGLBUFFERDATAPROC)glfwGetProcAddress("glBufferData");
-    glBufferSubData_ = (PFNGLBUFFERSUBDATAPROC)glfwGetProcAddress("glBufferSubData");
-    glCreateShader_ = (PFNGLCREATESHADERPROC)glfwGetProcAddress("glCreateShader");
-    glDeleteShader_ = (PFNGLDELETESHADERPROC)glfwGetProcAddress("glDeleteShader");
-    glShaderSource_ = (PFNGLSHADERSOURCEPROC)glfwGetProcAddress("glShaderSource");
-    glCompileShader_ = (PFNGLCOMPILESHADERPROC)glfwGetProcAddress("glCompileShader");
-    glGetShaderiv_ = (PFNGLGETSHADERIVPROC)glfwGetProcAddress("glGetShaderiv");
-    glGetShaderInfoLog_ = (PFNGLGETSHADERINFOLOGPROC)glfwGetProcAddress("glGetShaderInfoLog");
-    glCreateProgram_ = (PFNGLCREATEPROGRAMPROC)glfwGetProcAddress("glCreateProgram");
-    glDeleteProgram_ = (PFNGLDELETEPROGRAMPROC)glfwGetProcAddress("glDeleteProgram");
-    glAttachShader_ = (PFNGLATTACHSHADERPROC)glfwGetProcAddress("glAttachShader");
-    glLinkProgram_ = (PFNGLLINKPROGRAMPROC)glfwGetProcAddress("glLinkProgram");
-    glGetProgramiv_ = (PFNGLGETPROGRAMIVPROC)glfwGetProcAddress("glGetProgramiv");
-    glGetProgramInfoLog_ = (PFNGLGETPROGRAMINFOLOGPROC)glfwGetProcAddress("glGetProgramInfoLog");
-    glUseProgram_ = (PFNGLUSEPROGRAMPROC)glfwGetProcAddress("glUseProgram");
-    glGetUniformLocation_ = (PFNGLGETUNIFORMLOCATIONPROC)glfwGetProcAddress("glGetUniformLocation");
-    glUniformMatrix4fv_ = (PFNGLUNIFORMMATRIX4FVPROC)glfwGetProcAddress("glUniformMatrix4fv");
-    glUniform3f_ = (PFNGLUNIFORM3FPROC)glfwGetProcAddress("glUniform3f");
-    glGenVertexArrays_ = (PFNGLGENVERTEXARRAYSPROC)glfwGetProcAddress("glGenVertexArrays");
-    glDeleteVertexArrays_ = (PFNGLDELETEVERTEXARRAYSPROC)glfwGetProcAddress("glDeleteVertexArrays");
-    glBindVertexArray_ = (PFNGLBINDVERTEXARRAYPROC)glfwGetProcAddress("glBindVertexArray");
-    glEnableVertexAttribArray_ = (PFNGLENABLEVERTEXATTRIBARRAYPROC)glfwGetProcAddress("glEnableVertexAttribArray");
-    glVertexAttribPointer_ = (PFNGLVERTEXATTRIBPOINTERPROC)glfwGetProcAddress("glVertexAttribPointer");
-}
+// clang-format on
 
 // Simulation constants
 constexpr int GRID_WIDTH = 128;
@@ -318,15 +212,15 @@ void main() {
 
 GLuint compile_shader(GLenum type, const char* src)
 {
-    GLuint shader = glCreateShader_(type);
-    glShaderSource_(shader, 1, &src, nullptr);
-    glCompileShader_(shader);
+    GLuint shader = glCreateShader(type);
+    glShaderSource(shader, 1, &src, nullptr);
+    glCompileShader(shader);
 
     GLint success;
-    glGetShaderiv_(shader, GL_COMPILE_STATUS, &success);
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
     if (!success) {
         char log[512];
-        glGetShaderInfoLog_(shader, 512, nullptr, log);
+        glGetShaderInfoLog(shader, 512, nullptr, log);
         fprintf(stderr, "Shader compilation failed: %s\n", log);
     }
     return shader;
@@ -337,21 +231,21 @@ GLuint create_shader_program()
     GLuint vs = compile_shader(GL_VERTEX_SHADER, vertex_shader_src);
     GLuint fs = compile_shader(GL_FRAGMENT_SHADER, fragment_shader_src);
 
-    GLuint program = glCreateProgram_();
-    glAttachShader_(program, vs);
-    glAttachShader_(program, fs);
-    glLinkProgram_(program);
+    GLuint program = glCreateProgram();
+    glAttachShader(program, vs);
+    glAttachShader(program, fs);
+    glLinkProgram(program);
 
     GLint success;
-    glGetProgramiv_(program, GL_LINK_STATUS, &success);
+    glGetProgramiv(program, GL_LINK_STATUS, &success);
     if (!success) {
         char log[512];
-        glGetProgramInfoLog_(program, 512, nullptr, log);
+        glGetProgramInfoLog(program, 512, nullptr, log);
         fprintf(stderr, "Program linking failed: %s\n", log);
     }
 
-    glDeleteShader_(vs);
-    glDeleteShader_(fs);
+    glDeleteShader(vs);
+    glDeleteShader(fs);
 
     return program;
 }
@@ -447,13 +341,17 @@ int main(int argc, char** argv)
     glfwSetScrollCallback(window, scroll_callback);
     glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
 
-    // Load OpenGL functions
-    load_gl_functions();
+    // Load OpenGL functions using GLAD
+    if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
+        fprintf(stderr, "Failed to initialize GLAD\n");
+        glfwTerminate();
+        return 1;
+    }
 
     // Create shader program
     GLuint program = create_shader_program();
-    GLint mvp_loc = glGetUniformLocation_(program, "mvp");
-    GLint light_loc = glGetUniformLocation_(program, "light_dir");
+    GLint mvp_loc = glGetUniformLocation(program, "mvp");
+    GLint light_loc = glGetUniformLocation(program, "light_dir");
 
     // Create mesh (grid of vertices)
     printf("Creating mesh (%dx%d)...\n", GRID_WIDTH, GRID_HEIGHT);
@@ -486,20 +384,20 @@ int main(int argc, char** argv)
 
     // Create OpenGL buffers
     GLuint vao, vbo, ebo;
-    glGenVertexArrays_(1, &vao);
-    glGenBuffers_(1, &vbo);
-    glGenBuffers_(1, &ebo);
+    glGenVertexArrays(1, &vao);
+    glGenBuffers(1, &vbo);
+    glGenBuffers(1, &ebo);
 
-    glBindVertexArray_(vao);
+    glBindVertexArray(vao);
 
-    glBindBuffer_(GL_ARRAY_BUFFER, vbo);
-    glBufferData_(GL_ARRAY_BUFFER, vertices.size() * sizeof(float), vertices.data(), GL_DYNAMIC_DRAW);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, vertices.size() * sizeof(float), vertices.data(), GL_DYNAMIC_DRAW);
 
-    glBindBuffer_(GL_ELEMENT_ARRAY_BUFFER, ebo);
-    glBufferData_(GL_ELEMENT_ARRAY_BUFFER, indices.size() * sizeof(unsigned int), indices.data(), GL_STATIC_DRAW);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.size() * sizeof(unsigned int), indices.data(), GL_STATIC_DRAW);
 
-    glVertexAttribPointer_(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
-    glEnableVertexAttribArray_(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
 
     // Allocate CUDA arrays (two height buffers for wave equation)
     size_t heights_size = GRID_WIDTH * GRID_HEIGHT * sizeof(float);
@@ -583,8 +481,8 @@ int main(int argc, char** argv)
         CHECK_CUDA(cudaStreamSynchronize(stream));
 
         // Update VBO
-        glBindBuffer_(GL_ARRAY_BUFFER, vbo);
-        glBufferSubData_(GL_ARRAY_BUFFER, 0, vertices.size() * sizeof(float), vertices.data());
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glBufferSubData(GL_ARRAY_BUFFER, 0, vertices.size() * sizeof(float), vertices.data());
 
         // Compute camera position
         float cx = GRID_WIDTH * GRID_SCALE * 0.5f;
@@ -608,15 +506,15 @@ int main(int argc, char** argv)
         glClearColor(0.1f, 0.1f, 0.15f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-        glUseProgram_(program);
-        glUniformMatrix4fv_(mvp_loc, 1, GL_FALSE, mvp);
+        glUseProgram(program);
+        glUniformMatrix4fv(mvp_loc, 1, GL_FALSE, mvp);
 
         // Light direction (normalized)
         float lx = 0.5f, ly = 0.8f, lz = 0.3f;
         float ll = sqrtf(lx * lx + ly * ly + lz * lz);
-        glUniform3f_(light_loc, lx / ll, ly / ll, lz / ll);
+        glUniform3f(light_loc, lx / ll, ly / ll, lz / ll);
 
-        glBindVertexArray_(vao);
+        glBindVertexArray(vao);
         glDrawElements(GL_TRIANGLES, (GLsizei)indices.size(), GL_UNSIGNED_INT, 0);
 
         glfwSwapBuffers(window);
@@ -644,10 +542,10 @@ int main(int argc, char** argv)
     CHECK_CUDA(cudaFree(d_vertices));
     CHECK_CUDA(cudaFree(d_mouse_pos));
 
-    glDeleteVertexArrays_(1, &vao);
-    glDeleteBuffers_(1, &vbo);
-    glDeleteBuffers_(1, &ebo);
-    glDeleteProgram_(program);
+    glDeleteVertexArrays(1, &vao);
+    glDeleteBuffers(1, &vbo);
+    glDeleteBuffers(1, &ebo);
+    glDeleteProgram(program);
 
     wp_apic_destroy_graph(graph);
 
