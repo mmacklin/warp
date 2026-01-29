@@ -18,14 +18,126 @@
 #pragma once
 
 // APIC (API Capture) - Records Warp API calls for serialization and replay
-// This header contains internal definitions used by the APIC implementation.
-// Public API declarations are in warp.h
+// This header contains both public API and internal definitions.
 // POD structs for serialization are in apic_types.h
 
 #include "apic_types.h"
 
-// Forward declaration of internal state (definition in warp.cu)
-struct APICStateInternal;
+#include <stddef.h>
+#include <stdint.h>
+
+#ifndef WP_API
+#ifdef _WIN32
+#define WP_API __declspec(dllexport)
+#else
+#define WP_API __attribute__((visibility("default")))
+#endif
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// =============================================================================
+// APIC Public API - Recording and Saving
+// =============================================================================
+
+// Opaque handle to APIC state (used internally during CUDA graph capture)
+typedef struct APICStateInternal* APICState;
+
+// APIC State Management
+WP_API APICState wp_apic_create_state();
+WP_API void wp_apic_destroy_state(APICState state);
+
+// Recording Control
+WP_API void wp_apic_begin_recording(APICState state);
+WP_API void wp_apic_end_recording(APICState state);
+WP_API int wp_apic_is_recording(APICState state);
+
+// State Queries
+WP_API uint32_t wp_apic_get_operation_count(APICState state);
+WP_API uint32_t wp_apic_get_memory_region_count(APICState state);
+WP_API uint32_t wp_apic_get_module_count(APICState state);
+WP_API uint32_t wp_apic_get_kernel_count(APICState state);
+
+// Memory Region Registration
+WP_API uint32_t
+wp_apic_register_memory_region(APICState state, uint64_t base_ptr, uint64_t size, uint32_t element_size);
+
+// Metadata Registration - call these before wp_apic_state_save()
+WP_API void wp_apic_register_module(
+    APICState state, const char* module_hash, const char* module_name, const char* cubin_filename, int target_arch
+);
+
+WP_API void wp_apic_register_kernel(
+    APICState state,
+    const char* kernel_key,
+    const char* module_hash,
+    const char* forward_name,
+    const char* backward_name,  // can be NULL or empty string
+    int forward_smem_bytes,
+    int backward_smem_bytes,
+    int block_dim
+);
+
+WP_API void wp_apic_register_binding(APICState state, const char* name, uint32_t region_id);
+
+// Save APIC state to a WGF file
+// Serializes metadata from registered modules/kernels/bindings
+// Returns 1 on success, 0 on failure
+WP_API int wp_apic_state_save(APICState state, const char* path, uint32_t target_arch);
+
+// =============================================================================
+// APIC Public API - Loading and Execution
+// =============================================================================
+
+// Opaque handle to a loaded APIC graph
+typedef struct APICGraphInternal* APICGraph;
+
+// Load a graph from a .wgf file
+// Returns NULL on failure (use wp_get_error_string() for details)
+WP_API APICGraph wp_apic_load_graph(void* context, const char* path);
+
+// Destroy a loaded graph and free all resources
+WP_API void wp_apic_destroy_graph(APICGraph graph);
+
+// Set a named parameter by copying data to the pre-allocated region
+// This copies host data to the device memory region associated with the parameter
+// Returns 1 on success, 0 on failure (name not found or size mismatch)
+WP_API int wp_apic_set_param(APICGraph graph, const char* name, const void* data, size_t size);
+
+// Get a named parameter by copying data from the pre-allocated region
+// This copies device data from the memory region to the destination pointer
+// Returns 1 on success, 0 on failure (name not found or size mismatch)
+WP_API int wp_apic_get_param(APICGraph graph, const char* name, void* data, size_t size);
+
+// Get a named parameter's device pointer (for direct access)
+// Returns the device pointer, or NULL if not found
+WP_API void* wp_apic_get_param_ptr(APICGraph graph, const char* name);
+
+// Get the CUDA graph handle
+// Returns the cudaGraph_t handle, or NULL on failure
+WP_API void* wp_apic_get_cuda_graph(APICGraph graph);
+
+// Get the instantiated CUDA graph executable (creates if needed)
+// Returns the cudaGraphExec_t handle, or NULL on failure
+// Users should call wp_cuda_graph_launch() with the returned exec to launch
+WP_API void* wp_apic_get_cuda_graph_exec(APICGraph graph);
+
+// Query functions
+WP_API int wp_apic_get_num_params(APICGraph graph);
+WP_API const char* wp_apic_get_param_name(APICGraph graph, int index);
+WP_API size_t wp_apic_get_param_size(APICGraph graph, const char* name);
+
+#ifdef __cplusplus
+}  // extern "C"
+#endif
+
+// =============================================================================
+// APIC Internal API (C++ only)
+// =============================================================================
+
+#ifdef __cplusplus
 
 // Internal recording functions (called from wp_cuda_launch_kernel, wp_memcpy_*, etc.)
 void apic_record_kernel_launch(
@@ -49,3 +161,5 @@ void apic_record_memcpy(APICStateInternal* state, void* dst, void* src, size_t s
 void apic_record_memset(APICStateInternal* state, void* dst, int value, size_t size);
 
 void apic_record_alloc(APICStateInternal* state, void* ptr, size_t size);
+
+#endif  // __cplusplus

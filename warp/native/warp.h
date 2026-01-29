@@ -20,7 +20,7 @@
 // defines all crt + builtin types
 #include "builtin.h"
 
-#include "apic_types.h"
+#include "apic.h"
 
 #include <cstdint>
 
@@ -662,93 +662,5 @@ WP_API int wp_graph_coloring(int num_nodes, wp::array_t<int> edges, int algorith
 WP_API float wp_balance_coloring(
     int num_nodes, wp::array_t<int> edges, int num_colors, float target_max_min_ratio, wp::array_t<int> node_colors
 );
-
-// APIC (API Capture) - Records Warp API calls for serialization and replay
-// Opaque handle to APIC state (used internally during CUDA graph capture)
-typedef struct APICStateInternal* APICState;
-
-// APIC State Management
-WP_API APICState wp_apic_create_state();
-WP_API void wp_apic_destroy_state(APICState state);
-
-// Recording Control
-WP_API void wp_apic_begin_recording(APICState state);
-WP_API void wp_apic_end_recording(APICState state);
-WP_API int wp_apic_is_recording(APICState state);
-
-// State Queries
-WP_API uint32_t wp_apic_get_operation_count(APICState state);
-WP_API uint32_t wp_apic_get_memory_region_count(APICState state);
-WP_API uint32_t wp_apic_get_module_count(APICState state);
-WP_API uint32_t wp_apic_get_kernel_count(APICState state);
-
-// Memory Region Registration
-WP_API uint32_t
-wp_apic_register_memory_region(APICState state, uint64_t base_ptr, uint64_t size, uint32_t element_size);
-
-// Metadata Registration - call these before wp_apic_state_save()
-WP_API void wp_apic_register_module(
-    APICState state, const char* module_hash, const char* module_name, const char* cubin_filename, int target_arch
-);
-
-WP_API void wp_apic_register_kernel(
-    APICState state,
-    const char* kernel_key,
-    const char* module_hash,
-    const char* forward_name,
-    const char* backward_name,  // can be NULL or empty string
-    int forward_smem_bytes,
-    int backward_smem_bytes,
-    int block_dim
-);
-
-WP_API void wp_apic_register_binding(APICState state, const char* name, uint32_t region_id);
-
-// Save APIC state to a WGF file
-// Serializes metadata from registered modules/kernels/bindings
-// Returns 1 on success, 0 on failure
-WP_API int wp_apic_state_save(APICState state, const char* path, uint32_t target_arch);
-
-// =============================================================================
-// APIC Graph Loading - Load and execute serialized graphs from .wgf files
-// =============================================================================
-
-// Opaque handle to a loaded APIC graph
-typedef struct APICGraphInternal* APICGraph;
-
-// Load a graph from a .wgf file
-// Returns NULL on failure (use wp_get_error_string() for details)
-WP_API APICGraph wp_apic_load_graph(void* context, const char* path);
-
-// Destroy a loaded graph and free all resources
-WP_API void wp_apic_destroy_graph(APICGraph graph);
-
-// Set a named parameter by copying data to the pre-allocated region
-// This copies host data to the device memory region associated with the parameter
-// Returns 1 on success, 0 on failure (name not found or size mismatch)
-WP_API int wp_apic_set_param(APICGraph graph, const char* name, const void* data, size_t size);
-
-// Get a named parameter by copying data from the pre-allocated region
-// This copies device data from the memory region to the destination pointer
-// Returns 1 on success, 0 on failure (name not found or size mismatch)
-WP_API int wp_apic_get_param(APICGraph graph, const char* name, void* data, size_t size);
-
-// Get a named parameter's device pointer (for direct access)
-// Returns the device pointer, or NULL if not found
-WP_API void* wp_apic_get_param_ptr(APICGraph graph, const char* name);
-
-// Get the CUDA graph handle
-// Returns the cudaGraph_t handle, or NULL on failure
-WP_API void* wp_apic_get_cuda_graph(APICGraph graph);
-
-// Get the instantiated CUDA graph executable (creates if needed)
-// Returns the cudaGraphExec_t handle, or NULL on failure
-// Users should call wp_cuda_graph_launch() with the returned exec to launch
-WP_API void* wp_apic_get_cuda_graph_exec(APICGraph graph);
-
-// Query functions
-WP_API int wp_apic_get_num_params(APICGraph graph);
-WP_API const char* wp_apic_get_param_name(APICGraph graph, int index);
-WP_API size_t wp_apic_get_param_size(APICGraph graph, const char* name);
 
 }  // extern "C"
