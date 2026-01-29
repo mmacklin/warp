@@ -4904,13 +4904,40 @@ class Runtime:
             ]
             self.core.wp_apic_register_memory_region.restype = ctypes.c_uint32
 
-            # APIC state save (serializes directly from APICState)
+            # APIC metadata registration
+            self.core.wp_apic_register_module.argtypes = [
+                ctypes.c_void_p,  # state
+                ctypes.c_char_p,  # module_hash
+                ctypes.c_char_p,  # module_name
+                ctypes.c_char_p,  # cubin_filename
+                ctypes.c_int,  # target_arch
+            ]
+            self.core.wp_apic_register_module.restype = None
+
+            self.core.wp_apic_register_kernel.argtypes = [
+                ctypes.c_void_p,  # state
+                ctypes.c_char_p,  # kernel_key
+                ctypes.c_char_p,  # module_hash
+                ctypes.c_char_p,  # forward_name
+                ctypes.c_char_p,  # backward_name
+                ctypes.c_int,  # forward_smem_bytes
+                ctypes.c_int,  # backward_smem_bytes
+                ctypes.c_int,  # block_dim
+            ]
+            self.core.wp_apic_register_kernel.restype = None
+
+            self.core.wp_apic_register_binding.argtypes = [
+                ctypes.c_void_p,  # state
+                ctypes.c_char_p,  # name
+                ctypes.c_uint32,  # region_id
+            ]
+            self.core.wp_apic_register_binding.restype = None
+
+            # APIC state save (serializes from registered metadata)
             self.core.wp_apic_state_save.argtypes = [
                 ctypes.c_void_p,  # state (APICState)
                 ctypes.c_char_p,  # path
                 ctypes.c_uint32,  # target_arch
-                ctypes.c_char_p,  # metadata_json
-                ctypes.c_size_t,  # metadata_len
             ]
             self.core.wp_apic_state_save.restype = ctypes.c_int
 

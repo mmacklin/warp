@@ -272,18 +272,23 @@ static std::mutex g_graph_destroy_mutex;
 // APIC (API Capture) State
 // ============================================================================
 
-// Module info (for metadata)
+// Module info (for metadata serialization)
 struct APICRecordedModule {
     std::string module_hash;
+    std::string module_name;
     std::string cubin_filename;
+    int target_arch;
 };
 
-// Kernel info (for metadata)
+// Kernel info (for metadata serialization)
 struct APICRecordedKernel {
     std::string kernel_key;
     std::string module_hash;
     std::string forward_name;
     std::string backward_name;
+    int forward_smem_bytes;
+    int backward_smem_bytes;
+    int block_dim;
 };
 
 // Memory region info for recording
@@ -313,6 +318,9 @@ struct APICStateInternal {
     // Module and kernel metadata
     std::unordered_map<std::string, APICRecordedModule> modules;
     std::unordered_map<std::string, APICRecordedKernel> kernels;
+
+    // Named parameter bindings (name -> region_id)
+    std::vector<std::pair<std::string, uint32_t>> bindings;
 
     // Helper: append bytes to operation stream
     void append_bytes(const void* data, size_t size)

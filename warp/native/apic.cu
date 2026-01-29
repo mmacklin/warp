@@ -31,6 +31,7 @@ void wp_apic_begin_recording(APICState state)
         state->memory_regions.clear();
         state->modules.clear();
         state->kernels.clear();
+        state->bindings.clear();
         state->next_region_id = 0;
         g_apic_state = state;
     }
@@ -107,6 +108,62 @@ uint32_t wp_apic_register_memory_region(APICState state, uint64_t base_ptr, uint
 
     state->memory_regions[base_ptr] = region;
     return region_id;
+}
+
+void wp_apic_register_module(
+    APICState state, const char* module_hash, const char* module_name, const char* cubin_filename, int target_arch
+)
+{
+    if (!state || !module_hash)
+        return;
+
+    std::string hash_str(module_hash);
+    // Only register if not already present
+    if (state->modules.find(hash_str) == state->modules.end()) {
+        APICRecordedModule mod;
+        mod.module_hash = hash_str;
+        mod.module_name = module_name ? module_name : "";
+        mod.cubin_filename = cubin_filename ? cubin_filename : "";
+        mod.target_arch = target_arch;
+        state->modules[hash_str] = mod;
+    }
+}
+
+void wp_apic_register_kernel(
+    APICState state,
+    const char* kernel_key,
+    const char* module_hash,
+    const char* forward_name,
+    const char* backward_name,
+    int forward_smem_bytes,
+    int backward_smem_bytes,
+    int block_dim
+)
+{
+    if (!state || !kernel_key)
+        return;
+
+    std::string key_str(kernel_key);
+    // Only register if not already present
+    if (state->kernels.find(key_str) == state->kernels.end()) {
+        APICRecordedKernel kern;
+        kern.kernel_key = key_str;
+        kern.module_hash = module_hash ? module_hash : "";
+        kern.forward_name = forward_name ? forward_name : "";
+        kern.backward_name = backward_name ? backward_name : "";
+        kern.forward_smem_bytes = forward_smem_bytes;
+        kern.backward_smem_bytes = backward_smem_bytes;
+        kern.block_dim = block_dim;
+        state->kernels[key_str] = kern;
+    }
+}
+
+void wp_apic_register_binding(APICState state, const char* name, uint32_t region_id)
+{
+    if (!state || !name)
+        return;
+
+    state->bindings.push_back({ std::string(name), region_id });
 }
 
 // =============================================================================
@@ -291,14 +348,76 @@ void apic_record_alloc(APICState state, void* ptr, size_t size)
 // APIC WGF File Writing - Serialize directly from APICStateInternal
 // =============================================================================
 
-int wp_apic_state_save(
-    APICState state, const char* path, uint32_t target_arch, const char* metadata_json, size_t metadata_len
-)
+// Helper: write uint32_t to buffer
+static void apic_write_u32(std::vector<uint8_t>& buf, uint32_t val)
+{
+    size_t off = buf.size();
+    buf.resize(off + 4);
+    memcpy(buf.data() + off, &val, 4);
+}
+
+// Helper: write length-prefixed string to buffer
+static void apic_write_string(std::vector<uint8_t>& buf, const std::string& s)
+{
+    apic_write_u32(buf, static_cast<uint32_t>(s.size()));
+    if (!s.empty()) {
+        size_t off = buf.size();
+        buf.resize(off + s.size());
+        memcpy(buf.data() + off, s.data(), s.size());
+    }
+}
+
+// Build binary metadata section from internal state
+static std::vector<uint8_t> apic_serialize_metadata(APICStateInternal* state, uint32_t target_arch)
+{
+    std::vector<uint8_t> data;
+
+    // Header: version, target_arch, num_modules, num_kernels, num_bindings
+    apic_write_u32(data, APIC_FORMAT_VERSION);
+    apic_write_u32(data, target_arch);
+    apic_write_u32(data, static_cast<uint32_t>(state->modules.size()));
+    apic_write_u32(data, static_cast<uint32_t>(state->kernels.size()));
+    apic_write_u32(data, static_cast<uint32_t>(state->bindings.size()));
+
+    // Modules: hash, name, cubin_filename, target_arch
+    for (const auto& kv : state->modules) {
+        const APICRecordedModule& m = kv.second;
+        apic_write_string(data, m.module_hash);
+        apic_write_string(data, m.module_name);
+        apic_write_string(data, m.cubin_filename);
+        apic_write_u32(data, static_cast<uint32_t>(m.target_arch));
+    }
+
+    // Kernels: key, module_hash, forward_name, backward_name, smem bytes, block_dim
+    for (const auto& kv : state->kernels) {
+        const APICRecordedKernel& k = kv.second;
+        apic_write_string(data, k.kernel_key);
+        apic_write_string(data, k.module_hash);
+        apic_write_string(data, k.forward_name);
+        apic_write_string(data, k.backward_name);
+        apic_write_u32(data, static_cast<uint32_t>(k.forward_smem_bytes));
+        apic_write_u32(data, static_cast<uint32_t>(k.backward_smem_bytes));
+        apic_write_u32(data, static_cast<uint32_t>(k.block_dim));
+    }
+
+    // Bindings: name, region_id
+    for (const auto& b : state->bindings) {
+        apic_write_string(data, b.first);
+        apic_write_u32(data, b.second);
+    }
+
+    return data;
+}
+
+int wp_apic_state_save(APICState state, const char* path, uint32_t target_arch)
 {
     if (!state) {
         fprintf(stderr, "APIC: Null state passed to wp_apic_state_save\n");
         return 0;
     }
+
+    // Build metadata section from internal state
+    std::vector<uint8_t> metadata_section = apic_serialize_metadata(state, target_arch);
 
     // Build memory section from state->memory_regions
     // Write ALL regions (not just ones with data) so we have size info for input/output bindings
@@ -358,7 +477,7 @@ int wp_apic_state_save(
     uint64_t section_table_offset = HEADER_SIZE;
     uint64_t data_offset = section_table_offset + num_sections * SECTION_ENTRY_SIZE;
     uint64_t metadata_offset = data_offset;
-    uint64_t memory_offset = metadata_offset + metadata_len;
+    uint64_t memory_offset = metadata_offset + metadata_section.size();
     uint64_t operations_offset = memory_offset + memory_section.size();
 
     // Write header
@@ -381,7 +500,7 @@ int wp_apic_state_save(
     APICSectionEntry entries[3] = {};
     entries[0].type = APIC_SECTION_METADATA;
     entries[0].offset = metadata_offset;
-    entries[0].size = entries[0].uncompressed_size = static_cast<int64_t>(metadata_len);
+    entries[0].size = entries[0].uncompressed_size = static_cast<int64_t>(metadata_section.size());
     entries[1].type = APIC_SECTION_MEMORY;
     entries[1].offset = memory_offset;
     entries[1].size = entries[1].uncompressed_size = static_cast<int64_t>(memory_section.size());
@@ -395,7 +514,8 @@ int wp_apic_state_save(
     }
 
     // Write section data
-    if (metadata_len > 0 && fwrite(metadata_json, 1, metadata_len, f) != metadata_len) {
+    if (!metadata_section.empty()
+        && fwrite(metadata_section.data(), 1, metadata_section.size(), f) != metadata_section.size()) {
         fclose(f);
         return 0;
     }
@@ -551,319 +671,63 @@ template <typename T> static T apic_read_value(const uint8_t*& ptr)
     return value;
 }
 
-// Parse JSON metadata (simplified parser for our known format)
-// Returns true on success
-static bool apic_parse_metadata(const std::string& json, APICGraphInternal* graph)
+// Helper: read length-prefixed string from buffer
+static std::string apic_read_lp_string(const uint8_t*& ptr)
 {
-    // Use a simple approach: parse key parts we need
-    // In production, would use a proper JSON library
+    uint32_t len = apic_read_value<uint32_t>(ptr);
+    std::string s(reinterpret_cast<const char*>(ptr), len);
+    ptr += len;
+    return s;
+}
 
-    // For now, we'll parse the JSON manually since we control the format
-    // This is a simplified parser that handles our specific JSON structure
+// Parse binary metadata section
+// Format: header (5 x u32) + modules + kernels + bindings
+static bool apic_parse_metadata(const uint8_t* data, size_t size, APICGraphInternal* graph)
+{
+    if (!data || size < 20)  // Minimum header size: 5 x uint32
+        return false;
 
-    auto find_value = [&json](const std::string& key) -> std::string {
-        std::string search = "\"" + key + "\":";
-        size_t pos = json.find(search);
-        if (pos == std::string::npos)
-            return "";
-        pos += search.length();
-        while (pos < json.length() && (json[pos] == ' ' || json[pos] == '\n'))
-            pos++;
-        if (pos >= json.length())
-            return "";
+    const uint8_t* ptr = data;
 
-        if (json[pos] == '"') {
-            // String value
-            pos++;
-            size_t end = json.find('"', pos);
-            if (end == std::string::npos)
-                return "";
-            return json.substr(pos, end - pos);
-        } else if (json[pos] == '{' || json[pos] == '[') {
-            // Object or array - find matching brace
-            char open = json[pos];
-            char close = (open == '{') ? '}' : ']';
-            int depth = 1;
-            size_t start = pos;
-            pos++;
-            while (pos < json.length() && depth > 0) {
-                if (json[pos] == open)
-                    depth++;
-                else if (json[pos] == close)
-                    depth--;
-                pos++;
-            }
-            return json.substr(start, pos - start);
-        } else {
-            // Number or other value
-            size_t end = pos;
-            while (end < json.length() && json[end] != ',' && json[end] != '}' && json[end] != '\n')
-                end++;
-            std::string val = json.substr(pos, end - pos);
-            // Trim whitespace
-            while (!val.empty() && (val.back() == ' ' || val.back() == '\t'))
-                val.pop_back();
-            return val;
-        }
-    };
+    // Read header
+    uint32_t version = apic_read_value<uint32_t>(ptr);
+    (void)version;  // Could validate version here
+    graph->target_arch = apic_read_value<uint32_t>(ptr);
+    uint32_t num_modules = apic_read_value<uint32_t>(ptr);
+    uint32_t num_kernels = apic_read_value<uint32_t>(ptr);
+    uint32_t num_bindings = apic_read_value<uint32_t>(ptr);
 
-    auto find_int = [&find_value](const std::string& key) -> int {
-        std::string val = find_value(key);
-        return val.empty() ? 0 : std::stoi(val);
-    };
-
-    // Parse target_arch
-    graph->target_arch = find_int("target_arch");
-
-    // Parse modules
-    std::string modules_json = find_value("modules");
-    if (!modules_json.empty() && modules_json[0] == '{') {
-        // Parse each module entry
-        size_t pos = 1;
-        while (pos < modules_json.length()) {
-            // Find module hash (key)
-            size_t key_start = modules_json.find('"', pos);
-            if (key_start == std::string::npos)
-                break;
-            key_start++;
-            size_t key_end = modules_json.find('"', key_start);
-            if (key_end == std::string::npos)
-                break;
-            std::string module_hash = modules_json.substr(key_start, key_end - key_start);
-
-            // Find the module object
-            size_t obj_start = modules_json.find('{', key_end);
-            if (obj_start == std::string::npos)
-                break;
-            int depth = 1;
-            size_t obj_end = obj_start + 1;
-            while (obj_end < modules_json.length() && depth > 0) {
-                if (modules_json[obj_end] == '{')
-                    depth++;
-                else if (modules_json[obj_end] == '}')
-                    depth--;
-                obj_end++;
-            }
-            std::string module_obj = modules_json.substr(obj_start, obj_end - obj_start);
-
-            APICLoadedModule mod;
-            mod.module_hash = module_hash;
-
-            // Parse module fields
-            auto find_in_obj = [&module_obj](const std::string& key) -> std::string {
-                std::string search = "\"" + key + "\":";
-                size_t p = module_obj.find(search);
-                if (p == std::string::npos)
-                    return "";
-                p += search.length();
-                while (p < module_obj.length() && (module_obj[p] == ' ' || module_obj[p] == '\n'))
-                    p++;
-                if (module_obj[p] == '"') {
-                    p++;
-                    size_t e = module_obj.find('"', p);
-                    return module_obj.substr(p, e - p);
-                } else {
-                    size_t e = p;
-                    while (e < module_obj.length() && module_obj[e] != ',' && module_obj[e] != '}')
-                        e++;
-                    std::string v = module_obj.substr(p, e - p);
-                    while (!v.empty() && (v.back() == ' ' || v.back() == '\t'))
-                        v.pop_back();
-                    return v;
-                }
-            };
-
-            mod.module_name = find_in_obj("name");
-            mod.cubin_filename = find_in_obj("cubin_filename");
-            std::string arch_str = find_in_obj("target_arch");
-            mod.target_arch = arch_str.empty() ? 0 : std::stoi(arch_str);
-            mod.cuda_module = nullptr;
-
-            graph->modules[module_hash] = mod;
-
-            pos = obj_end;
-        }
+    // Read modules
+    for (uint32_t i = 0; i < num_modules; i++) {
+        APICLoadedModule mod;
+        mod.module_hash = apic_read_lp_string(ptr);
+        mod.module_name = apic_read_lp_string(ptr);
+        mod.cubin_filename = apic_read_lp_string(ptr);
+        mod.target_arch = apic_read_value<uint32_t>(ptr);
+        mod.cuda_module = nullptr;
+        graph->modules[mod.module_hash] = mod;
     }
 
-    // Parse kernels
-    std::string kernels_json = find_value("kernels");
-    if (!kernels_json.empty() && kernels_json[0] == '{') {
-        size_t pos = 1;
-        while (pos < kernels_json.length()) {
-            size_t key_start = kernels_json.find('"', pos);
-            if (key_start == std::string::npos)
-                break;
-            key_start++;
-            size_t key_end = kernels_json.find('"', key_start);
-            if (key_end == std::string::npos)
-                break;
-            std::string kernel_key = kernels_json.substr(key_start, key_end - key_start);
-
-            size_t obj_start = kernels_json.find('{', key_end);
-            if (obj_start == std::string::npos)
-                break;
-            int depth = 1;
-            size_t obj_end = obj_start + 1;
-            while (obj_end < kernels_json.length() && depth > 0) {
-                if (kernels_json[obj_end] == '{')
-                    depth++;
-                else if (kernels_json[obj_end] == '}')
-                    depth--;
-                obj_end++;
-            }
-            std::string kernel_obj = kernels_json.substr(obj_start, obj_end - obj_start);
-
-            APICKernelInfo info;
-            info.kernel_key = kernel_key;
-
-            auto find_in_obj = [&kernel_obj](const std::string& key) -> std::string {
-                std::string search = "\"" + key + "\":";
-                size_t p = kernel_obj.find(search);
-                if (p == std::string::npos)
-                    return "";
-                p += search.length();
-                while (p < kernel_obj.length() && (kernel_obj[p] == ' ' || kernel_obj[p] == '\n'))
-                    p++;
-                if (kernel_obj[p] == '"') {
-                    p++;
-                    size_t e = kernel_obj.find('"', p);
-                    return kernel_obj.substr(p, e - p);
-                } else if (kernel_obj.substr(p, 4) == "null") {
-                    return "";
-                } else {
-                    size_t e = p;
-                    while (e < kernel_obj.length() && kernel_obj[e] != ',' && kernel_obj[e] != '}')
-                        e++;
-                    std::string v = kernel_obj.substr(p, e - p);
-                    while (!v.empty() && (v.back() == ' ' || v.back() == '\t'))
-                        v.pop_back();
-                    return v;
-                }
-            };
-
-            info.module_hash = find_in_obj("module_hash");
-            info.forward_name = find_in_obj("forward_name");
-            info.backward_name = find_in_obj("backward_name");
-            std::string smem_str = find_in_obj("forward_smem_bytes");
-            info.forward_smem_bytes = smem_str.empty() ? 0 : std::stoi(smem_str);
-            smem_str = find_in_obj("backward_smem_bytes");
-            info.backward_smem_bytes = smem_str.empty() ? 0 : std::stoi(smem_str);
-            std::string block_str = find_in_obj("block_dim");
-            info.block_dim = block_str.empty() ? 256 : std::stoi(block_str);
-
-            graph->kernels[kernel_key] = info;
-
-            pos = obj_end;
-        }
+    // Read kernels
+    for (uint32_t i = 0; i < num_kernels; i++) {
+        APICKernelInfo info;
+        info.kernel_key = apic_read_lp_string(ptr);
+        info.module_hash = apic_read_lp_string(ptr);
+        info.forward_name = apic_read_lp_string(ptr);
+        info.backward_name = apic_read_lp_string(ptr);
+        info.forward_smem_bytes = apic_read_value<uint32_t>(ptr);
+        info.backward_smem_bytes = apic_read_value<uint32_t>(ptr);
+        info.block_dim = apic_read_value<uint32_t>(ptr);
+        graph->kernels[info.kernel_key] = info;
     }
 
-    // Parse memory_regions
-    std::string regions_json = find_value("memory_regions");
-    if (!regions_json.empty() && regions_json[0] == '{') {
-        size_t pos = 1;
-        while (pos < regions_json.length()) {
-            size_t key_start = regions_json.find('"', pos);
-            if (key_start == std::string::npos)
-                break;
-            key_start++;
-            size_t key_end = regions_json.find('"', key_start);
-            if (key_end == std::string::npos)
-                break;
-            std::string region_id_str = regions_json.substr(key_start, key_end - key_start);
-            uint32_t region_id = std::stoul(region_id_str);
-
-            size_t obj_start = regions_json.find('{', key_end);
-            if (obj_start == std::string::npos)
-                break;
-            int depth = 1;
-            size_t obj_end = obj_start + 1;
-            while (obj_end < regions_json.length() && depth > 0) {
-                if (regions_json[obj_end] == '{')
-                    depth++;
-                else if (regions_json[obj_end] == '}')
-                    depth--;
-                obj_end++;
-            }
-            std::string region_obj = regions_json.substr(obj_start, obj_end - obj_start);
-
-            APICLoadedRegion region;
-            region.region_id = region_id;
-            region.ptr = nullptr;
-
-            auto find_in_obj = [&region_obj](const std::string& key) -> std::string {
-                std::string search = "\"" + key + "\":";
-                size_t p = region_obj.find(search);
-                if (p == std::string::npos)
-                    return "";
-                p += search.length();
-                while (p < region_obj.length() && (region_obj[p] == ' ' || region_obj[p] == '\n'))
-                    p++;
-                if (region_obj[p] == '"') {
-                    p++;
-                    size_t e = region_obj.find('"', p);
-                    return region_obj.substr(p, e - p);
-                } else {
-                    size_t e = p;
-                    while (e < region_obj.length() && region_obj[e] != ',' && region_obj[e] != '}')
-                        e++;
-                    std::string v = region_obj.substr(p, e - p);
-                    while (!v.empty() && (v.back() == ' ' || v.back() == '\t'))
-                        v.pop_back();
-                    return v;
-                }
-            };
-
-            std::string size_str = find_in_obj("size");
-            region.size = size_str.empty() ? 0 : std::stoull(size_str);
-            std::string elem_str = find_in_obj("element_size");
-            region.element_size = elem_str.empty() ? 0 : std::stoul(elem_str);
-
-            graph->regions[region_id] = region;
-
-            pos = obj_end;
-        }
+    // Read bindings
+    for (uint32_t i = 0; i < num_bindings; i++) {
+        std::string name = apic_read_lp_string(ptr);
+        uint32_t region_id = apic_read_value<uint32_t>(ptr);
+        graph->params[name] = region_id;
+        graph->param_names.push_back(name);
     }
-
-    // Helper lambda to parse a bindings object and add to params
-    auto parse_bindings = [&](const std::string& key) {
-        std::string bindings_json = find_value(key);
-        if (!bindings_json.empty() && bindings_json[0] == '{') {
-            size_t pos = 1;
-            while (pos < bindings_json.length()) {
-                size_t key_start = bindings_json.find('"', pos);
-                if (key_start == std::string::npos)
-                    break;
-                key_start++;
-                size_t key_end = bindings_json.find('"', key_start);
-                if (key_end == std::string::npos)
-                    break;
-                std::string name = bindings_json.substr(key_start, key_end - key_start);
-
-                size_t val_start = bindings_json.find(':', key_end);
-                if (val_start == std::string::npos)
-                    break;
-                val_start++;
-                while (val_start < bindings_json.length() && bindings_json[val_start] == ' ')
-                    val_start++;
-                size_t val_end = val_start;
-                while (val_end < bindings_json.length() && bindings_json[val_end] != ','
-                       && bindings_json[val_end] != '}')
-                    val_end++;
-                std::string val_str = bindings_json.substr(val_start, val_end - val_start);
-                while (!val_str.empty() && (val_str.back() == ' ' || val_str.back() == '\t'))
-                    val_str.pop_back();
-                uint32_t region_id = std::stoul(val_str);
-
-                graph->params[name] = region_id;
-                graph->param_names.push_back(name);
-
-                pos = val_end;
-            }
-        }
-    };
-
-    // Parse bindings into params map
-    parse_bindings("bindings");
 
     return true;
 }
@@ -1297,10 +1161,9 @@ APICGraph wp_apic_load_graph(void* context, const char* path)
         }
     }
 
-    // Parse metadata
+    // Parse metadata (binary format)
     if (metadata_ptr && metadata_size > 0) {
-        std::string metadata_json(reinterpret_cast<const char*>(metadata_ptr), metadata_size);
-        if (!apic_parse_metadata(metadata_json, graph)) {
+        if (!apic_parse_metadata(metadata_ptr, metadata_size, graph)) {
             wp::set_error_string("Failed to parse metadata");
             delete graph;
             return nullptr;

@@ -686,12 +686,28 @@ WP_API uint32_t wp_apic_get_kernel_count(APICState state);
 WP_API uint32_t
 wp_apic_register_memory_region(APICState state, uint64_t base_ptr, uint64_t size, uint32_t element_size);
 
-// Save APIC state to a WGF file
-// Serializes directly from the APICState - Python just passes metadata JSON
-// Returns 1 on success, 0 on failure
-WP_API int wp_apic_state_save(
-    APICState state, const char* path, uint32_t target_arch, const char* metadata_json, size_t metadata_len
+// Metadata Registration - call these before wp_apic_state_save()
+WP_API void wp_apic_register_module(
+    APICState state, const char* module_hash, const char* module_name, const char* cubin_filename, int target_arch
 );
+
+WP_API void wp_apic_register_kernel(
+    APICState state,
+    const char* kernel_key,
+    const char* module_hash,
+    const char* forward_name,
+    const char* backward_name,  // can be NULL or empty string
+    int forward_smem_bytes,
+    int backward_smem_bytes,
+    int block_dim
+);
+
+WP_API void wp_apic_register_binding(APICState state, const char* name, uint32_t region_id);
+
+// Save APIC state to a WGF file
+// Serializes metadata from registered modules/kernels/bindings
+// Returns 1 on success, 0 on failure
+WP_API int wp_apic_state_save(APICState state, const char* path, uint32_t target_arch);
 
 // =============================================================================
 // APIC Graph Loading - Load and execute serialized graphs from .wgf files

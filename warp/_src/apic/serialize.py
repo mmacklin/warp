@@ -9,17 +9,13 @@
 Serialization of captured CUDA graphs to WGF format.
 
 All recording and serialization is done in C++ (apic.cu/warp.cu).
-Python just builds metadata JSON and calls wp_apic_state_save().
+Python registers modules/kernels/bindings via C API, then calls wp_apic_state_save().
 """
 
-import json
 import os
 from pathlib import Path
 
 from .capture import APICapture, ModuleInfo
-
-# Constants from apic_types.h
-APIC_FORMAT_VERSION = 2
 
 
 def save_graph(capture: APICapture, path: str):
@@ -51,18 +47,44 @@ def save_graph(capture: APICapture, path: str):
         cubin_path = modules_dir / module_info.cubin_filename
         _export_module_cubin(module_info, cubin_path)
 
-    # Build metadata JSON
-    metadata = _build_metadata(capture)
-    metadata_json = json.dumps(metadata, indent=2).encode("utf-8")
-
-    # Call native to save the graph (serializes from native state)
     runtime = warp._src.context.runtime
+
+    # Register modules with native code
+    for module_hash, module_info in capture.modules.items():
+        runtime.core.wp_apic_register_module(
+            capture.native_state,
+            module_hash.encode("utf-8"),
+            module_info.module_name.encode("utf-8"),
+            module_info.cubin_filename.encode("utf-8"),
+            module_info.target_arch,
+        )
+
+    # Register kernels with native code
+    for kernel_key, kernel_info in capture.kernels.items():
+        runtime.core.wp_apic_register_kernel(
+            capture.native_state,
+            kernel_key.encode("utf-8"),
+            kernel_info.module_hash.encode("utf-8"),
+            kernel_info.forward_name.encode("utf-8"),
+            (kernel_info.backward_name or "").encode("utf-8"),
+            kernel_info.forward_smem_bytes,
+            kernel_info.backward_smem_bytes,
+            kernel_info.block_dim,
+        )
+
+    # Register bindings with native code
+    for name, region_id in capture.bindings.items():
+        runtime.core.wp_apic_register_binding(
+            capture.native_state,
+            name.encode("utf-8"),
+            region_id,
+        )
+
+    # Save the graph (C++ serializes metadata from registered info)
     result = runtime.core.wp_apic_state_save(
         capture.native_state,
         str(wgf_path).encode("utf-8"),
         capture.device.arch,
-        metadata_json,
-        len(metadata_json),
     )
 
     if not result:
@@ -106,30 +128,3 @@ def _export_module_cubin(module_info: ModuleInfo, cubin_path: Path):
                         return
 
     raise ValueError(f"Could not find cubin for module {module_info.module_name} ({module_info.module_hash})")
-
-
-def _build_metadata(capture: APICapture) -> dict:
-    """Build the metadata dictionary."""
-    modules = {
-        h: {"name": i.module_name, "cubin_filename": i.cubin_filename, "target_arch": i.target_arch}
-        for h, i in capture.modules.items()
-    }
-    kernels = {
-        k: {
-            "module_hash": i.module_hash,
-            "forward_name": i.forward_name,
-            "backward_name": i.backward_name,
-            "forward_smem_bytes": i.forward_smem_bytes,
-            "backward_smem_bytes": i.backward_smem_bytes,
-            "block_dim": i.block_dim,
-        }
-        for k, i in capture.kernels.items()
-    }
-
-    return {
-        "version": APIC_FORMAT_VERSION,
-        "target_arch": capture.device.arch,
-        "modules": modules,
-        "kernels": kernels,
-        "bindings": dict(capture.bindings),
-    }
