@@ -1,9 +1,9 @@
 # APIC (API Capture) Design Document
 ## CUDA Graph Capture, Serialization, and Replay for Warp
 
-### Version: 1.4
+### Version: 1.5
 ### Date: January 2026
-### Status: Implemented (Phases 1-3 Python, Phase 4 C++ Native Loading)
+### Status: Implemented (Phases 1-4 Complete)
 
 ---
 
@@ -491,7 +491,7 @@ output_dir/
 +-------------------+
 | Section Table     |
 +-------------------+
-| Metadata Section  |  (JSON: kernel info, bindings)
+| Metadata Section  |  (Binary: modules, kernels, bindings)
 +-------------------+
 | Memory Section    |  (inline or references to external files)
 +-------------------+
@@ -525,9 +525,62 @@ struct SectionEntry {
 
 | Type | ID | Description |
 |------|-----|-------------|
-| METADATA | 0x01 | JSON metadata (kernel refs, bindings, array info) |
+| METADATA | 0x01 | Binary metadata (modules, kernels, bindings) |
 | MEMORY | 0x02 | Initial memory contents (or external file refs) |
 | OPERATIONS | 0x03 | Serialized operation sequence |
+
+**Metadata Section Format (Binary, Version 3):**
+
+The metadata section uses a compact binary format with length-prefixed strings:
+
+```c
+// Metadata header
+struct MetadataHeader {
+    uint32_t version;           // Format version (3)
+    uint32_t target_arch;       // CUDA SM version
+    uint32_t num_modules;
+    uint32_t num_kernels;
+    uint32_t num_bindings;
+};
+
+// Module entry (repeated num_modules times)
+struct ModuleEntry {
+    uint32_t module_hash_len;   // String length
+    char module_hash[];         // Module hash string
+    uint32_t module_name_len;
+    char module_name[];
+    uint32_t cubin_filename_len;
+    char cubin_filename[];
+    uint32_t target_arch;
+};
+
+// Kernel entry (repeated num_kernels times)
+struct KernelEntry {
+    uint32_t kernel_key_len;
+    char kernel_key[];
+    uint32_t module_hash_len;
+    char module_hash[];         // References ModuleEntry
+    uint32_t forward_name_len;
+    char forward_name[];
+    uint32_t backward_name_len; // 0 if no backward kernel
+    char backward_name[];
+    uint32_t forward_smem_bytes;
+    uint32_t backward_smem_bytes;
+    uint32_t block_dim;
+};
+
+// Binding entry (repeated num_bindings times)
+struct BindingEntry {
+    uint32_t name_len;
+    char name[];
+    uint32_t region_id;
+};
+```
+
+This binary format replaced the previous JSON-based metadata in version 3, providing:
+- ~200 fewer lines of parsing code
+- Type-safe C API for registration
+- No JSON dependency in C++ code
 
 **Operations Encoding:**
 
@@ -1098,38 +1151,88 @@ def __del__(self):
         self._native_graph = None
 ```
 
-### 5.4 C++ Native Loading API
+### 5.4 C++ Native API
 
-The C++ APIC loading API enables loading and executing serialized graphs without Python. This is essential for embedded devices and native C++ applications.
+The C++ APIC API enables both recording/saving and loading/executing serialized graphs without Python. All APIC declarations are consolidated in `apic.h`.
 
-**C++ API (warp/native/warp.h):**
+**C++ API (warp/native/apic.h):**
 
 ```cpp
+// =============================================================================
+// Recording API - Called during graph capture
+// =============================================================================
+
+// Opaque handle to APIC state (used during capture)
+typedef struct APICStateInternal* APICState;
+
+// State management
+WP_API APICState wp_apic_create_state();
+WP_API void wp_apic_destroy_state(APICState state);
+
+// Recording control
+WP_API void wp_apic_begin_recording(APICState state);
+WP_API void wp_apic_end_recording(APICState state);
+
+// Metadata registration - call these before wp_apic_state_save()
+WP_API void wp_apic_register_module(
+    APICState state,
+    const char* module_hash,
+    const char* module_name,
+    const char* cubin_filename,
+    int target_arch);
+
+WP_API void wp_apic_register_kernel(
+    APICState state,
+    const char* kernel_key,
+    const char* module_hash,
+    const char* forward_name,
+    const char* backward_name,  // can be NULL
+    int forward_smem_bytes,
+    int backward_smem_bytes,
+    int block_dim);
+
+WP_API void wp_apic_register_binding(
+    APICState state,
+    const char* name,
+    uint32_t region_id);
+
+// Save state to .wgf file (serializes registered metadata to binary format)
+WP_API int wp_apic_state_save(APICState state, const char* path, uint32_t target_arch);
+
+// =============================================================================
+// Loading API - Load and execute serialized graphs
+// =============================================================================
+
 // Opaque handle for a loaded APIC graph
-typedef void* wp_apic_graph_t;
+typedef struct APICGraphInternal* APICGraph;
 
 // Load a graph from a .wgf file
 // Returns: Graph handle on success, nullptr on failure
-WP_API wp_apic_graph_t wp_apic_load_graph(void* context, const char* path);
+WP_API APICGraph wp_apic_load_graph(void* context, const char* path);
 
 // Destroy a loaded graph and free all associated resources
-WP_API void wp_apic_destroy_graph(wp_apic_graph_t graph);
+WP_API void wp_apic_destroy_graph(APICGraph graph);
 
 // Set parameter data by copying to the pre-allocated memory region
 // No graph rebuild is needed - data is copied directly via memcpy
 // Returns: 1 on success, 0 on failure
-WP_API int wp_apic_set_param(wp_apic_graph_t graph, const char* name,
+WP_API int wp_apic_set_param(APICGraph graph, const char* name,
                               const void* data, size_t size);
 
 // Get the device pointer for a parameter's pre-allocated region
 // Returns: Device pointer or nullptr if not found
-WP_API void* wp_apic_get_param_ptr(wp_apic_graph_t graph, const char* name);
+WP_API void* wp_apic_get_param_ptr(APICGraph graph, const char* name);
 
 // Get the CUDA graph (builds on first access)
-WP_API void* wp_apic_get_cuda_graph(wp_apic_graph_t graph);
+WP_API void* wp_apic_get_cuda_graph(APICGraph graph);
 
 // Get the instantiated CUDA graph exec
-WP_API void* wp_apic_get_cuda_graph_exec(wp_apic_graph_t graph);
+WP_API void* wp_apic_get_cuda_graph_exec(APICGraph graph);
+
+// Query functions
+WP_API int wp_apic_get_num_params(APICGraph graph);
+WP_API const char* wp_apic_get_param_name(APICGraph graph, int index);
+WP_API size_t wp_apic_get_param_size(APICGraph graph, const char* name);
 ```
 
 **Python ctypes Bindings (warp/_src/context.py):**
@@ -1181,38 +1284,37 @@ def load_native(cls, path: str, device: Device = None) -> "Graph":
     return graph
 ```
 
-**C++ Implementation Details (warp/native/warp.cu):**
+**C++ Implementation Details (warp/native/apic.cu):**
 
-The C++ implementation uses a `LoadedApicGraph` structure that mirrors the Python Graph class:
+The C++ implementation uses an `APICGraphInternal` structure:
 
 ```cpp
-struct LoadedApicGraph {
+struct APICGraphInternal {
     void* context;                        // CUDA context
     void* stream;                         // CUDA stream for execution
     void* graph;                          // cudaGraph_t
     void* graph_exec;                     // cudaGraphExec_t
-    bool needs_rebuild;                   // True if bindings changed
 
     // Module management
     std::map<std::string, void*> modules; // module_hash -> CUmodule
 
-    // Memory regions
-    std::map<int, MemoryRegion> regions;  // region_id -> {ptr, size, external}
+    // Memory regions (pre-allocated, fixed addresses)
+    std::map<int, MemoryRegion> regions;  // region_id -> {ptr, size}
 
     // Kernel cache
     std::map<std::pair<std::string, std::string>, void*> kernel_cache;
 
-    // Binding maps
-    std::map<std::string, int> input_bindings;   // name -> region_id
-    std::map<std::string, int> output_bindings;  // name -> region_id
+    // Binding maps (name -> region_id)
+    std::map<std::string, int> bindings;
 
     // Operations for replay
     std::vector<LaunchRecord> launches;
     std::vector<MemoryOp> memory_ops;
-    std::vector<std::pair<std::string, int>> operations;  // ("launch"|"memop", idx)
+    std::vector<std::pair<int, int>> operations;  // (op_type, idx)
 
-    // Parsed metadata
-    json metadata;
+    // Parsed metadata (binary format, no JSON)
+    std::vector<APICModuleInfo> module_infos;
+    std::vector<APICKernelInfo> kernel_infos;
 };
 ```
 
@@ -1355,13 +1457,16 @@ warp/_src/apic/
     format.py             # WGFReader, WGFWriter for .wgf file handling
 ```
 
-**C++ Native Loading (Phase 4):**
+**C++ Native API (Phase 4):**
 
 ```
-warp/native/warp.h           # Added C++ APIC API declarations
-warp/native/warp.cu          # Added LoadedApicGraph struct and implementation
-warp/_src/context.py         # Added ctypes bindings and Graph.load_native()
-warp/tests/cuda/test_apic.py # Added test_apic_native_loading test
+warp/native/apic.h           # All APIC API declarations (public C API + internal C++)
+warp/native/apic_types.h     # POD structs for binary serialization
+warp/native/apic.cu          # APIC implementation (recording, serialization, loading)
+warp/native/warp.h           # Includes apic.h for backward compatibility
+warp/native/warp.cu          # APICStateInternal struct, recording hooks
+warp/_src/context.py         # ctypes bindings, Graph.load_native()
+warp/tests/cuda/test_apic.py # Comprehensive test suite (18 tests)
 ```
 
 **Not implemented (deferred):**
@@ -1508,54 +1613,44 @@ my_graph_modules/
     rendering_def67890.cubin     # Module "rendering" with hash def67890
 ```
 
-**Metadata in .wgf:**
-```json
-{
-  "modules": [
-    {
-      "module_name": "simulation",
-      "module_hash": "abc12345",
-      "cubin_file": "simulation_abc12345.cubin",
-      "target_arch": 86
-    },
-    {
-      "module_name": "rendering",
-      "module_hash": "def67890",
-      "cubin_file": "rendering_def67890.cubin",
-      "target_arch": 86
-    }
-  ],
-  "kernels": [
-    {
-      "key": "simulation.integrate",
-      "module_hash": "abc12345",
-      "forward_name": "simulation_integrate_abc12345_cuda_kernel_forward",
-      "backward_name": "simulation_integrate_abc12345_cuda_kernel_backward",
-      "forward_smem_bytes": 0,
-      "backward_smem_bytes": 0,
-      "block_dim": 256
-    },
-    {
-      "key": "simulation.collide",
-      "module_hash": "abc12345",
-      "forward_name": "simulation_collide_abc12345_cuda_kernel_forward",
-      "backward_name": null,
-      "forward_smem_bytes": 1024,
-      "backward_smem_bytes": 0,
-      "block_dim": 128
-    },
-    {
-      "key": "rendering.shade",
-      "module_hash": "def67890",
-      "forward_name": "rendering_shade_def67890_cuda_kernel_forward",
-      "backward_name": null,
-      "forward_smem_bytes": 0,
-      "backward_smem_bytes": 0,
-      "block_dim": 256
-    }
-  ]
-}
+**Metadata Registration (Python → C++):**
+
+Python registers metadata via C API calls before saving:
+
+```python
+# Register modules
+for module_hash, info in capture.modules.items():
+    runtime.core.wp_apic_register_module(
+        capture.native_state,
+        module_hash.encode('utf-8'),
+        info.module_name.encode('utf-8'),
+        info.cubin_filename.encode('utf-8'),
+        info.target_arch)
+
+# Register kernels
+for kernel_key, info in capture.kernels.items():
+    runtime.core.wp_apic_register_kernel(
+        capture.native_state,
+        kernel_key.encode('utf-8'),
+        info.module_hash.encode('utf-8'),
+        info.forward_name.encode('utf-8'),
+        (info.backward_name or "").encode('utf-8'),
+        info.forward_smem_bytes,
+        info.backward_smem_bytes,
+        info.block_dim)
+
+# Register bindings
+for name, region_id in capture.bindings.items():
+    runtime.core.wp_apic_register_binding(
+        capture.native_state,
+        name.encode('utf-8'),
+        region_id)
+
+# Save (C++ serializes to binary format internally)
+runtime.core.wp_apic_state_save(capture.native_state, path, target_arch)
 ```
+
+The C++ side stores registered data and serializes it to binary format. This replaces the previous JSON-based approach, eliminating ~300 lines of JSON parsing code.
 
 ### 9.2 Architecture Compatibility
 
