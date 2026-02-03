@@ -271,82 +271,7 @@ static std::mutex g_graph_destroy_mutex;
 // ============================================================================
 // APIC (API Capture) State
 // ============================================================================
-
-// Module info (for metadata serialization)
-struct APICRecordedModule {
-    std::string module_hash;
-    std::string module_name;
-    std::string cubin_filename;
-    int target_arch;
-};
-
-// Kernel info (for metadata serialization)
-struct APICRecordedKernel {
-    std::string kernel_key;
-    std::string module_hash;
-    std::string forward_name;
-    std::string backward_name;
-    int forward_smem_bytes;
-    int backward_smem_bytes;
-    int block_dim;
-};
-
-// Memory region info for recording
-struct APICRecordedRegion {
-    uint32_t region_id;
-    uint64_t base_ptr;
-    uint64_t size;
-    uint32_t element_size;
-    std::vector<uint8_t> initial_data;  // For internal regions
-};
-
-// Internal APIC state structure
-// Operations are stored in a single contiguous byte stream for efficient
-// serialization and to maintain operation order without a separate index.
-struct APICStateInternal {
-    bool recording = false;
-
-    // Contiguous operation stream - operations are serialized directly here
-    // Each operation has an APICOpHeader at the start with op_type and total_size
-    std::vector<uint8_t> operation_stream;
-    uint32_t operation_count = 0;  // Number of operations in stream
-
-    // Memory regions (keyed by base pointer for lookup)
-    std::unordered_map<uint64_t, APICRecordedRegion> memory_regions;
-    uint32_t next_region_id = 0;
-
-    // Module and kernel metadata
-    std::unordered_map<std::string, APICRecordedModule> modules;
-    std::unordered_map<std::string, APICRecordedKernel> kernels;
-
-    // Named parameter bindings (name -> region_id)
-    std::vector<std::pair<std::string, uint32_t>> bindings;
-
-    // Helper: append bytes to operation stream
-    void append_bytes(const void* data, size_t size)
-    {
-        size_t offset = operation_stream.size();
-        operation_stream.resize(offset + size);
-        memcpy(operation_stream.data() + offset, data, size);
-    }
-
-    // Helper: find region containing a pointer
-    bool find_region(uint64_t ptr, int32_t& region_id, uint64_t& offset) const
-    {
-        for (const auto& kv : memory_regions) {
-            const APICRecordedRegion& r = kv.second;
-            if (ptr >= r.base_ptr && ptr < r.base_ptr + r.size) {
-                region_id = r.region_id;
-                offset = ptr - r.base_ptr;
-                return true;
-            }
-        }
-        return false;
-    }
-};
-
-// Thread-local APIC state (set during recording)
-static thread_local APICState g_apic_state = nullptr;
+// APIC struct definitions and g_apic_state are in apic.cu
 
 
 void wp_cuda_set_context_restore_policy(bool always_restore) { ContextGuard::always_restore = always_restore; }
@@ -866,7 +791,7 @@ void* wp_alloc_device_async(void* context, size_t s)
             }
 
             // APIC hook: record allocation for internal arrays
-            if (g_apic_state && g_apic_state->recording) {
+            if (apic_is_recording(g_apic_state)) {
                 apic_record_alloc(g_apic_state, ptr, s);
             }
         }
@@ -963,7 +888,7 @@ bool wp_memcpy_h2d(void* context, void* dest, void* src, size_t n, void* stream)
     ContextGuard guard(context);
 
     // APIC hook
-    if (g_apic_state && g_apic_state->recording) {
+    if (apic_is_recording(g_apic_state)) {
         apic_record_memcpy(g_apic_state, dest, src, n, APIC_OP_MEMCPY_H2D);
     }
 
@@ -1006,7 +931,7 @@ bool wp_memcpy_d2d(void* context, void* dest, void* src, size_t n, void* stream)
     ContextGuard guard(context);
 
     // APIC hook
-    if (g_apic_state && g_apic_state->recording) {
+    if (apic_is_recording(g_apic_state)) {
         apic_record_memcpy(g_apic_state, dest, src, n, APIC_OP_MEMCPY_D2D);
     }
 
@@ -1175,7 +1100,7 @@ void wp_memset_device(void* context, void* dest, int value, size_t n)
     ContextGuard guard(context);
 
     // APIC hook
-    if (g_apic_state && g_apic_state->recording) {
+    if (apic_is_recording(g_apic_state)) {
         apic_record_memset(g_apic_state, dest, value, n);
     }
 
@@ -4617,7 +4542,7 @@ size_t wp_cuda_launch_kernel(
     ContextGuard guard(context);
 
     // APIC hook: record kernel launch with full parameter info if provided
-    if (g_apic_state && g_apic_state->recording && apic_info) {
+    if (apic_is_recording(g_apic_state) && apic_info) {
         // Extract shape/ndim from args[0] which is always launch_bounds_t
         const apic_launch_bounds_t* bounds = reinterpret_cast<const apic_launch_bounds_t*>(args[0]);
         apic_record_kernel_launch(

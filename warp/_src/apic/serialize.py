@@ -9,7 +9,7 @@
 Serialization of captured CUDA graphs to WGF format.
 
 All recording and serialization is done in C++ (apic.cu/warp.cu).
-Python registers modules/kernels/bindings via C API, then calls wp_apic_state_save().
+Python registers modules/kernels/params via C API, then calls wp_apic_state_save().
 """
 
 import os

@@ -9,9 +9,111 @@
 // This file is included at the end of warp.cu
 // It contains all APIC (API Capture) implementation code
 
+#include "mesh.h"  // For wp::Mesh struct
+
+// ============================================================================
+// APIC Internal Structures
+// ============================================================================
+
+// Module info (used for both recording and loaded state)
+struct APICModule {
+    std::string module_hash;
+    std::string module_name;
+    std::string cubin_filename;
+    int target_arch;
+    CUmodule cuda_module = nullptr;  // Set after loading
+};
+
+// Kernel info (used for both recording and loaded state)
+struct APICKernel {
+    std::string kernel_key;
+    std::string module_hash;
+    std::string forward_name;
+    std::string backward_name;
+    int forward_smem_bytes;
+    int backward_smem_bytes;
+    int block_dim;
+};
+
+// Memory region info (used for both recording and loaded state)
+struct APICRegion {
+    uint32_t region_id;
+    uint64_t base_ptr;  // Original device pointer during recording
+    uint64_t size;
+    uint32_t element_size;
+    std::vector<uint8_t> initial_data;  // For internal regions during recording
+    void* ptr = nullptr;  // Allocated device pointer after loading
+};
+
+// Handle pointer location in a memory region (for fixup during replay)
+struct APICPtrLocation {
+    uint32_t region_id;
+    uint64_t offset;
+    uint64_t stride;  // 0 = single pointer
+};
+
+// Internal APIC state structure
+// Operations are stored in a single contiguous byte stream for efficient
+// serialization and to maintain operation order without a separate index.
+struct APICStateInternal {
+    bool recording = false;
+
+    // Contiguous operation stream - operations are serialized directly here
+    // Each operation has an APICOpHeader at the start with op_type and total_size
+    std::vector<uint8_t> operation_stream;
+    uint32_t operation_count = 0;  // Number of operations in stream
+
+    // Memory regions (keyed by base pointer for lookup)
+    std::unordered_map<uint64_t, APICRegion> memory_regions;
+    uint32_t next_region_id = 0;
+
+    // Module and kernel metadata
+    std::unordered_map<std::string, APICModule> modules;
+    std::unordered_map<std::string, APICKernel> kernels;
+
+    // Named bindings (name -> region_id)
+    std::vector<std::pair<std::string, uint32_t>> bindings;
+
+    // Handle pointer locations in memory regions (for fixup during replay)
+    std::vector<APICPtrLocation> ptr_locations;
+
+    // Helper: append bytes to operation stream
+    void append_bytes(const void* data, size_t size)
+    {
+        size_t offset = operation_stream.size();
+        operation_stream.resize(offset + size);
+        memcpy(operation_stream.data() + offset, data, size);
+    }
+
+    // Helper: find region containing a pointer
+    bool find_region(uint64_t ptr, int32_t& region_id, uint64_t& offset) const
+    {
+        for (const auto& kv : memory_regions) {
+            const APICRegion& r = kv.second;
+            if (ptr >= r.base_ptr && ptr < r.base_ptr + r.size) {
+                region_id = r.region_id;
+                offset = ptr - r.base_ptr;
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
+// Thread-local APIC state (set during recording)
+thread_local APICState g_apic_state = nullptr;
+
+// Helper to check if APIC is recording (hides struct internals from warp.cu)
+bool apic_is_recording(APICState state) { return state && state->recording; }
+
 // ============================================================================
 // APIC (API Capture) Implementation
 // ============================================================================
+
+// Access mesh descriptors registry from mesh.cpp for mesh serialization
+namespace wp {
+extern std::map<uint64_t, Mesh> g_mesh_descriptors;
+}
 
 APICState wp_apic_create_state() { return new APICStateInternal(); }
 
@@ -32,6 +134,7 @@ void wp_apic_begin_recording(APICState state)
         state->modules.clear();
         state->kernels.clear();
         state->bindings.clear();
+        state->ptr_locations.clear();
         state->next_region_id = 0;
         g_apic_state = state;
     }
@@ -100,7 +203,7 @@ uint32_t wp_apic_register_memory_region(APICState state, uint64_t base_ptr, uint
 
     // Create new region
     uint32_t region_id = state->next_region_id++;
-    APICRecordedRegion region;
+    APICRegion region;
     region.region_id = region_id;
     region.base_ptr = base_ptr;
     region.size = size;
@@ -120,7 +223,7 @@ void wp_apic_register_module(
     std::string hash_str(module_hash);
     // Only register if not already present
     if (state->modules.find(hash_str) == state->modules.end()) {
-        APICRecordedModule mod;
+        APICModule mod;
         mod.module_hash = hash_str;
         mod.module_name = module_name ? module_name : "";
         mod.cubin_filename = cubin_filename ? cubin_filename : "";
@@ -146,7 +249,7 @@ void wp_apic_register_kernel(
     std::string key_str(kernel_key);
     // Only register if not already present
     if (state->kernels.find(key_str) == state->kernels.end()) {
-        APICRecordedKernel kern;
+        APICKernel kern;
         kern.kernel_key = key_str;
         kern.module_hash = module_hash ? module_hash : "";
         kern.forward_name = forward_name ? forward_name : "";
@@ -164,6 +267,35 @@ void wp_apic_register_binding(APICState state, const char* name, uint32_t region
         return;
 
     state->bindings.push_back({ std::string(name), region_id });
+
+    // Capture device data for this param region if not already captured
+    // This ensures input params have their data serialized
+    for (auto& kv : state->memory_regions) {
+        APICRegion& region = kv.second;
+        if (region.region_id == region_id && region.initial_data.empty() && region.size > 0) {
+            // Capture the current device data
+            region.initial_data.resize(region.size);
+            cudaError_t err
+                = cudaMemcpy(region.initial_data.data(), (void*)region.base_ptr, region.size, cudaMemcpyDeviceToHost);
+            if (err != cudaSuccess) {
+                fprintf(stderr, "APIC: Warning - failed to capture data for bound region '%s': %d\n", name, err);
+                region.initial_data.clear();
+            }
+            break;
+        }
+    }
+}
+
+void wp_apic_register_ptr_location(APICState state, uint32_t region_id, uint64_t offset, uint64_t stride)
+{
+    if (!state)
+        return;
+
+    APICPtrLocation loc;
+    loc.region_id = region_id;
+    loc.offset = offset;
+    loc.stride = stride;
+    state->ptr_locations.push_back(loc);
 }
 
 // =============================================================================
@@ -182,7 +314,7 @@ void apic_record_kernel_launch(
     bool is_forward,
     const char* kernel_key,
     const char* module_hash,
-    const APICParamBindingInfo* params,
+    const APICLaunchParam* params,
     int num_params
 )
 {
@@ -192,8 +324,8 @@ void apic_record_kernel_launch(
     // Build param bindings data (arrays and scalars)
     std::vector<uint8_t> params_data;
     for (int i = 0; i < num_params; i++) {
-        const APICParamBindingInfo& param = params[i];
-        APICParamBindingRecord rec = {};
+        const APICLaunchParam& param = params[i];
+        APICLaunchParamRecord rec = {};
         rec.is_array = param.is_array;
         rec.ndim = param.ndim;
         rec.param_index = param.param_index;
@@ -325,7 +457,7 @@ void apic_record_alloc(APICState state, void* ptr, size_t size)
     // Register as a memory region with auto-generated ID
     uint32_t region_id = state->next_region_id++;
 
-    APICRecordedRegion region;
+    APICRegion region;
     region.region_id = region_id;
     region.base_ptr = reinterpret_cast<uint64_t>(ptr);
     region.size = size;
@@ -356,6 +488,14 @@ static void apic_write_u32(std::vector<uint8_t>& buf, uint32_t val)
     memcpy(buf.data() + off, &val, 4);
 }
 
+// Helper: write uint64_t to buffer
+static void apic_write_u64(std::vector<uint8_t>& buf, uint64_t val)
+{
+    size_t off = buf.size();
+    buf.resize(off + 8);
+    memcpy(buf.data() + off, &val, 8);
+}
+
 // Helper: write length-prefixed string to buffer
 static void apic_write_string(std::vector<uint8_t>& buf, const std::string& s)
 {
@@ -367,21 +507,105 @@ static void apic_write_string(std::vector<uint8_t>& buf, const std::string& s)
     }
 }
 
+// Helper: find region ID for a device pointer, or register and capture device data
+static uint32_t
+apic_find_or_register_region_with_data(APICStateInternal* state, uint64_t ptr, uint64_t size, uint32_t elem_size)
+{
+    // Check if region already exists
+    auto it = state->memory_regions.find(ptr);
+    if (it != state->memory_regions.end()) {
+        return it->second.region_id;
+    }
+
+    // Register new region
+    uint32_t region_id = wp_apic_register_memory_region(state, ptr, size, elem_size);
+
+    // Capture device data for this region
+    auto& region = state->memory_regions[ptr];
+    region.initial_data.resize(size);
+    cudaError_t err = cudaMemcpy(region.initial_data.data(), (void*)ptr, size, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "APIC: Warning - failed to capture device data for region %u: %d\n", region_id, err);
+        region.initial_data.clear();
+    }
+
+    return region_id;
+}
+
+// Collect all meshes for serialization
+// All meshes in g_mesh_descriptors are serialized - their arrays will be registered as regions
+static std::vector<std::pair<uint64_t, wp::Mesh>> apic_collect_meshes_for_serialization()
+{
+    std::vector<std::pair<uint64_t, wp::Mesh>> meshes;
+
+    for (const auto& kv : wp::g_mesh_descriptors) {
+        meshes.push_back({ kv.first, kv.second });
+    }
+
+    return meshes;
+}
+
+// Write a single mesh as APICMeshRecord to the buffer
+// Registers memory regions for mesh arrays and captures their data
+static void
+apic_write_mesh(std::vector<uint8_t>& data, APICStateInternal* state, uint64_t mesh_id, const wp::Mesh& mesh)
+{
+    // Find or register regions for mesh arrays
+    uint64_t points_ptr = (uint64_t)mesh.points.data;
+    uint64_t indices_ptr = (uint64_t)mesh.indices.data;
+    uint64_t velocities_ptr = (uint64_t)mesh.velocities.data;
+
+    uint64_t points_size = mesh.num_points * sizeof(wp::vec3);
+    uint64_t indices_size = mesh.num_tris * 3 * sizeof(int);
+    uint64_t velocities_size = mesh.velocities.data ? mesh.num_points * sizeof(wp::vec3) : 0;
+
+    uint32_t points_region_id
+        = apic_find_or_register_region_with_data(state, points_ptr, points_size, sizeof(wp::vec3));
+    uint32_t indices_region_id = apic_find_or_register_region_with_data(state, indices_ptr, indices_size, sizeof(int));
+    uint32_t velocities_region_id = UINT32_MAX;
+    if (mesh.velocities.data) {
+        velocities_region_id
+            = apic_find_or_register_region_with_data(state, velocities_ptr, velocities_size, sizeof(wp::vec3));
+    }
+
+    APICMeshRecord rec = {};
+    rec.num_points = mesh.num_points;
+    rec.num_tris = mesh.num_tris;
+    rec.support_winding_number = mesh.solid_angle_props ? 1 : 0;
+    rec.bvh_constructor = 0;  // Default SAH constructor
+    rec.bvh_leaf_size = 1;  // Default leaf size
+    rec.points_region_id = points_region_id;
+    rec.indices_region_id = indices_region_id;
+    rec.velocities_region_id = velocities_region_id;
+    rec.original_ptr = mesh_id;
+
+    size_t off = data.size();
+    data.resize(off + sizeof(APICMeshRecord));
+    memcpy(data.data() + off, &rec, sizeof(APICMeshRecord));
+}
+
 // Build binary metadata section from internal state
 static std::vector<uint8_t> apic_serialize_metadata(APICStateInternal* state, uint32_t target_arch)
 {
     std::vector<uint8_t> data;
 
-    // Header: version, target_arch, num_modules, num_kernels, num_bindings
+    // Collect all meshes for serialization
+    auto meshes = apic_collect_meshes_for_serialization();
+
+    // Header: version, target_arch, num_modules, num_kernels, num_params, num_meshes, num_ptr_locations
     apic_write_u32(data, APIC_FORMAT_VERSION);
     apic_write_u32(data, target_arch);
     apic_write_u32(data, static_cast<uint32_t>(state->modules.size()));
     apic_write_u32(data, static_cast<uint32_t>(state->kernels.size()));
     apic_write_u32(data, static_cast<uint32_t>(state->bindings.size()));
+    apic_write_u32(data, static_cast<uint32_t>(meshes.size()));
+
+    // Pointer locations count
+    apic_write_u32(data, static_cast<uint32_t>(state->ptr_locations.size()));
 
     // Modules: hash, name, cubin_filename, target_arch
     for (const auto& kv : state->modules) {
-        const APICRecordedModule& m = kv.second;
+        const APICModule& m = kv.second;
         apic_write_string(data, m.module_hash);
         apic_write_string(data, m.module_name);
         apic_write_string(data, m.cubin_filename);
@@ -390,7 +614,7 @@ static std::vector<uint8_t> apic_serialize_metadata(APICStateInternal* state, ui
 
     // Kernels: key, module_hash, forward_name, backward_name, smem bytes, block_dim
     for (const auto& kv : state->kernels) {
-        const APICRecordedKernel& k = kv.second;
+        const APICKernel& k = kv.second;
         apic_write_string(data, k.kernel_key);
         apic_write_string(data, k.module_hash);
         apic_write_string(data, k.forward_name);
@@ -400,10 +624,22 @@ static std::vector<uint8_t> apic_serialize_metadata(APICStateInternal* state, ui
         apic_write_u32(data, static_cast<uint32_t>(k.block_dim));
     }
 
-    // Bindings: name, region_id
+    // Params: name, region_id
     for (const auto& b : state->bindings) {
         apic_write_string(data, b.first);
         apic_write_u32(data, b.second);
+    }
+
+    // Meshes: written as APICMeshRecord structs
+    for (const auto& kv : meshes) {
+        apic_write_mesh(data, state, kv.first, kv.second);
+    }
+
+    // Pointer locations: region_id, offset, stride
+    for (const auto& loc : state->ptr_locations) {
+        apic_write_u32(data, loc.region_id);
+        apic_write_u64(data, loc.offset);
+        apic_write_u64(data, loc.stride);
     }
 
     return data;
@@ -420,7 +656,7 @@ int wp_apic_state_save(APICState state, const char* path, uint32_t target_arch)
     std::vector<uint8_t> metadata_section = apic_serialize_metadata(state, target_arch);
 
     // Build memory section from state->memory_regions
-    // Write ALL regions (not just ones with data) so we have size info for input/output bindings
+    // Write ALL regions (not just ones with data) so we have size info for input/output params
     std::vector<uint8_t> memory_section;
     {
         uint32_t region_count = static_cast<uint32_t>(state->memory_regions.size());
@@ -431,7 +667,7 @@ int wp_apic_state_save(APICState state, const char* path, uint32_t target_arch)
 
         // Write each region
         for (const auto& kv : state->memory_regions) {
-            const APICRecordedRegion& region = kv.second;
+            const APICRegion& region = kv.second;
 
             APICMemoryRegionRecord rec = {};
             rec.region_id = region.region_id;
@@ -545,56 +781,41 @@ static const uint32_t WGF_SECTION_METADATA = APIC_SECTION_METADATA;
 static const uint32_t WGF_SECTION_MEMORY = APIC_SECTION_MEMORY;
 static const uint32_t WGF_SECTION_OPERATIONS = APIC_SECTION_OPERATIONS;
 
-// Loaded memory region
-struct APICLoadedRegion {
-    uint32_t region_id;
-    uint64_t size;
-    uint32_t element_size;
-    void* ptr;  // Allocated device pointer
-};
-
-// Loaded module
-struct APICLoadedModule {
-    std::string module_hash;
-    std::string module_name;
-    std::string cubin_filename;
-    int target_arch;
-    CUmodule cuda_module;
-};
-
-// Kernel info from metadata
-struct APICKernelInfo {
-    std::string kernel_key;
-    std::string module_hash;
-    std::string forward_name;
-    std::string backward_name;
-    int forward_smem_bytes;
-    int backward_smem_bytes;
-    int block_dim;
-};
-
 // Internal graph structure
+// Note: APICModule, APICKernel, APICRegion, APICPtrLocation are defined in warp.cu
 struct APICGraphInternal {
     void* cuda_context;
     int target_arch;
 
     // Loaded modules
-    std::unordered_map<std::string, APICLoadedModule> modules;
+    std::unordered_map<std::string, APICModule> modules;
 
     // Kernel info
-    std::unordered_map<std::string, APICKernelInfo> kernels;
+    std::unordered_map<std::string, APICKernel> kernels;
 
     // Memory regions
-    std::unordered_map<uint32_t, APICLoadedRegion> regions;
+    std::unordered_map<uint32_t, APICRegion> regions;
 
-    // Parameter bindings (name -> region_id) - unified for inputs and outputs
-    std::unordered_map<std::string, uint32_t> params;
-    std::vector<std::string> param_names;  // Ordered list for indexing
+    // Named bindings (name -> region_id) - unified for inputs and outputs
+    std::unordered_map<std::string, uint32_t> bindings;
+    std::vector<std::string> binding_names;  // Ordered list for indexing
 
     // Operation stream - stored directly in serialized format
     // Iterate through using APICOpHeader to dispatch
     std::vector<uint8_t> operation_stream;
     uint32_t operation_count;
+
+    // Handle pointer remapping (old_ptr -> new_ptr) for Mesh, Volume, BVH, etc.
+    std::unordered_map<uint64_t, uint64_t> handle_ptr_remap;
+
+    // Pointer locations in memory regions that need fixup
+    std::vector<APICPtrLocation> ptr_locations;
+
+    // Mesh records loaded from metadata (for deferred creation)
+    std::vector<APICMeshRecord> mesh_records;
+
+    // Mesh IDs created by this graph (for cleanup)
+    std::vector<uint64_t> created_mesh_ids;
 
     // CUDA graph (built once on first access)
     CUgraph cuda_graph;
@@ -614,6 +835,13 @@ struct APICGraphInternal {
 
     ~APICGraphInternal()
     {
+        ContextGuard guard(cuda_context);
+
+        // Destroy meshes created by this graph
+        for (uint64_t mesh_id : created_mesh_ids) {
+            wp_mesh_destroy_device(mesh_id);
+        }
+
         // Free CUDA graph resources using runtime API
         if (cuda_graph_exec) {
             cudaGraphExecDestroy((cudaGraphExec_t)cuda_graph_exec);
@@ -681,10 +909,10 @@ static std::string apic_read_lp_string(const uint8_t*& ptr)
 }
 
 // Parse binary metadata section
-// Format: header (5 x u32) + modules + kernels + bindings
+// Format: header (7 x u32) + modules + kernels + params + meshes + ptr_locations
 static bool apic_parse_metadata(const uint8_t* data, size_t size, APICGraphInternal* graph)
 {
-    if (!data || size < 20)  // Minimum header size: 5 x uint32
+    if (!data || size < 28)  // Minimum header size: 7 x uint32
         return false;
 
     const uint8_t* ptr = data;
@@ -695,11 +923,13 @@ static bool apic_parse_metadata(const uint8_t* data, size_t size, APICGraphInter
     graph->target_arch = apic_read_value<uint32_t>(ptr);
     uint32_t num_modules = apic_read_value<uint32_t>(ptr);
     uint32_t num_kernels = apic_read_value<uint32_t>(ptr);
-    uint32_t num_bindings = apic_read_value<uint32_t>(ptr);
+    uint32_t num_params = apic_read_value<uint32_t>(ptr);
+    uint32_t num_meshes = apic_read_value<uint32_t>(ptr);
+    uint32_t num_ptr_locations = apic_read_value<uint32_t>(ptr);
 
     // Read modules
     for (uint32_t i = 0; i < num_modules; i++) {
-        APICLoadedModule mod;
+        APICModule mod;
         mod.module_hash = apic_read_lp_string(ptr);
         mod.module_name = apic_read_lp_string(ptr);
         mod.cubin_filename = apic_read_lp_string(ptr);
@@ -710,7 +940,7 @@ static bool apic_parse_metadata(const uint8_t* data, size_t size, APICGraphInter
 
     // Read kernels
     for (uint32_t i = 0; i < num_kernels; i++) {
-        APICKernelInfo info;
+        APICKernel info;
         info.kernel_key = apic_read_lp_string(ptr);
         info.module_hash = apic_read_lp_string(ptr);
         info.forward_name = apic_read_lp_string(ptr);
@@ -721,12 +951,29 @@ static bool apic_parse_metadata(const uint8_t* data, size_t size, APICGraphInter
         graph->kernels[info.kernel_key] = info;
     }
 
-    // Read bindings
-    for (uint32_t i = 0; i < num_bindings; i++) {
+    // Read params
+    for (uint32_t i = 0; i < num_params; i++) {
         std::string name = apic_read_lp_string(ptr);
         uint32_t region_id = apic_read_value<uint32_t>(ptr);
-        graph->params[name] = region_id;
-        graph->param_names.push_back(name);
+        graph->bindings[name] = region_id;
+        graph->binding_names.push_back(name);
+    }
+
+    // Read mesh records (deferred creation until memory is allocated)
+    for (uint32_t i = 0; i < num_meshes; i++) {
+        APICMeshRecord rec;
+        memcpy(&rec, ptr, sizeof(APICMeshRecord));
+        ptr += sizeof(APICMeshRecord);
+        graph->mesh_records.push_back(rec);
+    }
+
+    // Read pointer locations
+    for (uint32_t i = 0; i < num_ptr_locations; i++) {
+        APICPtrLocation loc;
+        loc.region_id = apic_read_value<uint32_t>(ptr);
+        loc.offset = apic_read_value<uint64_t>(ptr);
+        loc.stride = apic_read_value<uint64_t>(ptr);
+        graph->ptr_locations.push_back(loc);
     }
 
     return true;
@@ -774,7 +1021,7 @@ static bool apic_parse_memory_regions(const uint8_t* data, size_t size, APICGrap
 
         // Create region entry if not already in graph
         if (graph->regions.find(rec->region_id) == graph->regions.end()) {
-            APICLoadedRegion region;
+            APICRegion region;
             region.region_id = rec->region_id;
             region.size = rec->size;
             region.element_size = rec->element_size;
@@ -825,6 +1072,119 @@ static bool apic_init_memory(const uint8_t* data, size_t size, APICGraphInternal
     }
 
     return true;
+}
+
+// Create meshes from stored mesh records after memory regions are allocated
+// This populates handle_ptr_remap with old_mesh_ptr -> new_mesh_ptr mappings
+static bool apic_create_meshes(APICGraphInternal* graph)
+{
+    for (const APICMeshRecord& rec : graph->mesh_records) {
+        // Get region pointers
+        auto points_it = graph->regions.find(rec.points_region_id);
+        auto indices_it = graph->regions.find(rec.indices_region_id);
+
+        if (points_it == graph->regions.end() || !points_it->second.ptr) {
+            wp::set_error_string("Mesh points region %u not found", rec.points_region_id);
+            return false;
+        }
+        if (indices_it == graph->regions.end() || !indices_it->second.ptr) {
+            wp::set_error_string("Mesh indices region %u not found", rec.indices_region_id);
+            return false;
+        }
+
+        // Build array_t for points
+        wp::array_t<wp::vec3> points;
+        points.data = (wp::vec3*)points_it->second.ptr;
+        points.grad = nullptr;
+        points.shape[0] = rec.num_points;
+        points.strides[0] = sizeof(wp::vec3);
+        points.ndim = 1;
+
+        // Build array_t for indices
+        wp::array_t<int> indices;
+        indices.data = (int*)indices_it->second.ptr;
+        indices.grad = nullptr;
+        indices.shape[0] = rec.num_tris * 3;
+        indices.strides[0] = sizeof(int);
+        indices.ndim = 1;
+
+        // Build array_t for velocities (optional)
+        wp::array_t<wp::vec3> velocities = {};
+        if (rec.velocities_region_id != UINT32_MAX) {
+            auto vel_it = graph->regions.find(rec.velocities_region_id);
+            if (vel_it != graph->regions.end() && vel_it->second.ptr) {
+                velocities.data = (wp::vec3*)vel_it->second.ptr;
+                velocities.grad = nullptr;
+                velocities.shape[0] = rec.num_points;
+                velocities.strides[0] = sizeof(wp::vec3);
+                velocities.ndim = 1;
+            }
+        }
+
+        // Create mesh
+        uint64_t new_mesh_id = wp_mesh_create_device(
+            graph->cuda_context, points, velocities, indices, rec.num_points, rec.num_tris, rec.support_winding_number,
+            rec.bvh_constructor, nullptr,  // groups
+            rec.bvh_leaf_size
+        );
+
+        if (new_mesh_id == 0) {
+            wp::set_error_string("Failed to create mesh from serialized data");
+            return false;
+        }
+
+        // Track mesh for cleanup
+        graph->created_mesh_ids.push_back(new_mesh_id);
+
+        // Add to handle remap table
+        graph->handle_ptr_remap[rec.original_ptr] = new_mesh_id;
+    }
+
+    return true;
+}
+
+// Fixup handle pointers in memory regions after loading
+// For each registered pointer location, remap old handle values to new ones
+// Note: regions are in device memory, so we must use cudaMemcpy
+static void apic_fixup_ptr_locations(APICGraphInternal* graph)
+{
+    if (graph->handle_ptr_remap.empty() || graph->ptr_locations.empty())
+        return;
+
+    for (const auto& loc : graph->ptr_locations) {
+        auto region_it = graph->regions.find(loc.region_id);
+        if (region_it == graph->regions.end() || !region_it->second.ptr)
+            continue;
+
+        uint8_t* base = static_cast<uint8_t*>(region_it->second.ptr);
+        uint64_t region_size = region_it->second.size;
+
+        if (loc.stride == 0) {
+            // Single pointer at offset
+            if (loc.offset + sizeof(uint64_t) <= region_size) {
+                uint8_t* device_ptr = base + loc.offset;
+                uint64_t old_val;
+                cudaMemcpy(&old_val, device_ptr, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+                auto remap_it = graph->handle_ptr_remap.find(old_val);
+                if (remap_it != graph->handle_ptr_remap.end()) {
+                    uint64_t new_val = remap_it->second;
+                    cudaMemcpy(device_ptr, &new_val, sizeof(uint64_t), cudaMemcpyHostToDevice);
+                }
+            }
+        } else {
+            // Array of pointers with stride
+            for (uint64_t off = loc.offset; off + sizeof(uint64_t) <= region_size; off += loc.stride) {
+                uint8_t* device_ptr = base + off;
+                uint64_t old_val;
+                cudaMemcpy(&old_val, device_ptr, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+                auto remap_it = graph->handle_ptr_remap.find(old_val);
+                if (remap_it != graph->handle_ptr_remap.end()) {
+                    uint64_t new_val = remap_it->second;
+                    cudaMemcpy(device_ptr, &new_val, sizeof(uint64_t), cudaMemcpyHostToDevice);
+                }
+            }
+        }
+    }
 }
 
 // Helper: resolve region_id + offset to a pointer
@@ -944,10 +1304,10 @@ static bool apic_rebuild_cuda_graph(APICGraphInternal* graph, CUstream stream)
             args.push_back(bounds_ptr);
             arg_storage.push_back(std::move(bounds));
 
-            // Parse param bindings (arrays and scalars, starting from param_index 1)
+            // Parse param bindings (arrays and scalars)
             for (uint16_t j = 0; j < rec->num_params; j++) {
-                const APICParamBindingRecord* binding = reinterpret_cast<const APICParamBindingRecord*>(params_ptr);
-                params_ptr += sizeof(APICParamBindingRecord);
+                const APICLaunchParamRecord* binding = reinterpret_cast<const APICLaunchParamRecord*>(params_ptr);
+                params_ptr += sizeof(APICLaunchParamRecord);
 
                 if (binding->is_array) {
                     // Array parameter - create array_t structure
@@ -968,7 +1328,6 @@ static bool apic_rebuild_cuda_graph(APICGraphInternal* graph, CUstream stream)
                     arg_storage.push_back(std::move(arr));
                 } else {
                     // Scalar parameter - value bytes are stored in shape[] and strides[]
-                    // byte_offset contains the scalar size
                     size_t scalar_size = binding->byte_offset;
                     auto scalar = std::make_unique<uint8_t[]>(scalar_size);
 
@@ -1196,23 +1555,40 @@ APICGraph wp_apic_load_graph(void* context, const char* path)
         pair.second.cuda_module = cuda_module;
     }
 
-    // Allocate memory regions using runtime API
-    for (auto& pair : graph->regions) {
-        void* device_ptr = nullptr;
-        cudaError_t err = cudaMalloc(&device_ptr, pair.second.size);
-        if (err != cudaSuccess) {
-            wp::set_error_string("Failed to allocate %llu bytes: %d", (unsigned long long)pair.second.size, err);
+    // Use ContextGuard to ensure all operations use the correct CUDA context
+    {
+        ContextGuard guard(context);
+
+        // Allocate memory regions using runtime API
+        for (auto& pair : graph->regions) {
+            void* device_ptr = nullptr;
+            cudaError_t err = cudaMalloc(&device_ptr, pair.second.size);
+            if (err != cudaSuccess) {
+                wp::set_error_string("Failed to allocate %llu bytes: %d", (unsigned long long)pair.second.size, err);
+                delete graph;
+                return nullptr;
+            }
+            pair.second.ptr = device_ptr;
+        }
+
+        // Initialize memory with saved data
+        if (memory_ptr && !apic_init_memory(memory_ptr, memory_size, graph)) {
             delete graph;
             return nullptr;
         }
-        pair.second.ptr = device_ptr;
+
+        // Synchronize to ensure memory is ready before mesh creation
+        cudaDeviceSynchronize();
     }
 
-    // Initialize memory with saved data
-    if (memory_ptr && !apic_init_memory(memory_ptr, memory_size, graph)) {
+    // Create meshes from serialized data (populates handle_ptr_remap)
+    if (!apic_create_meshes(graph)) {
         delete graph;
         return nullptr;
     }
+
+    // Fixup handle pointers in memory regions (e.g., Mesh, Volume, BVH)
+    apic_fixup_ptr_locations(graph);
 
     // Parse operations
     if (operations_ptr && !apic_parse_operations(operations_ptr, operations_size, graph)) {
@@ -1239,8 +1615,8 @@ int wp_apic_set_param(APICGraph graph, const char* name, const void* data, size_
     ContextGuard guard(graph->cuda_context);
 
     // Look up in params
-    auto param_it = graph->params.find(name);
-    if (param_it == graph->params.end()) {
+    auto param_it = graph->bindings.find(name);
+    if (param_it == graph->bindings.end()) {
         wp::set_error_string("Unknown parameter: %s", name);
         return 0;
     }
@@ -1276,8 +1652,8 @@ void* wp_apic_get_param_ptr(APICGraph graph, const char* name)
         return nullptr;
 
     // Look up in params
-    auto param_it = graph->params.find(name);
-    if (param_it == graph->params.end())
+    auto param_it = graph->bindings.find(name);
+    if (param_it == graph->bindings.end())
         return nullptr;
 
     auto region_it = graph->regions.find(param_it->second);
@@ -1295,8 +1671,8 @@ int wp_apic_get_param(APICGraph graph, const char* name, void* data, size_t size
     ContextGuard guard(graph->cuda_context);
 
     // Look up in params
-    auto param_it = graph->params.find(name);
-    if (param_it == graph->params.end()) {
+    auto param_it = graph->bindings.find(name);
+    if (param_it == graph->bindings.end()) {
         wp::set_error_string("Unknown parameter: %s", name);
         return 0;
     }
@@ -1374,21 +1750,21 @@ void* wp_apic_get_cuda_graph_exec(APICGraph graph)
     return graph->cuda_graph_exec;
 }
 
-int wp_apic_get_num_params(APICGraph graph) { return graph ? (int)graph->param_names.size() : 0; }
+int wp_apic_get_num_params(APICGraph graph) { return graph ? (int)graph->binding_names.size() : 0; }
 
 const char* wp_apic_get_param_name(APICGraph graph, int index)
 {
-    if (!graph || index < 0 || index >= (int)graph->param_names.size())
+    if (!graph || index < 0 || index >= (int)graph->binding_names.size())
         return nullptr;
-    return graph->param_names[index].c_str();
+    return graph->binding_names[index].c_str();
 }
 
 size_t wp_apic_get_param_size(APICGraph graph, const char* name)
 {
     if (!graph || !name)
         return 0;
-    auto it = graph->params.find(name);
-    if (it == graph->params.end())
+    auto it = graph->bindings.find(name);
+    if (it == graph->bindings.end())
         return 0;
     auto region_it = graph->regions.find(it->second);
     if (region_it == graph->regions.end())

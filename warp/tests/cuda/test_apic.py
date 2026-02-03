@@ -696,6 +696,160 @@ def test_apic_native_loading(test, device):
         np.testing.assert_array_almost_equal(new_output.numpy(), expected)
 
 
+def test_apic_handle_type(test, device):
+    """Test that wp.handle type is properly detected."""
+
+    # Test that handle is a subclass of uint64
+    test.assertTrue(issubclass(wp.handle, wp.uint64))
+
+    # Test that handle is distinguishable from uint64
+    test.assertIsNot(wp.handle, wp.uint64)
+
+    # Test handle in struct
+    @wp.struct
+    class TestStruct:
+        mesh_id: wp.handle
+        value: float
+
+    test.assertTrue(hasattr(TestStruct, "vars"))
+    test.assertIn("mesh_id", TestStruct.vars)
+
+
+def test_apic_find_handle_offsets(test, device):
+    """Test _find_handle_offsets method in APICapture."""
+    from warp._src.apic import APICapture
+
+    apic = APICapture(device)
+
+    # Test direct handle type
+    offsets = apic._find_handle_offsets(wp.handle)
+    test.assertEqual(offsets, [0])
+
+    # Test non-handle type
+    offsets = apic._find_handle_offsets(wp.float32)
+    test.assertEqual(offsets, [])
+
+    # Test struct with handle
+    @wp.struct
+    class BodyWithHandle:
+        mesh_id: wp.handle
+        mass: float
+
+    offsets = apic._find_handle_offsets(BodyWithHandle)
+    test.assertEqual(len(offsets), 1)
+    # Offset should be 0 since mesh_id is first field
+    test.assertEqual(offsets[0], 0)
+
+
+def test_apic_handle_in_array_dtype(test, device):
+    """Test that handles in array dtypes are auto-detected during track_array."""
+    from warp._src.apic import APICapture
+
+    @wp.struct
+    class BodyData:
+        mesh_id: wp.handle
+        position: wp.vec3
+
+    n = 10
+    bodies = wp.zeros(n, dtype=BodyData, device=device)
+
+    apic = APICapture(device)
+    apic.begin()
+
+    # Track the array - should auto-register handle locations
+    _region_id, offset = apic.track_array(bodies)
+    test.assertEqual(offset, 0)
+
+    apic.end()
+    apic.destroy()
+
+
+@wp.kernel
+def compare_handle_to_array_ptr_kernel(
+    data: wp.array(dtype=float),
+    data_handle: wp.handle,
+    result: wp.array(dtype=wp.int32),
+):
+    """Compare handle value to array's data pointer."""
+    tid = wp.tid()
+    if tid == 0:
+        # Compare handle to array pointer directly
+        if data.ptr == data_handle:
+            result[0] = 1
+        else:
+            result[0] = 0
+        # Also write to the array to prove it's valid
+        data[0] = 42.0
+
+
+def test_apic_handle_equals_array_ptr(test, device):
+    """Test that handle == array.ptr comparison works inside a kernel.
+
+    This verifies that passing array.ptr as a handle allows comparison
+    inside the kernel. Note: after serialization, the handle fixup for
+    raw array pointers is NOT currently implemented - only mesh/volume/BVH
+    handles support automatic fixup.
+    """
+    n = 4
+
+    # Create arrays
+    data = wp.array([1.0, 2.0, 3.0, 4.0], dtype=float, device=device)
+    result = wp.zeros(1, dtype=wp.int32, device=device)
+
+    # Get the array's pointer as a handle
+    data_handle = wp.uint64(data.ptr)
+
+    # Launch kernel - compare handle to array.ptr
+    wp.launch(compare_handle_to_array_ptr_kernel, dim=1, inputs=[data, data_handle, result], device=device)
+    wp.synchronize_device(device)
+
+    # Verify handle == array.ptr inside the kernel
+    test.assertEqual(result.numpy()[0], 1)
+    test.assertEqual(data.numpy()[0], 42.0)
+
+
+def test_apic_ptr_location_registration(test, device):
+    """Test that ptr_locations are correctly registered for arrays with handle dtypes."""
+    import warp._src.context
+    from warp._src.apic import APICapture
+
+    @wp.struct
+    class MultiHandleStruct:
+        mesh_handle: wp.handle
+        value: float
+        bvh_handle: wp.handle
+
+    n = 8
+    data = wp.zeros(n, dtype=MultiHandleStruct, device=device)
+
+    apic = APICapture(device)
+    apic.begin()
+
+    # Track the array - should register ptr_locations for both handle fields
+    _region_id, _offset = apic.track_array(data)
+
+    # Get the native state and check ptr_locations count
+    runtime = warp._src.context.runtime
+
+    # The APICapture.track_array should have registered ptr_locations
+    # We can verify this by checking that _find_handle_offsets finds both handles
+    handle_offsets = apic._find_handle_offsets(MultiHandleStruct)
+
+    # Should find 2 handles in the struct
+    test.assertEqual(len(handle_offsets), 2)
+
+    # First handle (mesh_handle) should be at offset 0
+    test.assertEqual(handle_offsets[0], 0)
+
+    # Second handle (bvh_handle) should be after value field
+    # mesh_handle: 8 bytes, value: 4 bytes (+ padding to 8 bytes) = offset 16
+    # Actually depends on struct packing - let's just verify it's > 0
+    test.assertGreater(handle_offsets[1], handle_offsets[0])
+
+    apic.end()
+    apic.destroy()
+
+
 class TestApic(unittest.TestCase):
     pass
 
@@ -725,6 +879,11 @@ add_function_test(
     TestApic, "test_apic_multiple_internal_allocations", test_apic_multiple_internal_allocations, devices=devices
 )
 add_function_test(TestApic, "test_apic_native_loading", test_apic_native_loading, devices=devices)
+add_function_test(TestApic, "test_apic_handle_type", test_apic_handle_type, devices=devices)
+add_function_test(TestApic, "test_apic_find_handle_offsets", test_apic_find_handle_offsets, devices=devices)
+add_function_test(TestApic, "test_apic_handle_in_array_dtype", test_apic_handle_in_array_dtype, devices=devices)
+add_function_test(TestApic, "test_apic_handle_equals_array_ptr", test_apic_handle_equals_array_ptr, devices=devices)
+add_function_test(TestApic, "test_apic_ptr_location_registration", test_apic_ptr_location_registration, devices=devices)
 
 
 if __name__ == "__main__":

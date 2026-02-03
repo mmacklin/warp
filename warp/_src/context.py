@@ -4933,6 +4933,15 @@ class Runtime:
             ]
             self.core.wp_apic_register_binding.restype = None
 
+            # APIC handle pointer location registration
+            self.core.wp_apic_register_ptr_location.argtypes = [
+                ctypes.c_void_p,  # state
+                ctypes.c_uint32,  # region_id
+                ctypes.c_uint64,  # offset
+                ctypes.c_uint64,  # stride
+            ]
+            self.core.wp_apic_register_ptr_location.restype = None
+
             # APIC state save (serializes from registered metadata)
             self.core.wp_apic_state_save.argtypes = [
                 ctypes.c_void_p,  # state (APICState)
@@ -8531,7 +8540,7 @@ def capture_save(
 
     from warp._src.apic import save_graph
 
-    # Set parameter bindings
+    # Set named bindings
     if inputs:
         for name, arr in inputs.items():
             graph.apic_capture.set_binding(name, arr)

@@ -18,7 +18,7 @@ extern "C" {
 // APIC Format Constants
 // =============================================================================
 
-#define APIC_FORMAT_VERSION 2
+#define APIC_FORMAT_VERSION 3
 #define APIC_MAGIC "WGF1"
 #define APIC_MAGIC_VALUE 0x31464757  // "WGF1" as little-endian uint32
 
@@ -82,6 +82,31 @@ typedef struct {
 } APICSectionEntry;  // 32 bytes
 
 // =============================================================================
+// Mesh Serialization Records
+// =============================================================================
+
+// Mesh data record - stores all info needed to reconstruct a mesh
+typedef struct {
+    int32_t num_points;
+    int32_t num_tris;
+    uint8_t support_winding_number;
+    uint8_t bvh_constructor;
+    uint16_t bvh_leaf_size;
+    uint32_t points_region_id;
+    uint32_t indices_region_id;
+    uint32_t velocities_region_id;  // UINT32_MAX if absent
+    uint64_t original_ptr;
+} APICMeshRecord;  // 32 bytes
+
+// Handle pointer location in a memory region (for fixup) - works for Mesh, Volume, BVH, etc.
+typedef struct {
+    uint32_t region_id;
+    uint32_t _pad;
+    uint64_t offset;
+    uint64_t stride;  // 0 = single pointer
+} APICPtrLocationRecord;  // 24 bytes
+
+// =============================================================================
 // Operation Records
 // =============================================================================
 
@@ -119,28 +144,29 @@ typedef struct {
     uint16_t kernel_key_len;  // Length of kernel_key string
     uint16_t module_hash_len;  // Length of module_hash string
     uint16_t num_params;  // Number of parameter bindings (array params only, starting from index 1)
-    uint16_t _pad2;
+    uint16_t num_handle_offsets;  // Number of handle byte offsets
 
     // Variable data follows in order:
     // 1. char kernel_key[kernel_key_len]
     // 2. char module_hash[module_hash_len]
-    // 3. Parameter bindings (APICParamBindingRecord for each array param)
+    // 3. Parameter bindings (APICLaunchParamRecord for each array param)
+    // 4. uint32_t handle_offsets[num_handle_offsets] - byte offsets where handles are in params buffer
 } APICLaunchRecord;
 
-// Parameter binding record (for array or scalar parameters, param_index >= 1)
+// Parameter binding record for array or scalar parameters (param_index >= 1)
 // For arrays: uses region_id, byte_offset, shape, strides, element_size
-// For scalars: scalar_size is in byte_offset, value bytes in shape[] and strides[]
+// For scalars: is_array=0, scalar_size in byte_offset, value bytes in shape[] and strides[]
 typedef struct {
     uint8_t is_array;  // 1 for array, 0 for scalar
     uint8_t ndim;  // Number of dimensions (arrays only)
     uint16_t param_index;  // Parameter index in kernel signature (1-based, 0 is launch_bounds)
-    int32_t region_id;  // Memory region ID (-1 for null array, ignored for scalars)
+    int32_t region_id;  // Memory region ID (-1 for null array or scalar)
     uint64_t byte_offset;  // Byte offset within region (arrays) or scalar_size (scalars)
-    int64_t shape[APIC_MAX_DIMS];  // Array shape, or first 32 bytes of scalar value
-    int64_t strides[APIC_MAX_DIMS];  // Array strides, or next 32 bytes of scalar value
+    int64_t shape[APIC_MAX_DIMS];  // Array shape or first 32 bytes of scalar value
+    int64_t strides[APIC_MAX_DIMS];  // Array strides or next 32 bytes of scalar value
     uint32_t element_size;  // Element size in bytes (arrays only)
     uint32_t _pad1;
-} APICParamBindingRecord;  // 88 bytes
+} APICLaunchParamRecord;  // 88 bytes
 
 // -----------------------------------------------------------------------------
 // Memory Operations
@@ -201,8 +227,8 @@ typedef struct {
 // Recording API Structures (for passing info from Python to C++)
 // =============================================================================
 
-// APICParamBindingInfo is the same as APICParamBindingRecord
-typedef APICParamBindingRecord APICParamBindingInfo;
+// APICLaunchParam is the same as APICLaunchParamRecord
+typedef APICLaunchParamRecord APICLaunchParam;
 
 // Launch info passed to wp_cuda_launch_kernel() for APIC recording
 // Only includes fields needed to identify the kernel - other launch parameters
@@ -213,7 +239,7 @@ typedef struct {
     const char* module_hash;  // Module hash string
     uint8_t is_forward;  // 1 for forward, 0 for backward
     uint8_t _pad[3];
-    const APICParamBindingInfo* params;  // Array of parameter bindings
+    const APICLaunchParam* params;  // Array of parameter bindings
     int32_t num_params;  // Number of parameter bindings
 } APICLaunchInfo;
 

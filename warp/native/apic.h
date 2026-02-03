@@ -82,8 +82,13 @@ WP_API void wp_apic_register_kernel(
 
 WP_API void wp_apic_register_binding(APICState state, const char* name, uint32_t region_id);
 
+// Register handle pointer location within a memory region (for fixup during replay)
+// Called automatically during track_array() when dtype contains handles
+// stride=0 means single pointer, otherwise stride is the array element size
+WP_API void wp_apic_register_ptr_location(APICState state, uint32_t region_id, uint64_t offset, uint64_t stride);
+
 // Save APIC state to a WGF file
-// Serializes metadata from registered modules/kernels/bindings
+// Serializes metadata from registered modules/kernels/params
 // Returns 1 on success, 0 on failure
 WP_API int wp_apic_state_save(APICState state, const char* path, uint32_t target_arch);
 
@@ -139,6 +144,12 @@ WP_API size_t wp_apic_get_param_size(APICGraph graph, const char* name);
 
 #ifdef __cplusplus
 
+// Thread-local APIC state (set during recording)
+extern thread_local APICState g_apic_state;
+
+// Helper to check if APIC is recording (hides struct internals)
+bool apic_is_recording(APICState state);
+
 // Internal recording functions (called from wp_cuda_launch_kernel, wp_memcpy_*, etc.)
 void apic_record_kernel_launch(
     APICStateInternal* state,
@@ -152,7 +163,7 @@ void apic_record_kernel_launch(
     bool is_forward,
     const char* kernel_key,
     const char* module_hash,
-    const APICParamBindingInfo* params,
+    const APICLaunchParam* params,
     int num_params
 );
 

@@ -25,14 +25,11 @@ using namespace wp;
 
 #include <map>
 
-namespace {
-// host-side copy of mesh descriptors, maps GPU mesh address (id) to a CPU desc
-std::map<uint64_t, Mesh> g_mesh_descriptors;
-
-}  // anonymous namespace
-
-
 namespace wp {
+
+// host-side copy of mesh descriptors, maps GPU mesh address (id) to a CPU desc
+// Note: Not in anonymous namespace so APIC can access it for mesh serialization
+std::map<uint64_t, Mesh> g_mesh_descriptors;
 
 bool mesh_get_descriptor(uint64_t id, Mesh& mesh)
 {

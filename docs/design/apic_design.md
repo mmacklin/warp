@@ -1,9 +1,9 @@
 # APIC (API Capture) Design Document
 ## CUDA Graph Capture, Serialization, and Replay for Warp
 
-### Version: 1.5
-### Date: January 2026
-### Status: Implemented (Phases 1-4 Complete)
+### Version: 1.6
+### Date: February 2026
+### Status: Implemented (Phases 1-4 Complete, Mesh Serialization)
 
 ---
 
@@ -34,7 +34,7 @@ This document outlines the design for adding CUDA graph capture, serialization, 
 | FR-8 | Serialize compiled CUDA kernels (CUBIN as separate files) | High | Done |
 | FR-9 | Generate C++ header for native application embedding | Medium | Partial (C++ loading API done) |
 | FR-10 | Support input/output array designation for graph parameters | High | Done |
-| FR-11 | Support `wp.Mesh`, `wp.Volume`, `wp.BVH` data structures | Medium | Not Implemented |
+| FR-11 | Support `wp.Mesh`, `wp.Volume`, `wp.BVH` data structures | Medium | Mesh: Done |
 | FR-12 | Handle array slicing/aliasing (same underlying memory) | High | Done |
 
 ### 2.2 Non-Functional Requirements
@@ -197,6 +197,40 @@ class array_t(ctypes.Structure):
 ```
 
 Cached artifacts location: `{kernel_cache_dir}/wp_{module_name}_{hash[:7]}/`
+
+### 3.5 Handle Type and Object Pointers
+
+**Location:** `warp/_src/types.py`
+
+Warp uses opaque 64-bit handles to reference native objects like `wp.Mesh`, `wp.Volume`, and `wp.BVH`. These handles are pointers to device-side structures that must be remapped when a serialized graph is loaded.
+
+```python
+class handle(uint64):
+    """Type for object handles (Mesh, Volume, BVH) in kernel parameters.
+
+    Behaves identically to uint64 but allows APIC to detect which params
+    need pointer remapping during replay.
+    """
+    pass
+```
+
+**Usage in kernel signatures:**
+```python
+@wp.kernel
+def query_mesh(mesh: wp.handle, points: wp.array(dtype=wp.vec3), ...):
+    m = wp.mesh_get(mesh)  # Works same as uint64
+    ...
+```
+
+**Handle locations in structs:**
+```python
+@wp.struct
+class Body:
+    mesh: wp.handle  # APIC auto-detects this field needs remapping
+    transform: wp.mat44
+```
+
+The `wp.handle` type is distinct from `wp.uint64` at the type level (`param_type is wp.handle`), allowing APIC to automatically detect which kernel parameters and struct fields contain handles that need remapping.
 
 ---
 
@@ -1595,7 +1629,218 @@ def _reconstruct_array_view(self, binding: ParamBinding) -> array_t:
 
 ---
 
-## 9. Module and Kernel Binary Handling
+## 9. Handle Pointer Serialization
+
+### 9.1 Problem Statement
+
+Objects like `wp.Mesh`, `wp.Volume`, and `wp.BVH` are referenced by 64-bit handle pointers. When a graph is serialized and later loaded:
+1. The original objects no longer exist
+2. New objects must be created from serialized data
+3. All handle pointers in kernel arguments and memory regions must be updated to point to the new objects
+
+### 9.2 Handle Detection
+
+APIC automatically detects handle locations through the `wp.handle` type:
+
+**Kernel arguments:**
+```python
+@wp.kernel
+def query_mesh(mesh: wp.handle, ...):  # Direct handle argument
+    ...
+```
+
+**Struct fields:**
+```python
+@wp.struct
+class Body:
+    mesh: wp.handle  # Handle inside struct
+    transform: wp.mat44
+```
+
+**Arrays of structs:**
+```python
+bodies = wp.zeros(n, dtype=Body)  # Array with handle fields
+```
+
+The `_find_handle_offsets()` function in `capture.py` recursively inspects types to find all byte offsets where handles are located:
+
+```python
+def _find_handle_offsets(self, dtype, base_offset=0) -> list[int]:
+    """Recursively find byte offsets of wp.handle fields in a type."""
+    offsets = []
+    if dtype is wp.handle:
+        offsets.append(base_offset)
+    elif isinstance(dtype, wp.struct):
+        for field_name, var in dtype.vars.items():
+            field_offset = getattr(dtype.ctype, field_name).offset
+            offsets.extend(self._find_handle_offsets(var.type, base_offset + field_offset))
+    return offsets
+```
+
+### 9.3 Pointer Location Registration
+
+When an array is tracked during capture, APIC automatically registers handle pointer locations:
+
+```python
+def track_array(self, arr) -> tuple[int, int]:
+    region_id, offset = ...  # Register memory region
+
+    # Auto-detect handle locations in the array's dtype
+    handle_offsets = self._find_handle_offsets(arr.dtype)
+    if handle_offsets:
+        stride = wp.types.type_size_in_bytes(arr.dtype)
+        for handle_offset in handle_offsets:
+            runtime.core.wp_apic_register_ptr_location(
+                self.native_state, region_id, handle_offset, stride
+            )
+
+    return region_id, offset
+```
+
+**C++ API for pointer location registration:**
+```cpp
+// Register a handle pointer location within a memory region
+// offset: byte offset of first handle in the region
+// stride: bytes between consecutive handles (0 for single pointer)
+WP_API void wp_apic_register_ptr_location(
+    APICState state,
+    uint32_t region_id,
+    uint64_t offset,
+    uint64_t stride);
+```
+
+### 9.4 Mesh Serialization
+
+Meshes are automatically discovered from the native `g_mesh_descriptors` registry during serialization:
+
+```cpp
+// In apic_serialize_metadata()
+for (auto& [ptr, mesh] : wp::g_mesh_descriptors) {
+    APICMeshRecord rec;
+    rec.num_points = mesh.num_points;
+    rec.num_tris = mesh.num_tris;
+    rec.points_region_id = find_or_register_region(mesh.points.data, ...);
+    rec.indices_region_id = find_or_register_region(mesh.indices.data, ...);
+    rec.original_ptr = ptr;
+    // ... write record
+}
+```
+
+**APICMeshRecord structure:**
+```cpp
+#pragma pack(push, 1)
+typedef struct {
+    int32_t num_points;
+    int32_t num_tris;
+    uint8_t support_winding_number;
+    uint8_t bvh_constructor;
+    uint16_t bvh_leaf_size;
+    uint32_t points_region_id;
+    uint32_t indices_region_id;
+    uint32_t velocities_region_id;  // UINT32_MAX if absent
+    uint64_t original_ptr;
+} APICMeshRecord;
+#pragma pack(pop)
+```
+
+### 9.5 Handle Remapping During Load
+
+When a graph is loaded:
+
+1. **Memory regions are allocated** and data is copied from the serialized file
+2. **Meshes are recreated** using `wp_mesh_create_device()` with the restored array data
+3. **Handle remap table is built** mapping old pointers to new pointers
+4. **Pointer fixup** updates all registered handle locations
+
+**Building the remap table:**
+```cpp
+// Create mesh from serialized data
+uint64_t new_mesh_id = wp_mesh_create_device(ctx, points, velocities, indices, ...);
+
+// Add to remap table
+graph->handle_ptr_remap[rec.original_ptr] = new_mesh_id;
+```
+
+**Fixing up kernel arguments (scalar handles):**
+```cpp
+// For uint64-sized scalar parameters, check for remapping
+if (scalar_size == sizeof(uint64_t) && !graph->handle_ptr_remap.empty()) {
+    uint64_t* handle_ptr = reinterpret_cast<uint64_t*>(scalar.get());
+    auto remap_it = graph->handle_ptr_remap.find(*handle_ptr);
+    if (remap_it != graph->handle_ptr_remap.end()) {
+        *handle_ptr = remap_it->second;
+    }
+}
+```
+
+**Fixing up memory regions (handle arrays):**
+```cpp
+// Note: regions are in device memory, so must use cudaMemcpy
+static void apic_fixup_ptr_locations(APICGraphInternal* graph) {
+    for (const auto& loc : graph->ptr_locations) {
+        uint8_t* base = (uint8_t*)graph->regions[loc.region_id].ptr;
+        uint64_t region_size = graph->regions[loc.region_id].size;
+
+        for (uint64_t off = loc.offset; off + sizeof(uint64_t) <= region_size;
+             off += loc.stride) {
+            uint8_t* device_ptr = base + off;
+            uint64_t old_val;
+            cudaMemcpy(&old_val, device_ptr, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+
+            auto remap_it = graph->handle_ptr_remap.find(old_val);
+            if (remap_it != graph->handle_ptr_remap.end()) {
+                uint64_t new_val = remap_it->second;
+                cudaMemcpy(device_ptr, &new_val, sizeof(uint64_t), cudaMemcpyHostToDevice);
+            }
+
+            if (loc.stride == 0) break;  // Single pointer
+        }
+    }
+}
+```
+
+### 9.6 Usage Examples
+
+**Direct handle as kernel argument:**
+```python
+@wp.kernel
+def query_mesh(mesh: wp.handle, query_points: wp.array(dtype=wp.vec3), ...):
+    m = wp.mesh_get(mesh)
+    ...
+
+mesh = wp.Mesh(points, indices)
+
+with wp.ScopedCapture(apic=True) as cap:
+    wp.launch(query_mesh, inputs=[mesh.id, query_points, ...])
+
+wp.capture_save(cap.graph, "mesh_query", inputs={"query_points": query_points}, ...)
+
+# Later:
+loaded = wp.capture_load("mesh_query")
+wp.capture_launch(loaded)  # Mesh automatically recreated and remapped
+```
+
+**Handle in struct array:**
+```python
+@wp.struct
+class Body:
+    mesh: wp.handle
+    transform: wp.mat44
+
+bodies = wp.zeros(n, dtype=Body)
+for i, m in enumerate(meshes):
+    bodies[i].mesh = m.id
+
+with wp.ScopedCapture(apic=True) as cap:
+    wp.launch(kernel, inputs=[bodies, ...])
+
+# Handle locations auto-detected from Body.mesh field
+wp.capture_save(cap.graph, "simulation", inputs={"bodies": bodies}, ...)
+```
+
+---
+
+## 10. Module and Kernel Binary Handling
 
 ### 9.1 Module CUBIN Files
 
@@ -1711,9 +1956,9 @@ def _load_kernels(self):
 
 ---
 
-## 10. Error Handling
+## 11. Error Handling
 
-### 10.1 Capture-Time Errors
+### 11.1 Capture-Time Errors
 
 ```python
 class CaptureError(Exception):
@@ -1732,7 +1977,7 @@ def record_operation(self, op_type, **kwargs):
         )
 ```
 
-### 10.2 Load-Time Errors
+### 11.2 Load-Time Errors
 
 ```python
 class LoadError(Exception):
@@ -1754,9 +1999,9 @@ class BindingError(Exception):
 
 ---
 
-## 11. Testing Strategy
+## 12. Testing Strategy
 
-### 11.1 Unit Tests
+### 12.1 Unit Tests
 
 ```python
 # test_apic.py
@@ -1777,7 +2022,7 @@ def test_ptx_fallback():
     """Test loading on different GPU architecture."""
 ```
 
-### 11.2 Integration Tests
+### 12.2 Integration Tests
 
 ```python
 def test_multi_kernel_pipeline():
@@ -1790,7 +2035,7 @@ def test_cpp_header_compilation():
     """Test that generated C++ header compiles."""
 ```
 
-### 11.3 C++ Native Loading Tests
+### 12.3 C++ Native Loading Tests
 
 ```python
 def test_apic_native_loading():
@@ -1814,21 +2059,21 @@ def test_apic_native_loading():
 
 ---
 
-## 12. Future Extensions
+## 13. Future Extensions
 
-### 12.1 Conditional Graphs
+### 13.1 Conditional Graphs
 
 Support for `wp.capture_if()` / `wp.capture_while()` conditional nodes.
 
-### 12.2 Multi-GPU
+### 13.2 Multi-GPU
 
 Extend to support graphs spanning multiple devices.
 
-### 12.3 Graph Optimization
+### 13.3 Graph Optimization
 
 Post-load optimization passes (kernel fusion, memory reuse).
 
-### 12.4 Debugging Tools
+### 13.4 Debugging Tools
 
 - Graph visualization (DOT export)
 - Profiling integration
@@ -1836,15 +2081,15 @@ Post-load optimization passes (kernel fusion, memory reuse).
 
 ---
 
-## 13. Appendix
+## 14. Appendix
 
-### 13.1 File Format Magic Numbers
+### 14.1 File Format Magic Numbers
 
 ```
 WGF1 = 0x31464757 (little-endian "WGF1")
 ```
 
-### 13.2 Data Type Handling
+### 14.2 Data Type Handling
 
 Rather than encoding specific Warp types, we use a **byte-size approach** that handles arbitrary vector/matrix types:
 
@@ -1877,7 +2122,7 @@ This approach:
 
 For binding validation, we only check `element_size` matches between the binding and the provided array.
 
-### 13.3 CUDA Graph Node Updates
+### 14.3 CUDA Graph Node Updates
 
 **Original Design (Not Implemented):**
 
@@ -1916,7 +2161,7 @@ if graph._needs_rebuild:
 
 For graphs with many operations and frequent binding changes, the node update approach would be more efficient. For typical use cases (bind once, launch many times), the rebuild approach is sufficient and simpler to implement.
 
-### 13.4 References
+### 14.4 References
 
 - CUDA Graph Management: https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#cuda-graphs
 - CUDA Driver API: https://docs.nvidia.com/cuda/cuda-driver-api/

@@ -48,6 +48,7 @@ from warp._src.types import int32 as int32
 from warp._src.types import uint32 as uint32
 from warp._src.types import int64 as int64
 from warp._src.types import uint64 as uint64
+from warp._src.types import handle as handle
 from warp._src.types import float16 as float16
 from warp._src.types import float32 as float32
 from warp._src.types import float64 as float64

@@ -33,7 +33,7 @@ ARRAY_MAX_DIMS = warp._src.types.ARRAY_MAX_DIMS
 LAUNCH_MAX_DIMS = warp._src.types.LAUNCH_MAX_DIMS
 
 
-class APICParamBindingInfo(ctypes.Structure):
+class APICLaunchParam(ctypes.Structure):
     """Parameter binding info for array or scalar parameters - matches C struct in apic_types.h.
 
     For arrays: uses region_id, byte_offset, shape, strides, element_size
@@ -45,7 +45,7 @@ class APICParamBindingInfo(ctypes.Structure):
         ("is_array", ctypes.c_uint8),  # 1 for array, 0 for scalar
         ("ndim", ctypes.c_uint8),  # Number of dimensions (arrays only)
         ("param_index", ctypes.c_uint16),
-        ("region_id", ctypes.c_int32),  # For arrays, -1 for null. Ignored for scalars.
+        ("region_id", ctypes.c_int32),  # For arrays, -1 for null or scalar
         ("byte_offset", ctypes.c_uint64),  # Byte offset (arrays) or scalar_size (scalars)
         ("shape", ctypes.c_int64 * ARRAY_MAX_DIMS),  # Array shape or first 32 bytes of scalar
         ("strides", ctypes.c_int64 * ARRAY_MAX_DIMS),  # Array strides or next 32 bytes of scalar
@@ -68,7 +68,7 @@ class APICLaunchInfo(ctypes.Structure):
         ("module_hash", ctypes.c_char_p),
         ("is_forward", ctypes.c_uint8),
         ("_pad", ctypes.c_uint8 * 3),
-        ("params", ctypes.POINTER(APICParamBindingInfo)),
+        ("params", ctypes.POINTER(APICLaunchParam)),
         ("num_params", ctypes.c_int32),
     ]
 
@@ -128,7 +128,7 @@ class APICapture:
         self.modules: dict[str, ModuleInfo] = {}  # module_hash -> ModuleInfo
         self.kernels: dict[str, KernelInfo] = {}  # kernel_key -> KernelInfo
 
-        # Named parameter bindings (set during save)
+        # Named bindings (set during save)
         self.bindings: dict[str, int] = {}  # name -> region_id
 
         # Internal tracking
@@ -191,14 +191,39 @@ class APICapture:
         """Get the number of unique kernels recorded."""
         return len(self.kernels)
 
+    def _find_handle_offsets(self, dtype, base_offset: int = 0) -> list[int]:
+        """Recursively find byte offsets of wp.handle fields in a type.
+
+        Handles:
+        - Direct wp.handle type
+        - wp.struct containing wp.handle fields (nested recursively)
+        - wp.array dtype that is a struct containing handles
+
+        Returns list of byte offsets where handle pointers are located.
+        """
+        import warp
+        import warp._src.codegen
+
+        offsets = []
+        if dtype is warp.handle:
+            offsets.append(base_offset)
+        elif isinstance(dtype, warp._src.codegen.Struct):
+            # wp.struct - inspect its fields
+            for field_name, var in dtype.vars.items():
+                field_offset = getattr(dtype.ctype, field_name).offset
+                offsets.extend(self._find_handle_offsets(var.type, base_offset + field_offset))
+        return offsets
+
     def track_array(self, arr) -> tuple[int, int]:
         """
         Track an array, resolving to its base allocation.
         Registers the region with native code if new.
+        Also automatically registers any handle pointer locations in the dtype.
 
         Returns:
             (region_id, offset) - The region ID and byte offset within the region
         """
+        import warp
         import warp._src.context
 
         # Walk the _ref chain to find base allocation
@@ -235,15 +260,26 @@ class APICapture:
         )
         self.memory_regions[base_ptr] = region
 
+        # Auto-detect handle locations in the array's dtype (including nested structs)
+        handle_offsets = self._find_handle_offsets(arr.dtype)
+        if handle_offsets:
+            stride = warp.types.type_size_in_bytes(arr.dtype)
+            for handle_offset in handle_offsets:
+                runtime.core.wp_apic_register_ptr_location(self.native_state, region_id, handle_offset, stride)
+
         return region_id, offset
 
     def _get_element_size(self, arr) -> int:
         """Get the size of one element in bytes."""
+        import warp._src.codegen
+
         dtype = arr.dtype
         if hasattr(dtype, "_type_size_"):
             return dtype._type_size_
         elif hasattr(dtype, "_length_") and hasattr(dtype, "_type_"):
             return dtype._length_ * ctypes.sizeof(dtype._type_)
+        elif isinstance(dtype, warp._src.codegen.Struct):
+            return ctypes.sizeof(dtype.ctype)
         else:
             return ctypes.sizeof(dtype)
 
@@ -304,7 +340,7 @@ class APICapture:
             )
 
         # Build parameter bindings
-        param_bindings = self._build_param_bindings(launch, inputs, outputs)
+        launch_params = self._build_launch_params(launch, inputs, outputs)
 
         # Build APICLaunchInfo struct
         # Store strings as instance attributes to keep them alive
@@ -316,83 +352,84 @@ class APICapture:
         info.module_hash = self._module_hash_bytes
         info.is_forward = 1 if not launch.adjoint else 0
 
-        if param_bindings:
-            # Store param_bindings as instance attribute to keep it alive
-            self._current_param_bindings = param_bindings
-            info.params = ctypes.cast(param_bindings, ctypes.POINTER(APICParamBindingInfo))
-            info.num_params = len(param_bindings)
+        if launch_params:
+            # Store launch_params as instance attribute to keep it alive
+            self._current_launch_params = launch_params
+            info.params = ctypes.cast(launch_params, ctypes.POINTER(APICLaunchParam))
+            info.num_params = len(launch_params)
         else:
             info.params = None
             info.num_params = 0
 
         return info
 
-    def _build_param_bindings(self, launch, inputs=None, outputs=None):
-        """Build parameter bindings array for all parameters (arrays and scalars).
+    def _build_launch_params(self, launch, inputs=None, outputs=None):
+        """Build launch params array for all kernel parameters.
 
-        Launch bounds (shape/ndim/size) are embedded directly in the launch record,
-        not as a parameter binding. All other parameters starting from index 1 are captured.
+        Launch bounds (shape/ndim/size) are embedded directly in the launch record.
+        All other parameters starting from index 1 are captured.
         """
         import warp
 
+        # Filter to only include actual arrays (items with ptr attribute)
         original_arrays = []
         if inputs:
-            original_arrays.extend(inputs)
+            for item in inputs:
+                if hasattr(item, "ptr"):
+                    original_arrays.append(item)
         if outputs:
-            original_arrays.extend(outputs)
+            for item in outputs:
+                if hasattr(item, "ptr"):
+                    original_arrays.append(item)
 
         kernel = launch.kernel
-        bindings = []
+        params = []
 
         # Capture all parameters (starting from index 1, param 0 is launch_bounds)
         array_idx = 0
         for i, arg in enumerate(kernel.adj.args):
             param_idx = i + 1
-            param = launch.params[param_idx]
             arg_type = arg.type
 
-            binding = APICParamBindingInfo()
-            binding.param_index = param_idx
+            param = APICLaunchParam()
+            param.param_index = param_idx
 
             if isinstance(arg_type, warp._src.types.array):
                 # Array parameter
-                binding.is_array = 1
+                param.is_array = 1
 
                 arr = None
                 if array_idx < len(original_arrays):
-                    candidate = original_arrays[array_idx]
-                    if hasattr(candidate, "ptr"):
-                        arr = candidate
+                    arr = original_arrays[array_idx]
                     array_idx += 1
 
                 if arr is not None and arr.ptr:
                     region_id, offset = self.track_array(arr)
-                    binding.region_id = region_id
-                    binding.byte_offset = offset
-                    binding.ndim = arr.ndim
-                    binding.element_size = self._get_element_size(arr)
+                    param.region_id = region_id
+                    param.byte_offset = offset
+                    param.ndim = arr.ndim
+                    param.element_size = self._get_element_size(arr)
                     for d in range(min(arr.ndim, ARRAY_MAX_DIMS)):
-                        binding.shape[d] = arr.shape[d]
-                        binding.strides[d] = arr.strides[d]
+                        param.shape[d] = arr.shape[d]
+                        param.strides[d] = arr.strides[d]
                 else:
-                    binding.region_id = -1
-                    binding.byte_offset = 0
-                    binding.ndim = 0
-                    binding.element_size = 0
+                    param.region_id = -1
+                    param.byte_offset = 0
+                    param.ndim = 0
+                    param.element_size = 0
             else:
                 # Scalar parameter - store value bytes in shape[] and strides[]
-                binding.is_array = 0
-                binding.ndim = 0
-                binding.region_id = -1
-                binding.element_size = 0
+                param.is_array = 0
+                param.ndim = 0
+                param.region_id = -1
+                param.element_size = 0
 
-                # Get scalar bytes
-                value_bytes = bytes(param)
+                # Get scalar bytes from the ctypes param
+                value_bytes = bytes(launch.params[param_idx])
                 scalar_size = len(value_bytes)
-                binding.byte_offset = scalar_size  # Store size in byte_offset
+                param.byte_offset = scalar_size  # Store size in byte_offset
 
                 # Store value bytes in shape[] (32 bytes) and strides[] (32 bytes)
-                # Total 64 bytes available
                 max_scalar_size = ARRAY_MAX_DIMS * 8 * 2  # 64 bytes
                 if scalar_size > max_scalar_size:
                     raise ValueError(f"Scalar parameter too large: {scalar_size} bytes (max {max_scalar_size})")
@@ -401,26 +438,26 @@ class APICapture:
                 shape_bytes = (ctypes.c_uint8 * (ARRAY_MAX_DIMS * 8)).from_buffer_copy(
                     value_bytes[: min(scalar_size, ARRAY_MAX_DIMS * 8)].ljust(ARRAY_MAX_DIMS * 8, b"\x00")
                 )
-                binding.shape = (ctypes.c_int64 * ARRAY_MAX_DIMS).from_buffer_copy(shape_bytes)
+                param.shape = (ctypes.c_int64 * ARRAY_MAX_DIMS).from_buffer_copy(shape_bytes)
 
                 if scalar_size > ARRAY_MAX_DIMS * 8:
                     strides_bytes = (ctypes.c_uint8 * (ARRAY_MAX_DIMS * 8)).from_buffer_copy(
                         value_bytes[ARRAY_MAX_DIMS * 8 :].ljust(ARRAY_MAX_DIMS * 8, b"\x00")
                     )
-                    binding.strides = (ctypes.c_int64 * ARRAY_MAX_DIMS).from_buffer_copy(strides_bytes)
+                    param.strides = (ctypes.c_int64 * ARRAY_MAX_DIMS).from_buffer_copy(strides_bytes)
 
-            bindings.append(binding)
+            params.append(param)
 
-        if not bindings:
+        if not params:
             return None
 
         # Convert to ctypes array
-        arr = (APICParamBindingInfo * len(bindings))(*bindings)
-        return arr
+        result = (APICLaunchParam * len(params))(*params)
+        return result
 
     def set_binding(self, name: str, arr):
-        """Mark an array as a named parameter binding."""
+        """Mark an array as a named parameter."""
         region_id, offset = self.track_array(arr)
         if offset != 0:
-            raise ValueError(f"Binding '{name}' must be a base array, not a slice")
+            raise ValueError(f"Parameter '{name}' must be a base array, not a slice")
         self.bindings[name] = region_id

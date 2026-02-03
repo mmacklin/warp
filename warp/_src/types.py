@@ -246,6 +246,17 @@ class uint64(int_base):
     _type_ = ctypes.c_uint64
 
 
+class handle(uint64):
+    """Type for object handles (Mesh, Volume, BVH) in kernel parameters.
+
+    Behaves identically to uint64 but allows APIC to detect which params
+    need pointer remapping during replay.
+    """
+
+    # Use uint64 in generated C++ code (there's no wp::handle in native code)
+    _wp_native_name_ = "uint64"
+
+
 # Scalar type tuples - defined here as canonical source, used by TypeVars below
 int_types = (int8, uint8, int16, uint16, int32, uint32, int64, uint64)
 float_types = (float16, float32, float64)
@@ -2101,6 +2112,8 @@ def type_typestr(dtype: type) -> str:
         return "<i8"
     elif dtype is uint64:
         return "<u8"
+    elif dtype is handle:
+        return "<u8"
     elif isinstance(dtype, warp._src.codegen.Struct):
         return f"|V{ctypes.sizeof(dtype.ctype)}"
     elif hasattr(dtype, "_wp_ctype_"):
@@ -2368,6 +2381,10 @@ def scalars_equal_generic(a, b, match_generic=True):
             return True
         if a is Float and b is Float:
             return True
+
+    # handle and uint64 are interchangeable (handle is a semantic alias for uint64)
+    if (a is handle and b is uint64) or (a is uint64 and b is handle):
+        return True
 
     return a is b
 
@@ -6169,6 +6186,7 @@ simple_type_codes = {
     uint16: "u2",
     uint32: "u4",
     uint64: "u8",
+    handle: "u8",  # handle is a uint64 alias for object handles (Mesh, Volume, BVH)
     float16: "f2",
     float32: "f4",
     float64: "f8",
