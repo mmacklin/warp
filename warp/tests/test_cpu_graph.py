@@ -142,8 +142,8 @@ class TestCPUGraph(unittest.TestCase):
         graph = wp.capture_end(device=device)
 
         # Check operation count (should be at least 2 kernel launches)
-        self.assertIsNotNone(graph.apic_capture)
-        self.assertGreaterEqual(graph.apic_capture.operation_count, 2)
+        self.assertIsNotNone(graph.apic)
+        self.assertGreaterEqual(graph.apic.operation_count, 2)
 
     def test_cpu_capture_without_apic(self):
         """Test CPU capture with apic=False (no memory tracking for serialization)."""

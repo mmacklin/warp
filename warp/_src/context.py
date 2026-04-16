@@ -4045,14 +4045,14 @@ DeviceLike = Device | str | None
 
 
 class Graph:
-    def __init__(self, device: Device, capture_id: int | None = None, apic_capture=None):
+    def __init__(self, device: Device, capture_id: int | None = None, apic=None):
         self.device = device
         self.capture_id = capture_id
         self.module_execs: set[ModuleExec] = set()
         self.graph_exec: ctypes.c_void_p | None = None
         self.graph: ctypes.c_void_p | None = None
         # APIC capture state (optional, for graphs being captured)
-        self.apic_capture = apic_capture
+        self.apic = apic
 
         # APIC loaded state (populated when loaded from file)
         self._params: dict = {}  # name -> binding info (size, etc.)
@@ -4161,8 +4161,8 @@ class Graph:
 
         # For CPU graphs, just clean up APIC state
         if getattr(self, '_is_cpu_graph', False):
-            if hasattr(self, 'apic_capture') and self.apic_capture is not None:
-                self.apic_capture.destroy()
+            if hasattr(self, 'apic') and self.apic is not None:
+                self.apic.destroy()
             return
 
         try:
@@ -7803,8 +7803,8 @@ class Launch:
                 if graph is not None:
                     graph.retain_module_exec(self.module_exec)
                     # Build APIC launch info if recording
-                    if graph.apic_capture is not None:
-                        apic_info = graph.apic_capture.build_launch_info(self)
+                    if graph.apic is not None:
+                        apic_info = graph.apic.build_launch_info(self)
 
             if self.adjoint:
                 runtime.core.wp_cuda_launch_kernel(
@@ -8062,7 +8062,7 @@ def launch(
             if runtime.cpu_capture is not None:
                 graph = runtime.cpu_capture
                 graph.retain_module_exec(module_exec)
-                if graph.apic_capture is not None:
+                if graph.apic is not None:
                     apic_launch = Launch(
                         kernel=kernel,
                         hooks=hooks,
@@ -8072,10 +8072,10 @@ def launch(
                         device=device,
                         adjoint=adjoint,
                     )
-                    apic_info = graph.apic_capture.build_launch_info(apic_launch, inputs=inputs, outputs=outputs)
+                    apic_info = graph.apic.build_launch_info(apic_launch, inputs=inputs, outputs=outputs)
                     # Register host function for native replay
                     runtime.core.wp_apic_register_host_function(
-                        graph.apic_capture.native_state,
+                        graph.apic.native_state,
                         kernel.key.encode("utf-8"),
                         hooks.forward if hooks.forward else None,
                         hooks.backward if hooks.backward else None,
@@ -8111,7 +8111,7 @@ def launch(
                 if graph is not None:
                     graph.retain_module_exec(module_exec)
                     # Check if APIC recording is active and build launch info
-                    if graph.apic_capture is not None:
+                    if graph.apic is not None:
                         # Create a Launch object to build the APIC info
                         apic_launch = Launch(
                             kernel=kernel,
@@ -8125,7 +8125,7 @@ def launch(
                             adjoint=adjoint,
                         )
                         # Build APIC info with original arrays for proper tracking
-                        apic_info = graph.apic_capture.build_launch_info(apic_launch, inputs=inputs, outputs=outputs)
+                        apic_info = graph.apic.build_launch_info(apic_launch, inputs=inputs, outputs=outputs)
 
             if adjoint:
                 if hooks.backward is None:
@@ -9019,12 +9019,12 @@ def capture_begin(
         # CPU graph capture uses APIC mechanism only (no CUDA stream capture)
         from warp._src.apic import APICapture
 
-        apic_capture = APICapture(device, stream=None)
-        apic_capture.begin(track_memory=apic)
+        apic_state = APICapture(device, stream=None)
+        apic_state.begin(track_memory=apic)
 
         # Use the native state pointer as a unique capture ID
-        capture_id = ctypes.cast(apic_capture.native_state, ctypes.c_void_p).value
-        graph = Graph(device, capture_id, apic_capture)
+        capture_id = ctypes.cast(apic_state.native_state, ctypes.c_void_p).value
+        graph = Graph(device, capture_id, apic_state)
         graph._is_cpu_graph = True
         runtime.cpu_capture = graph
         device.captures[None] = graph  # CPU has no stream key
@@ -9059,14 +9059,14 @@ def capture_begin(
     capture_id = runtime.core.wp_cuda_stream_get_capture_id(stream.cuda_stream)
 
     # Create APIC capture if requested
-    apic_capture = None
+    apic_state = None
     if apic:
         from warp._src.apic import APICapture
 
-        apic_capture = APICapture(device, stream)
-        apic_capture.begin()
+        apic_state = APICapture(device, stream)
+        apic_state.begin()
 
-    graph = Graph(device, capture_id, apic_capture)
+    graph = Graph(device, capture_id, apic_state)
 
     _register_capture(device, stream, graph, capture_id)
 
@@ -9098,8 +9098,8 @@ def capture_end(device: DeviceLike = None, stream: Stream | None = None) -> Grap
         del device.captures[None]
         del runtime.captures[graph.capture_id]
         runtime.cpu_capture = None
-        if graph.apic_capture is not None:
-            graph.apic_capture.end()
+        if graph.apic is not None:
+            graph.apic.end()
         return graph
 
     # get the graph being captured
@@ -9123,8 +9123,8 @@ def capture_end(device: DeviceLike = None, stream: Stream | None = None) -> Grap
     graph.graph_exec = None  # Lazy initialization
 
     # End APIC recording if active
-    if graph.apic_capture is not None:
-        graph.apic_capture.end()
+    if graph.apic is not None:
+        graph.apic.end()
 
     return graph
 
@@ -9507,9 +9507,9 @@ def capture_launch(graph: Graph, stream: Stream | None = None):
             result = runtime.core.wp_apic_replay_loaded_host_graph(graph._native_graph)
             if not result:
                 raise RuntimeError(f"CPU graph replay failed: {runtime.get_error_string()}")
-        elif graph.apic_capture is not None and graph.apic_capture.native_state is not None:
+        elif graph.apic is not None and graph.apic.native_state is not None:
             # In-process captured CPU graph
-            result = runtime.core.wp_apic_replay_host_ops(graph.apic_capture.native_state)
+            result = runtime.core.wp_apic_replay_host_ops(graph.apic.native_state)
             if not result:
                 raise RuntimeError(f"CPU graph replay failed: {runtime.get_error_string()}")
         else:
@@ -9557,7 +9557,7 @@ def capture_save(
             wp.launch(my_kernel, dim=n, inputs=[a], outputs=[b])
         wp.capture_save(capture.graph, "my_graph", inputs={"a": a}, outputs={"b": b})
     """
-    if graph.apic_capture is None:
+    if graph.apic is None:
         raise RuntimeError("Graph was not captured with APIC enabled (was apic=False passed to capture_begin?)")
 
     from warp._src.apic import save_graph
@@ -9565,13 +9565,13 @@ def capture_save(
     # Set named bindings
     if inputs:
         for name, arr in inputs.items():
-            graph.apic_capture.set_binding(name, arr)
+            graph.apic.set_binding(name, arr)
 
     if outputs:
         for name, arr in outputs.items():
-            graph.apic_capture.set_binding(name, arr)
+            graph.apic.set_binding(name, arr)
 
-    save_graph(graph.apic_capture, path)
+    save_graph(graph.apic, path)
 
 
 def capture_load(path: str, device: DeviceLike = None):
@@ -9608,8 +9608,8 @@ def _track_array_for_capture(arr):
     if runtime is None:
         return
     # CPU capture
-    if runtime.cpu_capture is not None and runtime.cpu_capture.apic_capture is not None:
-        runtime.cpu_capture.apic_capture.track_array(arr)
+    if runtime.cpu_capture is not None and runtime.cpu_capture.apic is not None:
+        runtime.cpu_capture.apic.track_array(arr)
         return
     # CUDA capture
     if len(runtime.captures) > 0:
@@ -9619,8 +9619,8 @@ def _track_array_for_capture(arr):
             if runtime.core.wp_cuda_stream_is_capturing(stream.cuda_stream):
                 capture_id = runtime.core.wp_cuda_stream_get_capture_id(stream.cuda_stream)
                 graph = runtime.captures.get(capture_id)
-                if graph is not None and graph.apic_capture is not None:
-                    graph.apic_capture.track_array(arr)
+                if graph is not None and graph.apic is not None:
+                    graph.apic.track_array(arr)
 
 
 def copy(

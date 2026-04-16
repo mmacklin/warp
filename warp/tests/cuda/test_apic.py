@@ -58,10 +58,10 @@ def test_apic_capture_begin_end(test, device):
     graph = wp.capture_end(device=device)
 
     # Verify APIC capture was created
-    test.assertIsNotNone(graph.apic_capture)
-    test.assertEqual(graph.apic_capture.operation_count, 1)
-    test.assertEqual(graph.apic_capture.module_count, 1)
-    test.assertEqual(graph.apic_capture.kernel_count, 1)
+    test.assertIsNotNone(graph.apic)
+    test.assertEqual(graph.apic.operation_count, 1)
+    test.assertEqual(graph.apic.module_count, 1)
+    test.assertEqual(graph.apic.kernel_count, 1)
 
 
 def test_apic_scoped_capture(test, device):
@@ -75,8 +75,8 @@ def test_apic_scoped_capture(test, device):
         wp.launch(scale_kernel, dim=n, inputs=[input_data, output_data, 3.0], device=device)
 
     # Verify APIC capture
-    test.assertIsNotNone(capture.graph.apic_capture)
-    test.assertEqual(capture.graph.apic_capture.operation_count, 1)
+    test.assertIsNotNone(capture.graph.apic)
+    test.assertEqual(capture.graph.apic.operation_count, 1)
 
     # Execute the graph normally to verify it still works
     wp.capture_launch(capture.graph)
@@ -104,7 +104,7 @@ def test_apic_multiple_launches(test, device):
         wp.launch(scale_kernel, dim=n, inputs=[c, d, 2.0], device=device)
 
     # Verify multiple launches were recorded
-    test.assertEqual(capture.graph.apic_capture.operation_count, 2)
+    test.assertEqual(capture.graph.apic.operation_count, 2)
 
     # Execute and verify
     wp.capture_launch(capture.graph)
@@ -126,7 +126,7 @@ def test_apic_memory_regions(test, device):
     with wp.ScopedCapture(device=device, apic=True) as capture:
         wp.launch(scale_kernel, dim=n, inputs=[input_data, output_data, 2.0], device=device)
 
-    apic = capture.graph.apic_capture
+    apic = capture.graph.apic
 
     # Should have tracked memory regions for input and output arrays
     test.assertGreaterEqual(len(apic.memory_regions), 2)
@@ -245,7 +245,7 @@ def test_apic_kernel_info_tracking(test, device):
     with wp.ScopedCapture(device=device, apic=True) as capture:
         wp.launch(add_kernel, dim=n, inputs=[a, b, c], device=device)
 
-    apic = capture.graph.apic_capture
+    apic = capture.graph.apic
 
     # Check kernel info
     test.assertEqual(len(apic.kernels), 1)
@@ -268,7 +268,7 @@ def test_apic_launch_record(test, device):
     with wp.ScopedCapture(device=device, apic=True) as capture:
         wp.launch(saxpy_kernel, dim=n, inputs=[x, y, 3.0], device=device)
 
-    apic = capture.graph.apic_capture
+    apic = capture.graph.apic
 
     # Verify operation was recorded
     test.assertEqual(apic.operation_count, 1)
@@ -419,7 +419,7 @@ def test_apic_with_memory_ops(test, device):
             wp.launch(scale_kernel, dim=n, inputs=[tmp, dst, 2.0], device=device)
 
         # Verify operations were recorded (1 memcpy + 1 launch)
-        apic = capture.graph.apic_capture
+        apic = capture.graph.apic
         test.assertEqual(apic.operation_count, 2)
 
         # Execute original graph to verify it works
@@ -488,7 +488,7 @@ def test_apic_complex_pipeline(test, device):
             wp.copy(f, e)  # f = 10
             wp.launch(add_kernel, dim=n, inputs=[f, c, g], device=device)  # g = 10 + 5 = 15
 
-        apic = capture.graph.apic_capture
+        apic = capture.graph.apic
         # 3 kernel launches + 2 memory copies = 5 operations
         test.assertEqual(apic.operation_count, 5)
 
@@ -552,7 +552,7 @@ def test_apic_internal_allocation(test, device):
             wp.launch(scale_kernel, dim=n, inputs=[input_data, tmp, 2.0], device=device)
             wp.launch(add_kernel, dim=n, inputs=[tmp, input_data, output_data], device=device)
 
-        apic = capture.graph.apic_capture
+        apic = capture.graph.apic
         # Should have 3 memory regions: input, output, and internal tmp
         test.assertEqual(len(apic.memory_regions), 3)
 
@@ -618,7 +618,7 @@ def test_apic_multiple_internal_allocations(test, device):
             wp.launch(add_kernel, dim=n, inputs=[t3, input_data, output_data], device=device)  # out = 16 + 2 = 18
 
         # Should have 5 memory regions: input, output, t1, t2, t3
-        test.assertEqual(len(capture.graph.apic_capture.memory_regions), 5)
+        test.assertEqual(len(capture.graph.apic.memory_regions), 5)
 
         # Verify original graph
         wp.capture_launch(capture.graph)
