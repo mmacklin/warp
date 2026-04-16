@@ -67,7 +67,8 @@ class APICLaunchInfo(ctypes.Structure):
         ("kernel_key", ctypes.c_char_p),
         ("module_hash", ctypes.c_char_p),
         ("is_forward", ctypes.c_uint8),
-        ("_pad", ctypes.c_uint8 * 3),
+        ("ndim", ctypes.c_uint8),  # Number of launch dimensions, for parsing launch_bounds_t<N>
+        ("_pad", ctypes.c_uint8 * 2),
         ("params", ctypes.POINTER(APICLaunchParam)),
         ("num_params", ctypes.c_int32),
     ]
@@ -363,6 +364,7 @@ class APICapture:
         info.kernel_key = self._kernel_key_bytes
         info.module_hash = self._module_hash_bytes
         info.is_forward = 1 if not launch.adjoint else 0
+        info.ndim = len(launch.bounds.shape)
 
         if launch_params:
             # Store launch_params as instance attribute to keep it alive

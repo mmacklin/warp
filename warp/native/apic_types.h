@@ -243,7 +243,8 @@ typedef struct {
     const char* kernel_key;  // Kernel identifier string
     const char* module_hash;  // Module hash string
     uint8_t is_forward;  // 1 for forward, 0 for backward
-    uint8_t _pad[3];
+    uint8_t ndim;  // Number of launch dimensions (1-4), for parsing launch_bounds_t<N>
+    uint8_t _pad[2];
     const APICLaunchParam* params;  // Array of parameter bindings
     int32_t num_params;  // Number of parameter bindings
 } APICLaunchInfo;

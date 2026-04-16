@@ -42,10 +42,16 @@ def save_graph(capture: APICapture, path: str):
     # Create modules directory
     modules_dir.mkdir(parents=True, exist_ok=True)
 
-    # Export cubin files for each unique module
+    # Export module files for each unique module
     for _module_hash, module_info in capture.modules.items():
-        cubin_path = modules_dir / module_info.cubin_filename
-        _export_module_cubin(module_info, cubin_path)
+        if capture.device.is_cpu:
+            # CPU: export .o file (change extension from .cubin to .o)
+            obj_filename = module_info.cubin_filename.replace(".cubin", ".o")
+            obj_path = modules_dir / obj_filename
+            _export_module_obj(module_info, obj_path)
+        else:
+            cubin_path = modules_dir / module_info.cubin_filename
+            _export_module_cubin(module_info, cubin_path)
 
     runtime = warp._src.context.runtime
 
@@ -128,3 +134,39 @@ def _export_module_cubin(module_info: ModuleInfo, cubin_path: Path):
                         return
 
     raise ValueError(f"Could not find cubin for module {module_info.module_name} ({module_info.module_hash})")
+
+
+def _export_module_obj(module_info: ModuleInfo, obj_path: Path):
+    """Export a CPU module's object file."""
+    import glob
+    import shutil
+
+    import warp
+    import warp._src.context
+
+    user_modules = warp._src.context.user_modules
+    module_hash_short = module_info.module_hash[:7]
+
+    for module in user_modules.values():
+        if module.name == module_info.module_name:
+            module_name_short = module.get_module_identifier()
+            module_dir = os.path.join(warp.config.kernel_cache_dir, module_name_short)
+            if os.path.exists(module_dir):
+                patterns = [
+                    os.path.join(module_dir, "*.o"),
+                ]
+                for pattern in patterns:
+                    matches = glob.glob(pattern)
+                    if matches:
+                        shutil.copy2(matches[0], obj_path)
+                        return
+
+            # Fallback: search cache by hash
+            cache_dir = warp.config.kernel_cache_dir
+            for root, _dirs, files in os.walk(cache_dir):
+                for f in files:
+                    if module_hash_short in f and f.endswith(".o"):
+                        shutil.copy2(os.path.join(root, f), obj_path)
+                        return
+
+    raise ValueError(f"Could not find object file for module {module_info.module_name} ({module_info.module_hash})")

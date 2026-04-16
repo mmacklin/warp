@@ -543,13 +543,17 @@ apic_find_or_register_region_with_data(APICStateInternal* state, uint64_t ptr, u
     // Register new region
     uint32_t region_id = wp_apic_register_memory_region(state, ptr, size, elem_size);
 
-    // Capture device data for this region
+    // Capture data - use memcpy for CPU, cudaMemcpy for CUDA
     auto& region = state->memory_regions[ptr];
     region.initial_data.resize(size);
-    cudaError_t err = cudaMemcpy(region.initial_data.data(), (void*)ptr, size, cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "APIC: Warning - failed to capture device data for region %u: %d\n", region_id, err);
-        region.initial_data.clear();
+    if (state->is_cpu) {
+        memcpy(region.initial_data.data(), (void*)ptr, size);
+    } else {
+        cudaError_t err = cudaMemcpy(region.initial_data.data(), (void*)ptr, size, cudaMemcpyDeviceToHost);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "APIC: Warning - failed to capture device data for region %u: %d\n", region_id, err);
+            region.initial_data.clear();
+        }
     }
 
     return region_id;
@@ -809,6 +813,7 @@ static const uint32_t WGF_SECTION_OPERATIONS = APIC_SECTION_OPERATIONS;
 struct APICGraphInternal {
     void* cuda_context;
     int target_arch;
+    bool is_cpu = false;  // True when loaded as a CPU graph
 
     // Loaded modules
     std::unordered_map<std::string, APICModule> modules;
@@ -840,6 +845,9 @@ struct APICGraphInternal {
     // Mesh IDs created by this graph (for cleanup)
     std::vector<uint64_t> created_mesh_ids;
 
+    // CPU graph support: host function pointers (kernel_key -> {forward_fn, backward_fn})
+    std::unordered_map<std::string, std::pair<void*, void*>> host_functions;
+
     // CUDA graph (built once on first access)
     CUgraph cuda_graph;
     CUgraphExec cuda_graph_exec;
@@ -858,30 +866,41 @@ struct APICGraphInternal {
 
     ~APICGraphInternal()
     {
-        ContextGuard guard(cuda_context);
-
-        // Destroy meshes created by this graph
-        for (uint64_t mesh_id : created_mesh_ids) {
-            wp_mesh_destroy_device(mesh_id);
-        }
-
-        // Free CUDA graph resources using runtime API
-        if (cuda_graph_exec) {
-            cudaGraphExecDestroy((cudaGraphExec_t)cuda_graph_exec);
-        }
-        if (cuda_graph) {
-            cudaGraphDestroy((cudaGraph_t)cuda_graph);
-        }
-        // Free allocated memory regions using runtime API
-        for (auto& pair : regions) {
-            if (pair.second.ptr) {
-                cudaFree(pair.second.ptr);
+        if (is_cpu) {
+            // CPU path: free host-allocated memory regions
+            for (auto& pair : regions) {
+                if (pair.second.ptr) {
+                    free(pair.second.ptr);
+                }
             }
-        }
-        // Unload modules using wrapper function
-        for (auto& pair : modules) {
-            if (pair.second.cuda_module) {
-                cuModuleUnload_f(pair.second.cuda_module);
+            // Module unloading for CPU is handled by Python (wp_unload_obj);
+            // no CUDA graph or module cleanup needed.
+        } else {
+            ContextGuard guard(cuda_context);
+
+            // Destroy meshes created by this graph
+            for (uint64_t mesh_id : created_mesh_ids) {
+                wp_mesh_destroy_device(mesh_id);
+            }
+
+            // Free CUDA graph resources using runtime API
+            if (cuda_graph_exec) {
+                cudaGraphExecDestroy((cudaGraphExec_t)cuda_graph_exec);
+            }
+            if (cuda_graph) {
+                cudaGraphDestroy((cudaGraph_t)cuda_graph);
+            }
+            // Free allocated memory regions using runtime API
+            for (auto& pair : regions) {
+                if (pair.second.ptr) {
+                    cudaFree(pair.second.ptr);
+                }
+            }
+            // Unload modules using wrapper function
+            for (auto& pair : modules) {
+                if (pair.second.cuda_module) {
+                    cuModuleUnload_f(pair.second.cuda_module);
+                }
             }
         }
     }
@@ -1083,11 +1102,15 @@ static bool apic_init_memory(const uint8_t* data, size_t size, APICGraphInternal
         if (rec->has_initial_data) {
             auto it = graph->regions.find(rec->region_id);
             if (it != graph->regions.end() && it->second.ptr) {
-                // Copy data to device using runtime API
-                cudaError_t err = cudaMemcpy(it->second.ptr, ptr, rec->size, cudaMemcpyHostToDevice);
-                if (err != cudaSuccess) {
-                    wp::set_error_string("Failed to initialize memory region %u", rec->region_id);
-                    return false;
+                if (graph->is_cpu) {
+                    memcpy(it->second.ptr, ptr, rec->size);
+                } else {
+                    // Copy data to device using runtime API
+                    cudaError_t err = cudaMemcpy(it->second.ptr, ptr, rec->size, cudaMemcpyHostToDevice);
+                    if (err != cudaSuccess) {
+                        wp::set_error_string("Failed to initialize memory region %u", rec->region_id);
+                        return false;
+                    }
                 }
             }
             ptr += rec->size;
@@ -1186,24 +1209,42 @@ static void apic_fixup_ptr_locations(APICGraphInternal* graph)
             // Single pointer at offset
             if (loc.offset + sizeof(uint64_t) <= region_size) {
                 uint8_t* device_ptr = base + loc.offset;
-                uint64_t old_val;
-                cudaMemcpy(&old_val, device_ptr, sizeof(uint64_t), cudaMemcpyDeviceToHost);
-                auto remap_it = graph->handle_ptr_remap.find(old_val);
-                if (remap_it != graph->handle_ptr_remap.end()) {
-                    uint64_t new_val = remap_it->second;
-                    cudaMemcpy(device_ptr, &new_val, sizeof(uint64_t), cudaMemcpyHostToDevice);
+                if (graph->is_cpu) {
+                    // Direct host memory access
+                    uint64_t old_val = *(uint64_t*)device_ptr;
+                    auto remap_it = graph->handle_ptr_remap.find(old_val);
+                    if (remap_it != graph->handle_ptr_remap.end()) {
+                        *(uint64_t*)device_ptr = remap_it->second;
+                    }
+                } else {
+                    uint64_t old_val;
+                    cudaMemcpy(&old_val, device_ptr, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+                    auto remap_it = graph->handle_ptr_remap.find(old_val);
+                    if (remap_it != graph->handle_ptr_remap.end()) {
+                        uint64_t new_val = remap_it->second;
+                        cudaMemcpy(device_ptr, &new_val, sizeof(uint64_t), cudaMemcpyHostToDevice);
+                    }
                 }
             }
         } else {
             // Array of pointers with stride
             for (uint64_t off = loc.offset; off + sizeof(uint64_t) <= region_size; off += loc.stride) {
                 uint8_t* device_ptr = base + off;
-                uint64_t old_val;
-                cudaMemcpy(&old_val, device_ptr, sizeof(uint64_t), cudaMemcpyDeviceToHost);
-                auto remap_it = graph->handle_ptr_remap.find(old_val);
-                if (remap_it != graph->handle_ptr_remap.end()) {
-                    uint64_t new_val = remap_it->second;
-                    cudaMemcpy(device_ptr, &new_val, sizeof(uint64_t), cudaMemcpyHostToDevice);
+                if (graph->is_cpu) {
+                    // Direct host memory access
+                    uint64_t old_val = *(uint64_t*)device_ptr;
+                    auto remap_it = graph->handle_ptr_remap.find(old_val);
+                    if (remap_it != graph->handle_ptr_remap.end()) {
+                        *(uint64_t*)device_ptr = remap_it->second;
+                    }
+                } else {
+                    uint64_t old_val;
+                    cudaMemcpy(&old_val, device_ptr, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+                    auto remap_it = graph->handle_ptr_remap.find(old_val);
+                    if (remap_it != graph->handle_ptr_remap.end()) {
+                        uint64_t new_val = remap_it->second;
+                        cudaMemcpy(device_ptr, &new_val, sizeof(uint64_t), cudaMemcpyHostToDevice);
+                    }
                 }
             }
         }
@@ -1315,16 +1356,20 @@ static bool apic_rebuild_cuda_graph(APICGraphInternal* graph, CUstream stream)
             std::vector<void*> args;
             std::vector<std::unique_ptr<uint8_t[]>> arg_storage;
 
-            // Create launch_bounds_t as param[0] from embedded data in record
-            auto bounds = std::make_unique<uint8_t[]>(sizeof(apic_launch_bounds_t));
-            apic_launch_bounds_t* bounds_ptr = reinterpret_cast<apic_launch_bounds_t*>(bounds.get());
-            memset(bounds_ptr, 0, sizeof(apic_launch_bounds_t));
-            bounds_ptr->ndim = rec->ndim;
-            bounds_ptr->size = rec->size;
-            for (int d = 0; d < rec->ndim && d < APIC_LAUNCH_MAX_DIMS; d++) {
-                bounds_ptr->shape[d] = rec->shape[d];
-            }
-            args.push_back(bounds_ptr);
+            // Create launch_bounds_t<N> as param[0] from embedded data in record.
+            // Layout: int shape[N], size_t size, bool tiled (varies by N).
+            int ndim = rec->ndim;
+            size_t shape_bytes = ndim * sizeof(int);
+            size_t size_offset = (shape_bytes + sizeof(size_t) - 1) & ~(sizeof(size_t) - 1);
+            size_t bounds_total = size_offset + sizeof(size_t) + sizeof(bool);
+            auto bounds = std::make_unique<uint8_t[]>(bounds_total);
+            memset(bounds.get(), 0, bounds_total);
+            int* shape_ptr = reinterpret_cast<int*>(bounds.get());
+            for (int d = 0; d < ndim && d < APIC_LAUNCH_MAX_DIMS; d++)
+                shape_ptr[d] = rec->shape[d];
+            *reinterpret_cast<size_t*>(bounds.get() + size_offset) = rec->size;
+            *reinterpret_cast<bool*>(bounds.get() + size_offset + sizeof(size_t)) = false;
+            args.push_back(bounds.get());
             arg_storage.push_back(std::move(bounds));
 
             // Parse param bindings (arrays and scalars)
@@ -1466,7 +1511,12 @@ APICGraph wp_apic_load_graph(void* context, const char* path)
         return nullptr;
     }
 
-    ContextGuard guard(context);
+    // Determine CPU vs CUDA mode: NULL context means CPU
+    bool is_cpu = (context == nullptr);
+
+    if (!is_cpu) {
+        ContextGuard guard(context);
+    }
 
     // Determine base path and construct file paths
     std::string path_str(path);
@@ -1516,6 +1566,7 @@ APICGraph wp_apic_load_graph(void* context, const char* path)
     graph->cuda_context = context;
     graph->target_arch = header->target_arch;
     graph->base_path = base_name;
+    graph->is_cpu = is_cpu;
 
     // Parse section table using direct struct reads
     const APICSectionEntry* sections
@@ -1559,39 +1610,22 @@ APICGraph wp_apic_load_graph(void* context, const char* path)
         return nullptr;
     }
 
-    // Load cubin modules using the existing warp API
-    for (auto& pair : graph->modules) {
-        std::string cubin_path = modules_dir + "/" + pair.second.cubin_filename;
+    if (is_cpu) {
+        // CPU path: skip module loading (Python handles it via wp_load_obj + wp_lookup,
+        // then calls wp_apic_graph_register_host_function() to register function pointers)
 
-// Try with forward slash on Unix, backslash on Windows
-#ifdef _WIN32
-        std::replace(cubin_path.begin(), cubin_path.end(), '/', '\\');
-#endif
-
-        // Use wp_cuda_load_module which handles file loading
-        CUmodule cuda_module = (CUmodule)wp_cuda_load_module(context, cubin_path.c_str());
-        if (!cuda_module) {
-            wp::set_error_string("Failed to load module %s", cubin_path.c_str());
-            delete graph;
-            return nullptr;
-        }
-        pair.second.cuda_module = cuda_module;
-    }
-
-    // Use ContextGuard to ensure all operations use the correct CUDA context
-    {
-        ContextGuard guard(context);
-
-        // Allocate memory regions using runtime API
+        // Allocate memory regions with malloc
         for (auto& pair : graph->regions) {
-            void* device_ptr = nullptr;
-            cudaError_t err = cudaMalloc(&device_ptr, pair.second.size);
-            if (err != cudaSuccess) {
-                wp::set_error_string("Failed to allocate %llu bytes: %d", (unsigned long long)pair.second.size, err);
+            void* host_ptr = malloc(pair.second.size);
+            if (!host_ptr) {
+                wp::set_error_string("Failed to allocate %llu bytes for CPU region",
+                    (unsigned long long)pair.second.size);
                 delete graph;
                 return nullptr;
             }
-            pair.second.ptr = device_ptr;
+            // Zero-initialize (matches cudaMalloc behavior for consistency)
+            memset(host_ptr, 0, pair.second.size);
+            pair.second.ptr = host_ptr;
         }
 
         // Initialize memory with saved data
@@ -1600,18 +1634,63 @@ APICGraph wp_apic_load_graph(void* context, const char* path)
             return nullptr;
         }
 
-        // Synchronize to ensure memory is ready before mesh creation
-        cudaDeviceSynchronize();
-    }
+        // Skip mesh creation and handle fixup for CPU (not supported yet)
 
-    // Create meshes from serialized data (populates handle_ptr_remap)
-    if (!apic_create_meshes(graph)) {
-        delete graph;
-        return nullptr;
-    }
+    } else {
+        // CUDA path: load cubin modules
+        for (auto& pair : graph->modules) {
+            std::string cubin_path = modules_dir + "/" + pair.second.cubin_filename;
 
-    // Fixup handle pointers in memory regions (e.g., Mesh, Volume, BVH)
-    apic_fixup_ptr_locations(graph);
+// Try with forward slash on Unix, backslash on Windows
+#ifdef _WIN32
+            std::replace(cubin_path.begin(), cubin_path.end(), '/', '\\');
+#endif
+
+            // Use wp_cuda_load_module which handles file loading
+            CUmodule cuda_module = (CUmodule)wp_cuda_load_module(context, cubin_path.c_str());
+            if (!cuda_module) {
+                wp::set_error_string("Failed to load module %s", cubin_path.c_str());
+                delete graph;
+                return nullptr;
+            }
+            pair.second.cuda_module = cuda_module;
+        }
+
+        // Use ContextGuard to ensure all operations use the correct CUDA context
+        {
+            ContextGuard guard(context);
+
+            // Allocate memory regions using runtime API
+            for (auto& pair : graph->regions) {
+                void* device_ptr = nullptr;
+                cudaError_t err = cudaMalloc(&device_ptr, pair.second.size);
+                if (err != cudaSuccess) {
+                    wp::set_error_string("Failed to allocate %llu bytes: %d", (unsigned long long)pair.second.size, err);
+                    delete graph;
+                    return nullptr;
+                }
+                pair.second.ptr = device_ptr;
+            }
+
+            // Initialize memory with saved data
+            if (memory_ptr && !apic_init_memory(memory_ptr, memory_size, graph)) {
+                delete graph;
+                return nullptr;
+            }
+
+            // Synchronize to ensure memory is ready before mesh creation
+            cudaDeviceSynchronize();
+        }
+
+        // Create meshes from serialized data (populates handle_ptr_remap)
+        if (!apic_create_meshes(graph)) {
+            delete graph;
+            return nullptr;
+        }
+
+        // Fixup handle pointers in memory regions (e.g., Mesh, Volume, BVH)
+        apic_fixup_ptr_locations(graph);
+    }
 
     // Parse operations
     if (operations_ptr && !apic_parse_operations(operations_ptr, operations_size, graph)) {
@@ -1635,7 +1714,9 @@ int wp_apic_set_param(APICGraph graph, const char* name, const void* data, size_
     if (!graph || !name || !data)
         return 0;
 
-    ContextGuard guard(graph->cuda_context);
+    if (!graph->is_cpu) {
+        ContextGuard guard(graph->cuda_context);
+    }
 
     // Look up in params
     auto param_it = graph->bindings.find(name);
@@ -1659,11 +1740,15 @@ int wp_apic_set_param(APICGraph graph, const char* name, const void* data, size_
         return 0;
     }
 
-    // Copy data to the pre-allocated device memory (device-to-device async copy since input is a device pointer)
-    cudaError_t err = cudaMemcpyAsync(region_it->second.ptr, data, size, cudaMemcpyDeviceToDevice, 0);
-    if (err != cudaSuccess) {
-        wp::set_error_string("Failed to copy parameter data: %d", err);
-        return 0;
+    if (graph->is_cpu) {
+        memcpy(region_it->second.ptr, data, size);
+    } else {
+        // Copy data to the pre-allocated device memory (device-to-device async copy since input is a device pointer)
+        cudaError_t err = cudaMemcpyAsync(region_it->second.ptr, data, size, cudaMemcpyDeviceToDevice, 0);
+        if (err != cudaSuccess) {
+            wp::set_error_string("Failed to copy parameter data: %d", err);
+            return 0;
+        }
     }
 
     return 1;
@@ -1691,7 +1776,9 @@ int wp_apic_get_param(APICGraph graph, const char* name, void* data, size_t size
     if (!graph || !name || !data)
         return 0;
 
-    ContextGuard guard(graph->cuda_context);
+    if (!graph->is_cpu) {
+        ContextGuard guard(graph->cuda_context);
+    }
 
     // Look up in params
     auto param_it = graph->bindings.find(name);
@@ -1715,11 +1802,15 @@ int wp_apic_get_param(APICGraph graph, const char* name, void* data, size_t size
         return 0;
     }
 
-    // Copy data from the pre-allocated device memory to the destination (device-to-device async)
-    cudaError_t err = cudaMemcpyAsync(data, region_it->second.ptr, size, cudaMemcpyDeviceToDevice, 0);
-    if (err != cudaSuccess) {
-        wp::set_error_string("Failed to copy parameter data: %d", err);
-        return 0;
+    if (graph->is_cpu) {
+        memcpy(data, region_it->second.ptr, size);
+    } else {
+        // Copy data from the pre-allocated device memory to the destination (device-to-device async)
+        cudaError_t err = cudaMemcpyAsync(data, region_it->second.ptr, size, cudaMemcpyDeviceToDevice, 0);
+        if (err != cudaSuccess) {
+            wp::set_error_string("Failed to copy parameter data: %d", err);
+            return 0;
+        }
     }
 
     return 1;
@@ -1868,7 +1959,7 @@ static void apic_call_cpu_bwd(void* fn, const int* shape, size_t size, void* arg
 }
 
 // Helper: extract shape and size from a launch_bounds_t<N> given N
-static void apic_parse_launch_bounds(const void* bounds, int ndim, int* out_shape, size_t* out_size)
+void apic_parse_launch_bounds(const void* bounds, int ndim, int* out_shape, size_t* out_size)
 {
     // launch_bounds_t<N> layout: int shape[N], size_t size, bool tiled
     const int* shape_ptr = reinterpret_cast<const int*>(bounds);
@@ -2149,6 +2240,237 @@ int wp_apic_replay_host_ops(APICState state)
 
         default:
             wp::set_error_string("Unknown operation type during CPU replay: %d", hdr->op_type);
+            return 0;
+        }
+
+        // Advance to next operation
+        ptr = op_start + hdr->total_size;
+    }
+
+    return 1;
+}
+
+// =============================================================================
+// APIC Loaded CPU Graph Support
+// =============================================================================
+
+void wp_apic_graph_register_host_function(APICGraph graph, const char* kernel_key, void* forward_fn, void* backward_fn)
+{
+    if (!graph || !kernel_key)
+        return;
+    graph->host_functions[std::string(kernel_key)] = { forward_fn, backward_fn };
+}
+
+// Build CPU kernel args from APIC parameter records, resolving pointers from APICGraphInternal.
+// Mirrors apic_build_host_args() but uses graph->regions instead of state->region_id_to_ptr.
+static size_t apic_build_host_args_from_graph(
+    const APICLaunchParamRecord* params,
+    int num_params,
+    APICGraphInternal* graph,
+    uint8_t* args_buf,
+    size_t buf_capacity)
+{
+    size_t offset = 0;
+
+    for (int j = 0; j < num_params; j++) {
+        const APICLaunchParamRecord& p = params[j];
+
+        if (p.is_array) {
+            // Align to 8 bytes (pointer alignment, matches array_t<T> alignment)
+            offset = (offset + 7) & ~(size_t)7;
+            if (offset + WP_ARRAY_T_SIZE > buf_capacity)
+                return 0;
+
+            wp::array_t<int> arr = {};
+            void* resolved = apic_resolve_region_ptr(graph, p.region_id, p.byte_offset);
+            arr.data = (int*)resolved;
+            arr.grad = nullptr;
+            for (int d = 0; d < APIC_MAX_DIMS; d++) {
+                arr.shape.dims[d] = (int)p.shape[d];
+                arr.strides[d] = (int)p.strides[d];
+            }
+            arr.ndim = p.ndim;
+            memcpy(args_buf + offset, &arr, WP_ARRAY_T_SIZE);
+            offset += WP_ARRAY_T_SIZE;
+        } else {
+            // Scalar parameter
+            size_t scalar_size = p.byte_offset;
+            if (scalar_size == 0)
+                continue;
+
+            // Align to natural alignment (at most 8)
+            size_t align = 1;
+            if (scalar_size >= 8)
+                align = 8;
+            else if (scalar_size >= 4)
+                align = 4;
+            else if (scalar_size >= 2)
+                align = 2;
+            offset = (offset + align - 1) & ~(align - 1);
+
+            if (offset + scalar_size > buf_capacity)
+                return 0;
+
+            // Scalar bytes stored in shape[] (first 32B) and strides[] (next 32B)
+            const uint8_t* shape_bytes = reinterpret_cast<const uint8_t*>(p.shape);
+            const uint8_t* strides_bytes = reinterpret_cast<const uint8_t*>(p.strides);
+            size_t first_part = std::min(scalar_size, (size_t)(APIC_MAX_DIMS * sizeof(int64_t)));
+            memcpy(args_buf + offset, shape_bytes, first_part);
+            if (scalar_size > first_part) {
+                memcpy(args_buf + offset + first_part, strides_bytes, scalar_size - first_part);
+            }
+            offset += scalar_size;
+        }
+    }
+
+    return offset;
+}
+
+int wp_apic_replay_loaded_host_graph(APICGraph graph)
+{
+    if (!graph) {
+        wp::set_error_string("Null graph passed to wp_apic_replay_loaded_host_graph");
+        return 0;
+    }
+
+    if (!graph->is_cpu) {
+        wp::set_error_string("wp_apic_replay_loaded_host_graph called on a CUDA graph");
+        return 0;
+    }
+
+    const uint8_t* ptr = graph->operation_stream.data();
+    const uint8_t* end = ptr + graph->operation_stream.size();
+
+    // Temporary buffer for reconstructed kernel args (reused across launches)
+    std::vector<uint8_t> args_buf(4096);
+
+    for (uint32_t i = 0; i < graph->operation_count && ptr < end; i++) {
+        const APICOpHeader* hdr = reinterpret_cast<const APICOpHeader*>(ptr);
+        const uint8_t* op_start = ptr;
+
+        switch (hdr->op_type) {
+        case APIC_OP_KERNEL_LAUNCH: {
+            const APICLaunchRecord* rec = reinterpret_cast<const APICLaunchRecord*>(ptr);
+            const uint8_t* var_data = ptr + sizeof(APICLaunchRecord);
+
+            // Parse kernel key
+            std::string key_str(reinterpret_cast<const char*>(var_data), rec->kernel_key_len);
+
+            // Look up host function
+            auto fn_it = graph->host_functions.find(key_str);
+            if (fn_it == graph->host_functions.end()) {
+                wp::set_error_string("Host function not found for loaded graph replay: %s", key_str.c_str());
+                return 0;
+            }
+
+            int ndim = rec->ndim;
+            int shape[APIC_LAUNCH_MAX_DIMS] = {};
+            for (int d = 0; d < ndim && d < APIC_LAUNCH_MAX_DIMS; d++)
+                shape[d] = rec->shape[d];
+            size_t launch_size = rec->size;
+
+            // Parse parameter bindings
+            const uint8_t* params_ptr = var_data + rec->kernel_key_len + rec->module_hash_len;
+            const APICLaunchParamRecord* params
+                = reinterpret_cast<const APICLaunchParamRecord*>(params_ptr);
+
+            // Ensure args buffer is large enough
+            size_t estimated_size = rec->num_params * (WP_ARRAY_T_SIZE + 8);
+            if (args_buf.size() < estimated_size)
+                args_buf.resize(estimated_size);
+
+            if (rec->is_forward) {
+                size_t args_size = apic_build_host_args_from_graph(
+                    params, rec->num_params, graph, args_buf.data(), args_buf.size());
+                if (args_size == 0 && rec->num_params > 0) {
+                    wp::set_error_string("Failed to reconstruct kernel args for: %s", key_str.c_str());
+                    return 0;
+                }
+                void* fwd = fn_it->second.first;
+                if (!fwd) {
+                    wp::set_error_string("No forward function registered for: %s", key_str.c_str());
+                    return 0;
+                }
+                switch (ndim) {
+                case 1: apic_call_cpu_fwd<1>(fwd, shape, launch_size, args_buf.data()); break;
+                case 2: apic_call_cpu_fwd<2>(fwd, shape, launch_size, args_buf.data()); break;
+                case 3: apic_call_cpu_fwd<3>(fwd, shape, launch_size, args_buf.data()); break;
+                case 4: apic_call_cpu_fwd<4>(fwd, shape, launch_size, args_buf.data()); break;
+                default:
+                    wp::set_error_string("Unsupported launch ndim %d for: %s", ndim, key_str.c_str());
+                    return 0;
+                }
+            } else {
+                void* bwd = fn_it->second.second;
+                if (!bwd) {
+                    wp::set_error_string("No backward function registered for: %s", key_str.c_str());
+                    return 0;
+                }
+                int half = rec->num_params / 2;
+                size_t fwd_size = apic_build_host_args_from_graph(
+                    params, half, graph, args_buf.data(), args_buf.size());
+                if (fwd_size == 0 && half > 0) {
+                    wp::set_error_string("Failed to reconstruct forward args for backward: %s", key_str.c_str());
+                    return 0;
+                }
+                std::vector<uint8_t> adj_buf(args_buf.size());
+                size_t adj_size = apic_build_host_args_from_graph(
+                    params + half, rec->num_params - half, graph, adj_buf.data(), adj_buf.size());
+                (void)adj_size;
+                switch (ndim) {
+                case 1: apic_call_cpu_bwd<1>(bwd, shape, launch_size, args_buf.data(), adj_buf.data()); break;
+                case 2: apic_call_cpu_bwd<2>(bwd, shape, launch_size, args_buf.data(), adj_buf.data()); break;
+                case 3: apic_call_cpu_bwd<3>(bwd, shape, launch_size, args_buf.data(), adj_buf.data()); break;
+                case 4: apic_call_cpu_bwd<4>(bwd, shape, launch_size, args_buf.data(), adj_buf.data()); break;
+                default:
+                    wp::set_error_string("Unsupported launch ndim %d for backward: %s", ndim, key_str.c_str());
+                    return 0;
+                }
+            }
+            break;
+        }
+
+        case APIC_OP_MEMCPY_H2H:
+        case APIC_OP_MEMCPY_D2D: {
+            const APICMemcpyD2DRecord* rec = reinterpret_cast<const APICMemcpyD2DRecord*>(ptr);
+            void* dst = apic_resolve_region_ptr(graph, rec->dst_region_id, rec->dst_offset);
+            void* src = apic_resolve_region_ptr(graph, rec->src_region_id, rec->src_offset);
+            if (dst && src)
+                memcpy(dst, src, rec->size);
+            break;
+        }
+
+        case APIC_OP_MEMCPY_H2D: {
+            // H2D with inline data -- copy inline bytes to destination region
+            const APICMemcpyH2DRecord* rec = reinterpret_cast<const APICMemcpyH2DRecord*>(ptr);
+            void* dst = apic_resolve_region_ptr(graph, rec->dst_region_id, rec->dst_offset);
+            const void* src_data = ptr + sizeof(APICMemcpyH2DRecord);
+            if (dst)
+                memcpy(dst, src_data, rec->size);
+            break;
+        }
+
+        case APIC_OP_MEMSET: {
+            const APICMemsetRecord* rec = reinterpret_cast<const APICMemsetRecord*>(ptr);
+            void* dst = apic_resolve_region_ptr(graph, rec->region_id, rec->offset);
+            if (dst) {
+                if ((rec->size % 4) > 0) {
+                    memset(dst, rec->value, rec->size);
+                } else {
+                    const size_t num_words = rec->size / 4;
+                    for (size_t w = 0; w < num_words; ++w)
+                        ((int*)dst)[w] = rec->value;
+                }
+            }
+            break;
+        }
+
+        case APIC_OP_ALLOC:
+            // Allocations are handled by memory region setup during loading
+            break;
+
+        default:
+            wp::set_error_string("Unknown operation type during loaded CPU graph replay: %d", hdr->op_type);
             return 0;
         }
 

@@ -854,36 +854,43 @@ class TestApic(unittest.TestCase):
     pass
 
 
-# Register tests for CUDA devices
-devices = get_selected_cuda_test_devices()
+# Register tests for all devices (CPU + CUDA) or CUDA-only
+devices = get_test_devices()
+cuda_devices = get_selected_cuda_test_devices()
 
+# Tests that work on both CPU and CUDA
 add_function_test(TestApic, "test_apic_capture_begin_end", test_apic_capture_begin_end, devices=devices)
 add_function_test(TestApic, "test_apic_scoped_capture", test_apic_scoped_capture, devices=devices)
 add_function_test(TestApic, "test_apic_multiple_launches", test_apic_multiple_launches, devices=devices)
 add_function_test(TestApic, "test_apic_memory_regions", test_apic_memory_regions, devices=devices)
-add_function_test(TestApic, "test_apic_save_load_basic", test_apic_save_load_basic, devices=devices)
 add_function_test(TestApic, "test_apic_capture_class", test_apic_capture_class, devices=devices)
 add_function_test(TestApic, "test_apic_array_slicing", test_apic_array_slicing, devices=devices)
 add_function_test(TestApic, "test_apic_bindings", test_apic_bindings, devices=devices)
 add_function_test(TestApic, "test_apic_kernel_info_tracking", test_apic_kernel_info_tracking, devices=devices)
 add_function_test(TestApic, "test_apic_launch_record", test_apic_launch_record, devices=devices)
 add_function_test(TestApic, "test_apic_graph_execution_unchanged", test_apic_graph_execution_unchanged, devices=devices)
-add_function_test(TestApic, "test_apic_save_load_execute", test_apic_save_load_execute, devices=devices)
+
+# Tests that require operations not yet supported in CPU graph capture
+# (allocation during capture, wp.copy within capture, etc.)
+add_function_test(TestApic, "test_apic_with_memory_ops", test_apic_with_memory_ops, devices=cuda_devices)
+add_function_test(TestApic, "test_apic_complex_pipeline", test_apic_complex_pipeline, devices=cuda_devices)
+add_function_test(TestApic, "test_apic_internal_allocation", test_apic_internal_allocation, devices=cuda_devices)
 add_function_test(
-    TestApic, "test_apic_load_execute_multiple_kernels", test_apic_load_execute_multiple_kernels, devices=devices
+    TestApic, "test_apic_multiple_internal_allocations", test_apic_multiple_internal_allocations, devices=cuda_devices
 )
-add_function_test(TestApic, "test_apic_with_memory_ops", test_apic_with_memory_ops, devices=devices)
-add_function_test(TestApic, "test_apic_complex_pipeline", test_apic_complex_pipeline, devices=devices)
-add_function_test(TestApic, "test_apic_internal_allocation", test_apic_internal_allocation, devices=devices)
-add_function_test(
-    TestApic, "test_apic_multiple_internal_allocations", test_apic_multiple_internal_allocations, devices=devices
-)
-add_function_test(TestApic, "test_apic_native_loading", test_apic_native_loading, devices=devices)
-add_function_test(TestApic, "test_apic_handle_type", test_apic_handle_type, devices=devices)
 add_function_test(TestApic, "test_apic_find_handle_offsets", test_apic_find_handle_offsets, devices=devices)
 add_function_test(TestApic, "test_apic_handle_in_array_dtype", test_apic_handle_in_array_dtype, devices=devices)
 add_function_test(TestApic, "test_apic_handle_equals_array_ptr", test_apic_handle_equals_array_ptr, devices=devices)
-add_function_test(TestApic, "test_apic_ptr_location_registration", test_apic_ptr_location_registration, devices=devices)
+
+# Tests that are CUDA-only (serialization, native loading, CUDA handles)
+add_function_test(TestApic, "test_apic_save_load_basic", test_apic_save_load_basic, devices=cuda_devices)
+add_function_test(TestApic, "test_apic_save_load_execute", test_apic_save_load_execute, devices=cuda_devices)
+add_function_test(
+    TestApic, "test_apic_load_execute_multiple_kernels", test_apic_load_execute_multiple_kernels, devices=cuda_devices
+)
+add_function_test(TestApic, "test_apic_native_loading", test_apic_native_loading, devices=cuda_devices)
+add_function_test(TestApic, "test_apic_handle_type", test_apic_handle_type, devices=cuda_devices)
+add_function_test(TestApic, "test_apic_ptr_location_registration", test_apic_ptr_location_registration, devices=cuda_devices)
 
 
 if __name__ == "__main__":

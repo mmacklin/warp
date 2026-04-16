@@ -182,6 +182,16 @@ WP_API int wp_apic_replay_host_ops(APICState state);
 // Mark APIC state as targeting CPU (affects serialization behavior).
 WP_API void wp_apic_set_cpu_mode(APICState state);
 
+// Register host function on a loaded graph (for CPU graph replay after loading).
+// Python calls this after loading .o modules via wp_load_obj + wp_lookup to provide
+// the function pointers that wp_apic_replay_loaded_host_graph() needs.
+WP_API void wp_apic_graph_register_host_function(APICGraph graph, const char* kernel_key, void* forward_fn, void* backward_fn);
+
+// Replay a loaded CPU graph using registered host functions.
+// Operates on an APICGraphInternal loaded via wp_apic_load_graph(NULL, path).
+// Returns 1 on success, 0 on failure.
+WP_API int wp_apic_replay_loaded_host_graph(APICGraph graph);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif
@@ -191,6 +201,10 @@ WP_API void wp_apic_set_cpu_mode(APICState state);
 // =============================================================================
 
 #ifdef __cplusplus
+
+// Helper: extract shape and size from a launch_bounds_t<N> given N.
+// Accounts for alignment padding between shape[N] and size_t size.
+void apic_parse_launch_bounds(const void* bounds, int ndim, int* out_shape, size_t* out_size);
 
 // Thread-local APIC state (set during recording)
 extern thread_local APICState g_apic_state;

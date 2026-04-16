@@ -4081,13 +4081,18 @@ class Graph:
             base_path = base_path.with_suffix(".wgf")
 
         # Load using native C++ implementation
-        native_graph = runtime.core.wp_apic_load_graph(device.context, str(base_path).encode("utf-8"))
+        if device.is_cpu:
+            # Pass NULL context to signal CPU mode to the C++ loader
+            native_graph = runtime.core.wp_apic_load_graph(None, str(base_path).encode("utf-8"))
+        else:
+            native_graph = runtime.core.wp_apic_load_graph(device.context, str(base_path).encode("utf-8"))
         if native_graph is None:
             raise RuntimeError(f"Failed to load graph from {path}: {runtime.get_error_string()}")
 
         graph = cls(device)
         graph._source_path = str(base_path)
         graph._native_graph = native_graph
+        graph._is_cpu_graph = device.is_cpu
 
         # Populate params from native graph
         num_params = runtime.core.wp_apic_get_num_params(native_graph)
@@ -4098,9 +4103,16 @@ class Graph:
                 size = runtime.core.wp_apic_get_param_size(native_graph, name.encode("utf-8"))
                 graph._params[name] = {"size": size}
 
-        # Get the CUDA graph handles from native
-        graph.graph = runtime.core.wp_apic_get_cuda_graph(native_graph)
-        graph.graph_exec = runtime.core.wp_apic_get_cuda_graph_exec(native_graph)
+        if device.is_cpu:
+            # For CPU graphs loaded in-process, the modules are already compiled
+            # and available via the Warp module system. The caller must ensure the
+            # same kernels are available at load time.
+            graph.graph = None
+            graph.graph_exec = None
+        else:
+            # Get the CUDA graph handles from native
+            graph.graph = runtime.core.wp_apic_get_cuda_graph(native_graph)
+            graph.graph_exec = runtime.core.wp_apic_get_cuda_graph_exec(native_graph)
 
         return graph
 
@@ -5311,6 +5323,14 @@ class Runtime:
 
             self.core.wp_apic_set_cpu_mode.argtypes = [ctypes.c_void_p]
             self.core.wp_apic_set_cpu_mode.restype = None
+
+            self.core.wp_apic_graph_register_host_function.argtypes = [
+                ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_void_p
+            ]
+            self.core.wp_apic_graph_register_host_function.restype = None
+
+            self.core.wp_apic_replay_loaded_host_graph.argtypes = [ctypes.c_void_p]
+            self.core.wp_apic_replay_loaded_host_graph.restype = ctypes.c_int
 
             self.core.wp_cuda_compile_program.argtypes = [
                 ctypes.c_char_p,  # cuda_src
