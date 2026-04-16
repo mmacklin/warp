@@ -3797,21 +3797,10 @@ class array(Array[DType, NDim]):
                     f"Warning: Array {self} is being written to but has already been read from in a previous launch. This may corrupt gradient computation in the backward pass."
                 )
 
-    def _track_for_cpu_capture(self):
-        """Register this array with the active CPU graph capture if any.
-
-        This ensures APIC can resolve the memory pointer to a region ID when
-        the C++ hooks in ``wp_memset_host`` / ``wp_memtile_host`` record the
-        operation.
-        """
-        rt = warp._src.context.runtime
-        if rt is not None and rt.cpu_capture is not None and rt.cpu_capture.apic_capture is not None:
-            rt.cpu_capture.apic_capture.track_array(self)
-
     def zero_(self):
         """Zero out the array entries."""
-        # Track array for CPU graph capture so memset/fill can resolve region IDs
-        self._track_for_cpu_capture()
+        # Track array for graph capture so memset/fill can resolve region IDs
+        warp._src.context._track_array_for_capture(self)
         if self.is_contiguous:
             # simple memset is usually faster than generic fill
             self.device.memset(self.ptr, 0, self.size * type_size_in_bytes(self.dtype))
@@ -3849,8 +3838,8 @@ class array(Array[DType, NDim]):
         if self.size == 0:
             return
 
-        # Track array for CPU graph capture so memtile/fill can resolve region IDs
-        self._track_for_cpu_capture()
+        # Track array for graph capture so memtile/fill can resolve region IDs
+        warp._src.context._track_array_for_capture(self)
 
         # try to convert the given value to the array dtype
         try:

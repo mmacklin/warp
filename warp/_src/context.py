@@ -9599,6 +9599,30 @@ def capture_load(path: str, device: DeviceLike = None):
     return Graph.load(path, device)
 
 
+def _track_array_for_capture(arr):
+    """Register an array with the active graph capture (CPU or CUDA) if any.
+
+    This ensures APIC can resolve the array's memory pointer to a region ID
+    when native hooks record operations like memset, memtile, or array_copy.
+    """
+    if runtime is None:
+        return
+    # CPU capture
+    if runtime.cpu_capture is not None and runtime.cpu_capture.apic_capture is not None:
+        runtime.cpu_capture.apic_capture.track_array(arr)
+        return
+    # CUDA capture
+    if len(runtime.captures) > 0:
+        device = arr.device
+        if device.is_cuda:
+            stream = device.stream
+            if runtime.core.wp_cuda_stream_is_capturing(stream.cuda_stream):
+                capture_id = runtime.core.wp_cuda_stream_get_capture_id(stream.cuda_stream)
+                graph = runtime.captures.get(capture_id)
+                if graph is not None and graph.apic_capture is not None:
+                    graph.apic_capture.track_array(arr)
+
+
 def copy(
     dest: warp.array,
     src: warp.array,
@@ -9680,19 +9704,9 @@ def copy(
             copy(tmp, src, stream=stream)
             src = tmp
 
-    # APIC: track both arrays for graph capture if a same-device capture is active.
-    # This must happen before any copy path so region IDs are available for recording.
-    if src.device == dest.device:
-        if dest.device.is_cuda:
-            if len(runtime.captures) > 0 and runtime.core.wp_cuda_stream_is_capturing(stream.cuda_stream):
-                capture_id = runtime.core.wp_cuda_stream_get_capture_id(stream.cuda_stream)
-                graph = runtime.captures.get(capture_id)
-                if graph is not None and graph.apic_capture is not None:
-                    graph.apic_capture.track_array(dest)
-                    graph.apic_capture.track_array(src)
-        elif runtime.cpu_capture is not None and runtime.cpu_capture.apic_capture is not None:
-            runtime.cpu_capture.apic_capture.track_array(dest)
-            runtime.cpu_capture.apic_capture.track_array(src)
+    # APIC: track both arrays for graph capture so region IDs are available for recording.
+    _track_array_for_capture(dest)
+    _track_array_for_capture(src)
 
     if src.is_contiguous and dest.is_contiguous:
         bytes_to_copy = count * warp._src.types.type_size_in_bytes(src.dtype)
