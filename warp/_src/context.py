@@ -8053,24 +8053,23 @@ def launch(
             if runtime.cpu_capture is not None:
                 graph = runtime.cpu_capture
                 graph.retain_module_exec(module_exec)
-                if graph.apic is not None:
-                    apic_launch = Launch(
-                        kernel=kernel,
-                        hooks=hooks,
-                        params=params,
-                        params_addr=None,
-                        bounds=bounds,
-                        device=device,
-                        adjoint=adjoint,
-                    )
-                    apic_info = graph.apic.build_launch_info(apic_launch, inputs=inputs, outputs=outputs)
-                    # Register host function for native replay
-                    runtime.core.wp_apic_register_host_function(
-                        graph.apic.native_state,
-                        kernel.key.encode("utf-8"),
-                        hooks.forward if hooks.forward else None,
-                        hooks.backward if hooks.backward else None,
-                    )
+                apic_launch = Launch(
+                    kernel=kernel,
+                    hooks=hooks,
+                    params=params,
+                    params_addr=None,
+                    bounds=bounds,
+                    device=device,
+                    adjoint=adjoint,
+                )
+                apic_info = graph.apic.build_launch_info(apic_launch, inputs=inputs, outputs=outputs)
+                # Register host function for native replay
+                runtime.core.wp_apic_register_host_function(
+                    graph.apic.native_state,
+                    kernel.key.encode("utf-8"),
+                    hooks.forward if hooks.forward else None,
+                    hooks.backward if hooks.backward else None,
+                )
 
             if apic_info is not None:
                 # Record the launch to C++ operation stream
@@ -9594,7 +9593,7 @@ def _track_array_for_capture(arr):
     if runtime is None:
         return
     # CPU capture
-    if runtime.cpu_capture is not None and runtime.cpu_capture.apic is not None:
+    if runtime.cpu_capture is not None:
         runtime.cpu_capture.apic.track_array(arr)
         return
     # CUDA capture
