@@ -4562,17 +4562,7 @@ size_t wp_cuda_launch_kernel(
     ContextGuard guard(context);
 
     // APIC hook: record kernel launch with full parameter info if provided
-    if (apic_is_recording(g_apic_state) && apic_info) {
-        // Parse shape/size from the new launch_bounds_t<N> (variable layout per ndim)
-        int shape[APIC_LAUNCH_MAX_DIMS] = {};
-        size_t launch_size = 0;
-        apic_parse_launch_bounds(args[0], apic_info->ndim, shape, &launch_size);
-        apic_record_kernel_launch(
-            g_apic_state, kernel, dim, shape, apic_info->ndim, max_blocks, block_dim, shared_memory_bytes,
-            apic_info->is_forward != 0, apic_info->kernel_key, apic_info->module_hash, apic_info->params,
-            apic_info->num_params
-        );
-    }
+    wp_apic_record_launch(kernel, args[0], dim, max_blocks, block_dim, shared_memory_bytes, apic_info);
 
     if (block_dim <= 0) {
 #if defined(_DEBUG)

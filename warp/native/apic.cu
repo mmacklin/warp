@@ -1973,28 +1973,31 @@ void apic_parse_launch_bounds(const void* bounds, int ndim, int* out_shape, size
     *out_size = *reinterpret_cast<const size_t*>(reinterpret_cast<const uint8_t*>(bounds) + size_offset);
 }
 
-void wp_apic_record_cpu_launch(
+void wp_apic_record_launch(
     void* kernel_fn,
     void* bounds,
-    int ndim,
+    size_t dim,
+    int max_blocks,
+    int block_dim,
+    int smem_bytes,
     const APICLaunchInfo* apic_info)
 {
     if (!apic_is_recording(g_apic_state) || !apic_info)
         return;
 
     int shape[APIC_LAUNCH_MAX_DIMS] = {};
-    size_t dim = 0;
-    apic_parse_launch_bounds(bounds, ndim, shape, &dim);
+    size_t launch_size = 0;
+    apic_parse_launch_bounds(bounds, apic_info->ndim, shape, &launch_size);
 
     apic_record_kernel_launch(
         g_apic_state,
         kernel_fn,
         dim,
         shape,
-        ndim,
-        0,     // max_blocks (not used for CPU)
-        1,     // block_dim (single thread for CPU)
-        0,     // smem_bytes (not used for CPU)
+        apic_info->ndim,
+        max_blocks,
+        block_dim,
+        smem_bytes,
         apic_info->is_forward != 0,
         apic_info->kernel_key,
         apic_info->module_hash,

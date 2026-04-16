@@ -158,14 +158,17 @@ WP_API void wp_apic_record_host_memtile(void* dst, size_t total_size);
 // dst/src are pointers to array_t<void> descriptors. Only ARRAY_TYPE_REGULAR supported.
 WP_API void wp_apic_record_array_copy(void* dst, void* src, int dst_type, int src_type, int elem_size);
 
-// Record a CPU kernel launch to the active APIC state.
-// Called from Python before the kernel is invoked via ctypes (which handles
-// the by-value launch_bounds_t<N> calling convention correctly).
-// bounds: pointer to launch_bounds_t<N>; ndim: N (so C++ knows the layout).
-WP_API void wp_apic_record_cpu_launch(
+// Record a kernel launch to the active APIC state.
+// Shared by both CPU and CUDA recording paths.
+// bounds: pointer to launch_bounds_t<N>; other launch params come from apic_info
+// or are passed directly (dim, max_blocks, block_dim, smem_bytes).
+WP_API void wp_apic_record_launch(
     void* kernel_fn,
     void* bounds,
-    int ndim,
+    size_t dim,
+    int max_blocks,
+    int block_dim,
+    int smem_bytes,
     const APICLaunchInfo* apic_info
 );
 

@@ -5335,13 +5335,16 @@ class Runtime:
             self.core.wp_apic_is_recording_active.argtypes = []
             self.core.wp_apic_is_recording_active.restype = ctypes.c_int
 
-            self.core.wp_apic_record_cpu_launch.argtypes = [
+            self.core.wp_apic_record_launch.argtypes = [
                 ctypes.c_void_p,  # kernel_fn
                 ctypes.c_void_p,  # bounds
-                ctypes.c_int,     # ndim
+                ctypes.c_size_t,  # dim
+                ctypes.c_int,     # max_blocks
+                ctypes.c_int,     # block_dim
+                ctypes.c_int,     # smem_bytes
                 ctypes.c_void_p,  # apic_info
             ]
-            self.core.wp_apic_record_cpu_launch.restype = None
+            self.core.wp_apic_record_launch.restype = None
 
             self.core.wp_apic_register_host_function.argtypes = [
                 ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_void_p
@@ -8074,10 +8077,13 @@ def launch(
             if apic_info is not None:
                 # Record the launch to C++ operation stream
                 fn = hooks.backward if adjoint else hooks.forward
-                runtime.core.wp_apic_record_cpu_launch(
+                runtime.core.wp_apic_record_launch(
                     fn,
                     ctypes.byref(params[0]),
-                    len(bounds.shape),
+                    bounds.size,
+                    0,  # max_blocks (not used for CPU)
+                    1,  # block_dim (single thread for CPU)
+                    0,  # smem_bytes (not used for CPU)
                     ctypes.byref(apic_info),
                 )
 
