@@ -369,3 +369,51 @@ extern "C" WP_API bool apic_create_meshes(APICGraphInternal* graph)
 
     return true;
 }
+
+extern "C" WP_API void* wp_apic_get_cuda_graph(APICGraph graph)
+{
+    if (!graph)
+        return nullptr;
+
+    ContextGuard guard(graph->cuda_context);
+
+    // Build graph once on first access
+    if (!graph->cuda_graph) {
+        CUstream stream;
+        cuStreamCreate_f(&stream, CU_STREAM_DEFAULT);
+
+        bool success = apic_rebuild_cuda_graph(graph, stream);
+
+        cuStreamDestroy_f(stream);
+
+        if (!success)
+            return nullptr;
+    }
+
+    return graph->cuda_graph;
+}
+
+extern "C" WP_API void* wp_apic_get_cuda_graph_exec(APICGraph graph)
+{
+    if (!graph)
+        return nullptr;
+
+    ContextGuard guard(graph->cuda_context);
+
+    // Ensure graph is up to date
+    if (!wp_apic_get_cuda_graph(graph))
+        return nullptr;
+
+    // Instantiate if needed using runtime API
+    if (!graph->cuda_graph_exec) {
+        cudaError_t err = cudaGraphInstantiateWithFlags(
+            (cudaGraphExec_t*)&graph->cuda_graph_exec, (cudaGraph_t)graph->cuda_graph, 0
+        );
+        if (err != cudaSuccess) {
+            wp::set_error_string("Failed to instantiate graph: %d", err);
+            return nullptr;
+        }
+    }
+
+    return graph->cuda_graph_exec;
+}
