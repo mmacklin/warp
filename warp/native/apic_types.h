@@ -43,6 +43,7 @@ typedef enum {
     APIC_OP_ALLOC = 6,  // In-graph allocation
     APIC_OP_MEMCPY_H2H = 7,  // Host-to-host memcpy (CPU graphs, uses APICMemcpyD2DRecord format)
     APIC_OP_ARRAY_COPY = 8,  // Strided array copy (non-contiguous wp.copy)
+    APIC_OP_MEMTILE = 9,  // Repeat a small pattern into a region (fill_)
 
     // Future: high-level Warp operations
     // APIC_OP_MESH_CREATE = 10,
@@ -236,6 +237,17 @@ typedef struct {
     // Common
     int32_t elem_size;
 } APICArrayCopyRecord;
+
+// Memtile (repeat a small pattern N times into a region)
+// Variable: src pattern bytes follow the fixed header
+typedef struct {
+    APICOpHeader header;  // op_type = APIC_OP_MEMTILE
+    int32_t dst_region_id;
+    uint32_t srcsize;  // size of one pattern element in bytes
+    uint64_t dst_offset;
+    uint64_t n;  // number of repetitions
+    // uint8_t pattern[srcsize] follows
+} APICMemtileRecord;
 
 // =============================================================================
 // Memory Section Records

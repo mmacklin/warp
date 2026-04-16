@@ -1413,6 +1413,15 @@ static bool apic_rebuild_cuda_graph(APICGraphInternal* graph, CUstream stream)
             break;
         }
 
+        case APIC_OP_MEMTILE: {
+            const APICMemtileRecord* rec = reinterpret_cast<const APICMemtileRecord*>(ptr);
+            void* dst = graph->resolve_region_ptr(rec->dst_region_id, rec->dst_offset);
+            const void* pattern = ptr + sizeof(APICMemtileRecord);
+            if (dst)
+                wp_memtile_device(graph->cuda_context, dst, pattern, rec->srcsize, rec->n);
+            break;
+        }
+
         case APIC_OP_ALLOC:
             // Allocations are handled by memory region setup, skip
             break;
@@ -1865,13 +1874,34 @@ void wp_apic_record_host_memset(void* dst, int value, size_t size)
     }
 }
 
-void wp_apic_record_host_memtile(void* dst, size_t total_size)
+void wp_apic_record_memtile(void* dst, const void* src, size_t srcsize, size_t n)
 {
-    if (apic_is_recording(g_apic_state)) {
-        // Record as H2D with inline data snapshot (the tiling has already executed,
-        // so dst contains the final tiled pattern that we capture for replay).
-        apic_record_memcpy(g_apic_state, dst, dst, total_size, APIC_OP_MEMCPY_H2D);
+    if (!apic_is_recording(g_apic_state))
+        return;
+
+    APICGraphInternal* state = g_apic_state;
+
+    // Resolve destination to region
+    int32_t dst_region_id = -1;
+    uint64_t dst_offset = 0;
+    if (!state->find_region(reinterpret_cast<uint64_t>(dst), dst_region_id, dst_offset)) {
+        fprintf(stderr, "APIC: Warning - memtile dst pointer not in any registered region\n");
     }
+
+    uint32_t total_size = sizeof(APICMemtileRecord) + srcsize;
+
+    APICMemtileRecord rec = {};
+    rec.header.op_type = APIC_OP_MEMTILE;
+    rec.header.total_size = total_size;
+    rec.dst_region_id = dst_region_id;
+    rec.srcsize = static_cast<uint32_t>(srcsize);
+    rec.dst_offset = dst_offset;
+    rec.n = n;
+
+    state->append_bytes(&rec, sizeof(rec));
+    // Append the fill pattern inline (src is host memory — the fill value)
+    state->append_bytes(src, srcsize);
+    state->operation_count++;
 }
 
 void wp_apic_record_array_copy(void* dst, void* src, int dst_type, int src_type, int elem_size)
@@ -2237,6 +2267,15 @@ static int apic_replay_cpu_ops(APICGraphInternal* g)
                 }
                 wp_array_copy_host(&dst_arr, &src_arr, rec->dst_type, rec->src_type, rec->elem_size);
             }
+            break;
+        }
+
+        case APIC_OP_MEMTILE: {
+            const APICMemtileRecord* rec = reinterpret_cast<const APICMemtileRecord*>(ptr);
+            void* dst = g->resolve_region_ptr(rec->dst_region_id, rec->dst_offset);
+            const void* pattern = ptr + sizeof(APICMemtileRecord);
+            if (dst)
+                wp_memtile_host(dst, pattern, rec->srcsize, rec->n);
             break;
         }
 

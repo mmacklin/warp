@@ -150,9 +150,10 @@ WP_API void wp_apic_record_host_memcpy(void* dst, void* src, size_t size);
 // Called from warp.cpp host memory function hooks.
 WP_API void wp_apic_record_host_memset(void* dst, int value, size_t size);
 
-// Record a host memtile (repeat pattern) to the active APIC state.
-// Must be called AFTER execution so the full dst content can be captured as inline data.
-WP_API void wp_apic_record_host_memtile(void* dst, size_t total_size);
+// Record a memtile (repeat small pattern N times) to the active APIC state.
+// Shared by both CPU and CUDA — stores the pattern inline for replay.
+// src points to the fill pattern (srcsize bytes, may be host memory).
+WP_API void wp_apic_record_memtile(void* dst, const void* src, size_t srcsize, size_t n);
 
 // Record a strided array copy (non-contiguous wp.copy) to the active APIC state.
 // dst/src are pointers to array_t<void> descriptors. Only ARRAY_TYPE_REGULAR supported.

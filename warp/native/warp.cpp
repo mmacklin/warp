@@ -246,9 +246,9 @@ template <typename T> void memtile_value_host(T* dst, T value, size_t n)
 
 void wp_memtile_host(void* dst, const void* src, size_t srcsize, size_t n)
 {
-    bool recording = wp_apic_is_recording_active();
-    void* dst_start = dst;    // save for APIC recording after execution
-    size_t total_bytes = srcsize * n;  // save before n gets modified by the loop
+    // APIC: record before execution with the original fill pattern
+    if (wp_apic_is_recording_active())
+        wp_apic_record_memtile(dst, src, srcsize, n);
 
     size_t dst_addr = reinterpret_cast<size_t>(dst);
     size_t src_addr = reinterpret_cast<size_t>(src);
@@ -269,10 +269,6 @@ void wp_memtile_host(void* dst, const void* src, size_t srcsize, size_t n)
             dst = (int8_t*)dst + srcsize;
         }
     }
-
-    // APIC: record after execution so we capture the final tiled content
-    if (recording)
-        wp_apic_record_host_memtile(dst_start, total_bytes);
 }
 
 void wp_array_scan_int_host(uint64_t in, uint64_t out, int len, bool inclusive)

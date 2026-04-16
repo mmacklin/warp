@@ -1129,6 +1129,9 @@ void wp_memtile_device(void* context, void* dst, const void* src, size_t srcsize
 {
     ContextGuard guard(context);
 
+    // APIC: record with the original fill pattern (src is host memory)
+    wp_apic_record_memtile(dst, src, srcsize, n);
+
     size_t dst_addr = reinterpret_cast<size_t>(dst);
     size_t src_addr = reinterpret_cast<size_t>(src);
 
