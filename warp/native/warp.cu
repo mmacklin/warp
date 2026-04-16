@@ -257,7 +257,8 @@ static std::mutex g_graph_destroy_mutex;
 // ============================================================================
 // APIC (API Capture) State
 // ============================================================================
-// APIC struct definitions and g_apic_state are in apic.cu
+// APIC struct definitions are in apic.h; platform-independent code is in apic.cpp;
+// CUDA-only functions are in apic.cu (included below); g_apic_state is in warp.cpp.
 
 
 void wp_cuda_set_context_restore_policy(bool always_restore) { ContextGuard::always_restore = always_restore; }

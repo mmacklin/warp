@@ -478,6 +478,7 @@ def main(argv: list[str] | None = None) -> int:
             "native/mathdx.cpp",
             "native/coloring.cpp",
             "native/fastcall.cpp",
+            "native/apic.cpp",
         ]
         warp_cpp_paths = [os.path.join(build_path, cpp) for cpp in cpp_sources]
 

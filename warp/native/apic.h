@@ -199,6 +199,137 @@ WP_API int wp_apic_replay_loaded_host_graph(APICGraph graph);
 
 #ifdef __cplusplus
 
+#include <map>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+// Forward declarations for CUDA types used inside APICGraphInternal.
+// When WP_ENABLE_CUDA is 0 (or undefined), these are not needed because
+// the CUDA-specific fields are compiled out.
+#if WP_ENABLE_CUDA
+#include "cuda_util.h"  // CUgraph, CUgraphExec, CUmodule, ContextGuard, etc.
+#endif
+
+// ============================================================================
+// APIC Internal Structures (shared between apic.cpp and apic.cu)
+// ============================================================================
+
+// Module info (used for both recording and loaded state)
+struct APICModule {
+    std::string module_hash;
+    std::string module_name;
+    std::string cubin_filename;
+    int target_arch;
+#if WP_ENABLE_CUDA
+    CUmodule cuda_module = nullptr;  // Set after loading
+#endif
+};
+
+// Kernel info (used for both recording and loaded state)
+struct APICKernel {
+    std::string kernel_key;
+    std::string module_hash;
+    std::string forward_name;
+    std::string backward_name;
+    int forward_smem_bytes;
+    int backward_smem_bytes;
+    int block_dim;
+};
+
+// Memory region info (used for both recording and loaded state)
+struct APICRegion {
+    uint32_t region_id;
+    uint64_t base_ptr;  // Original device pointer during recording
+    uint64_t size;
+    uint32_t element_size;
+    std::vector<uint8_t> initial_data;  // For internal regions during recording
+    void* ptr = nullptr;  // Allocated device pointer after loading
+};
+
+// Handle pointer location in a memory region (for fixup during replay)
+struct APICPtrLocation {
+    uint32_t region_id;
+    uint64_t offset;
+    uint64_t stride;  // 0 = single pointer
+};
+
+// Merged internal structure for both recording (APICState) and loaded graph (APICGraph).
+// Some fields are only used during recording, some only during loading -- unused fields
+// stay at their default values.
+struct APICGraphInternal {
+    // === Recording state (populated during capture) ===
+    bool recording = false;
+    std::unordered_map<uint64_t, APICRegion> memory_regions;  // keyed by base_ptr (recording)
+    uint32_t next_region_id = 0;
+
+    // === Loaded graph state (populated during file loading) ===
+    void* cuda_context = nullptr;
+    int target_arch = 0;
+    std::unordered_map<uint32_t, APICRegion> regions;  // keyed by region_id (loaded)
+    std::unordered_map<std::string, uint32_t> bindings;  // name -> region_id (loaded)
+    std::vector<std::string> binding_names;  // ordered for indexing (loaded)
+    std::unordered_map<uint64_t, uint64_t> handle_ptr_remap;
+    std::vector<APICMeshRecord> mesh_records;
+    std::vector<uint64_t> created_mesh_ids;
+#if WP_ENABLE_CUDA
+    CUgraph cuda_graph = nullptr;
+    CUgraphExec cuda_graph_exec = nullptr;
+#endif
+    std::string base_path;
+
+    // === Shared state (used by both recording and loaded paths) ===
+    std::vector<uint8_t> operation_stream;
+    uint32_t operation_count = 0;
+    std::unordered_map<std::string, APICModule> modules;
+    std::unordered_map<std::string, APICKernel> kernels;
+    std::vector<std::pair<std::string, uint32_t>> recording_bindings;  // name->id pairs (recording)
+    std::vector<APICPtrLocation> ptr_locations;
+    bool is_cpu = false;
+    std::unordered_map<std::string, std::pair<void*, void*>> host_functions;
+    std::unordered_map<uint32_t, uint64_t> region_id_to_ptr;  // region_id -> base_ptr (both)
+
+    // === Methods ===
+
+    void* resolve_region_ptr(int32_t region_id, uint64_t offset) const
+    {
+        auto it = region_id_to_ptr.find(region_id);
+        if (it != region_id_to_ptr.end())
+            return (void*)(it->second + offset);
+        return nullptr;
+    }
+
+    void append_bytes(const void* data, size_t size)
+    {
+        size_t off = operation_stream.size();
+        operation_stream.resize(off + size);
+        memcpy(operation_stream.data() + off, data, size);
+    }
+
+    bool find_region(uint64_t ptr, int32_t& region_id, uint64_t& offset) const
+    {
+        for (const auto& kv : memory_regions) {
+            const APICRegion& r = kv.second;
+            if (ptr >= r.base_ptr && ptr < r.base_ptr + r.size) {
+                region_id = r.region_id;
+                offset = ptr - r.base_ptr;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Destructor handles both recording and loaded cleanup.
+    // Defined out-of-line in apic.cpp because it references symbols
+    // (wp_mesh_destroy_device, cudaFree, etc.) not yet declared at this point.
+    ~APICGraphInternal();
+};
+
+// ============================================================================
+// APIC Internal Function Declarations
+// ============================================================================
+
 // Helper: extract shape and size from a launch_bounds_t<N> given N.
 // Accounts for alignment padding between shape[N] and size_t size.
 void apic_parse_launch_bounds(const void* bounds, int ndim, int* out_shape, size_t* out_size);
@@ -231,5 +362,24 @@ void apic_record_memcpy(APICGraphInternal* state, void* dst, void* src, size_t s
 void apic_record_memset(APICGraphInternal* state, void* dst, int value, size_t size);
 
 void apic_record_alloc(APICGraphInternal* state, void* ptr, size_t size);
+
+#if WP_ENABLE_CUDA
+// CUDA-only functions (defined in apic.cu, called from apic.cpp).
+// extern "C" for stable linkage across translation units.
+extern "C" {
+WP_API CUfunction apic_get_kernel_function(
+    APICGraphInternal* graph,
+    const char* module_hash,
+    size_t hash_len,
+    const char* kernel_key,
+    size_t key_len,
+    int is_forward
+);
+
+WP_API bool apic_rebuild_cuda_graph(APICGraphInternal* graph, CUstream stream);
+
+WP_API bool apic_create_meshes(APICGraphInternal* graph);
+}  // extern "C"
+#endif  // WP_ENABLE_CUDA
 
 #endif  // __cplusplus
