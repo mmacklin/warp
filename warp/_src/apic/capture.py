@@ -118,6 +118,10 @@ class APICapture:
     """
 
     def __init__(self, device, stream=None):
+        import warp._src.context
+
+        if isinstance(device, str):
+            device = warp._src.context.runtime.get_device(device)
         self.device = device
         self.stream = stream if stream is not None else (device.stream if device.is_cuda else None)
 

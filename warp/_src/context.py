@@ -4075,6 +4075,8 @@ class Graph:
 
         if device is None:
             device = warp.get_device()
+        else:
+            device = runtime.get_device(device)
 
         base_path = Path(path)
         if not base_path.suffix:
@@ -4109,12 +4111,49 @@ class Graph:
             # same kernels are available at load time.
             graph.graph = None
             graph.graph_exec = None
+            graph._register_host_functions_for_loaded_graph()
         else:
             # Get the CUDA graph handles from native
             graph.graph = runtime.core.wp_apic_get_cuda_graph(native_graph)
             graph.graph_exec = runtime.core.wp_apic_get_cuda_graph_exec(native_graph)
 
         return graph
+
+    def _register_host_functions_for_loaded_graph(self):
+        """Register host kernel functions for a loaded CPU graph.
+
+        Iterates loaded modules to find kernels that match the graph's kernel
+        metadata, loads them on CPU, and registers their function pointers
+        for native replay.
+        """
+        if self._native_graph is None:
+            return
+
+        # Get kernel info from the native graph's metadata
+        # We need to iterate all loaded Warp modules to find matching kernels
+        for _name, module in user_modules.items():
+            # Try loading the module on CPU
+            try:
+                module_exec = module.load(self.device)
+            except Exception:
+                continue
+            if module_exec is None:
+                continue
+
+            # Check each kernel in this module
+            for kernel in module.kernels.values():
+                try:
+                    hooks = module_exec.get_kernel_hooks(kernel)
+                except Exception:
+                    continue
+
+                # Register the host function
+                runtime.core.wp_apic_graph_register_host_function(
+                    self._native_graph,
+                    kernel.key.encode("utf-8"),
+                    hooks.forward if hooks.forward else None,
+                    hooks.backward if hooks.backward else None,
+                )
 
     def __del__(self):
         if not hasattr(self, "graph") or not hasattr(self, "device"):
@@ -9463,11 +9502,18 @@ def capture_launch(graph: Graph, stream: Stream | None = None):
 
     # CPU graph replay
     if getattr(graph, '_is_cpu_graph', False):
-        if graph.apic_capture is None or graph.apic_capture.native_state is None:
+        if graph._native_graph is not None:
+            # Loaded CPU graph — replay via native loaded graph
+            result = runtime.core.wp_apic_replay_loaded_host_graph(graph._native_graph)
+            if not result:
+                raise RuntimeError(f"CPU graph replay failed: {runtime.get_error_string()}")
+        elif graph.apic_capture is not None and graph.apic_capture.native_state is not None:
+            # In-process captured CPU graph
+            result = runtime.core.wp_apic_replay_host_ops(graph.apic_capture.native_state)
+            if not result:
+                raise RuntimeError(f"CPU graph replay failed: {runtime.get_error_string()}")
+        else:
             raise RuntimeError("CPU graph has no recorded operations")
-        result = runtime.core.wp_apic_replay_host_ops(graph.apic_capture.native_state)
-        if not result:
-            raise RuntimeError(f"CPU graph replay failed: {runtime.get_error_string()}")
         return
 
     if stream is not None:
@@ -9734,6 +9780,10 @@ def copy(
                 )
                 stream.wait_stream(dest.device.stream)
         else:
+            # Track arrays for CPU graph capture
+            if runtime.cpu_capture is not None and runtime.cpu_capture.apic_capture is not None:
+                runtime.cpu_capture.apic_capture.track_array(dest)
+                runtime.cpu_capture.apic_capture.track_array(src)
             result = runtime.core.wp_array_copy_host(dst_ptr, src_ptr, dst_type, src_type, src_elem_size)
 
         if not result:
