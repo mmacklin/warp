@@ -1996,7 +1996,7 @@ void wp_launch_host_kernel(
     void* adj_args,
     const APICLaunchInfo* apic_info)
 {
-    // Record if APIC capture is active
+    // If recording, just record the op and return (matching CUDA graph capture semantics)
     if (apic_is_recording(g_apic_state) && apic_info) {
         int shape[APIC_LAUNCH_MAX_DIMS] = {};
         size_t launch_size = 0;
@@ -2016,6 +2016,7 @@ void wp_launch_host_kernel(
             apic_info->module_hash,
             apic_info->params,
             apic_info->num_params);
+        return;
     }
 
     // Execute — parse bounds and dispatch by ndim to pass launch_bounds_t<N> by value

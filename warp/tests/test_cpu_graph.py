@@ -103,11 +103,12 @@ class TestCPUGraph(unittest.TestCase):
         graph = wp.capture_end(device=device)
 
         # Replay 5 times - each should increment by 1
+        # (capture itself does NOT execute, matching CUDA graph semantics)
         for i in range(5):
             wp.capture_launch(graph)
 
-        # After capture (1) + 5 replays = 6 increments
-        expected = np.ones(n) * 6.0
+        # 5 replays = 5 increments (capture phase is record-only)
+        expected = np.ones(n) * 5.0
         np.testing.assert_allclose(data.numpy(), expected)
 
     def test_cpu_scoped_capture(self):

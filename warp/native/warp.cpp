@@ -221,16 +221,20 @@ void wp_free_host(void* ptr)
 
 bool wp_memcpy_h2h(void* dest, void* src, size_t n)
 {
-    if (apic_is_recording(g_apic_state))
+    if (apic_is_recording(g_apic_state)) {
         apic_record_memcpy(g_apic_state, dest, src, n, APIC_OP_MEMCPY_H2H);
+        return true;
+    }
     memcpy(dest, src, n);
     return true;
 }
 
 void wp_memset_host(void* dest, int value, size_t n)
 {
-    if (apic_is_recording(g_apic_state))
+    if (apic_is_recording(g_apic_state)) {
         apic_record_memset(g_apic_state, dest, value, n);
+        return;
+    }
     if ((n % 4) > 0) {
         memset(dest, value, n);
     } else {
@@ -250,9 +254,10 @@ template <typename T> void memtile_value_host(T* dst, T value, size_t n)
 
 void wp_memtile_host(void* dst, const void* src, size_t srcsize, size_t n)
 {
-    // APIC: record before execution with the original fill pattern
-    if (apic_is_recording(g_apic_state))
+    if (apic_is_recording(g_apic_state)) {
         wp_apic_record_memtile(dst, src, srcsize, n);
+        return;
+    }
 
     size_t dst_addr = reinterpret_cast<size_t>(dst);
     size_t src_addr = reinterpret_cast<size_t>(src);
@@ -608,8 +613,10 @@ WP_API bool wp_array_copy_host(void* dst, void* src, int dst_type, int src_type,
     if (!src || !dst)
         return false;
 
-    if (apic_is_recording(g_apic_state))
+    if (apic_is_recording(g_apic_state)) {
         wp_apic_record_array_copy(dst, src, dst_type, src_type, elem_size);
+        return true;
+    }
 
     const void* src_data = NULL;
     void* dst_data = NULL;
