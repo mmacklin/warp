@@ -13,6 +13,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+// Thread-local APIC recording state — defined here (always linked) so both
+// warp.cpp and warp.cu (via extern in apic.h) can access it directly.
+thread_local APICGraphInternal* g_apic_state = nullptr;
+
 // MSVC provides _aligned_malloc() instead of the standard aligned_alloc()
 #if defined(_MSC_VER)
 #include <malloc.h>
@@ -217,16 +221,16 @@ void wp_free_host(void* ptr)
 
 bool wp_memcpy_h2h(void* dest, void* src, size_t n)
 {
-    if (wp_apic_is_recording_active())
-        wp_apic_record_host_memcpy(dest, src, n);
+    if (apic_is_recording(g_apic_state))
+        apic_record_memcpy(g_apic_state, dest, src, n, APIC_OP_MEMCPY_H2H);
     memcpy(dest, src, n);
     return true;
 }
 
 void wp_memset_host(void* dest, int value, size_t n)
 {
-    if (wp_apic_is_recording_active())
-        wp_apic_record_host_memset(dest, value, n);
+    if (apic_is_recording(g_apic_state))
+        apic_record_memset(g_apic_state, dest, value, n);
     if ((n % 4) > 0) {
         memset(dest, value, n);
     } else {
@@ -247,7 +251,7 @@ template <typename T> void memtile_value_host(T* dst, T value, size_t n)
 void wp_memtile_host(void* dst, const void* src, size_t srcsize, size_t n)
 {
     // APIC: record before execution with the original fill pattern
-    if (wp_apic_is_recording_active())
+    if (apic_is_recording(g_apic_state))
         wp_apic_record_memtile(dst, src, srcsize, n);
 
     size_t dst_addr = reinterpret_cast<size_t>(dst);
@@ -604,7 +608,7 @@ WP_API bool wp_array_copy_host(void* dst, void* src, int dst_type, int src_type,
     if (!src || !dst)
         return false;
 
-    if (wp_apic_is_recording_active())
+    if (apic_is_recording(g_apic_state))
         wp_apic_record_array_copy(dst, src, dst_type, src_type, elem_size);
 
     const void* src_data = NULL;

@@ -138,18 +138,6 @@ WP_API size_t wp_apic_get_param_size(APICGraph graph, const char* name);
 // APIC Public API - CPU Graph Support
 // =============================================================================
 
-// Check if any APIC recording is active on the current thread.
-// Callable from any compilation unit (wraps access to thread-local g_apic_state).
-WP_API int wp_apic_is_recording_active(void);
-
-// Record a host-to-host memcpy to the active APIC state.
-// Called from warp.cpp host memory function hooks.
-WP_API void wp_apic_record_host_memcpy(void* dst, void* src, size_t size);
-
-// Record a host memset to the active APIC state.
-// Called from warp.cpp host memory function hooks.
-WP_API void wp_apic_record_host_memset(void* dst, int value, size_t size);
-
 // Record a memtile (repeat small pattern N times) to the active APIC state.
 // Shared by both CPU and CUDA — stores the pattern inline for replay.
 // src points to the fill pattern (srcsize bytes, may be host memory).

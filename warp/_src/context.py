@@ -5332,9 +5332,6 @@ class Runtime:
             self.core.wp_apic_get_param_size.restype = ctypes.c_size_t
 
             # CPU graph support
-            self.core.wp_apic_is_recording_active.argtypes = []
-            self.core.wp_apic_is_recording_active.restype = ctypes.c_int
-
             self.core.wp_apic_record_launch.argtypes = [
                 ctypes.c_void_p,  # kernel_fn
                 ctypes.c_void_p,  # bounds

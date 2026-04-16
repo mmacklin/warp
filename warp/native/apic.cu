@@ -146,7 +146,8 @@ struct APICGraphInternal {
 };
 
 // Thread-local APIC state (set during recording)
-thread_local APICGraphInternal* g_apic_state = nullptr;
+// g_apic_state is defined in warp.cpp (always linked) so both warp.cpp and
+// warp.cu can access it directly without cross-TU bridge functions.
 
 // Helper to check if APIC is recording (hides struct internals from warp.cu)
 bool apic_is_recording(APICGraphInternal* state) { return state && state->recording; }
@@ -1857,22 +1858,6 @@ size_t wp_apic_get_param_size(APICGraph graph, const char* name)
 // We use sizeof(wp::array_t<int>) for args reconstruction since that is the actual
 // layout the CPU kernels expect.
 static constexpr size_t WP_ARRAY_T_SIZE = sizeof(wp::array_t<int>);
-
-int wp_apic_is_recording_active() { return apic_is_recording(g_apic_state) ? 1 : 0; }
-
-void wp_apic_record_host_memcpy(void* dst, void* src, size_t size)
-{
-    if (apic_is_recording(g_apic_state)) {
-        apic_record_memcpy(g_apic_state, dst, src, size, APIC_OP_MEMCPY_H2H);
-    }
-}
-
-void wp_apic_record_host_memset(void* dst, int value, size_t size)
-{
-    if (apic_is_recording(g_apic_state)) {
-        apic_record_memset(g_apic_state, dst, value, size);
-    }
-}
 
 void wp_apic_record_memtile(void* dst, const void* src, size_t srcsize, size_t n)
 {
