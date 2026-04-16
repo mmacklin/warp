@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 # ==============================================================================
 # Common Shared Configuration
@@ -55,8 +43,8 @@
 # Standard container image references are defined as variables in the main
 # .gitlab-ci.yml file and can be used throughout all child pipelines:
 #
-#   - $UV_BOOKWORM_IMAGE: Full uv image with git, make, and build tools
-#   - $UV_BOOKWORM_SLIM_IMAGE: Lightweight uv image for testing
+#   - $UV_TRIXIE_IMAGE: Full uv image with git, make, and build tools
+#   - $UV_TRIXIE_SLIM_IMAGE: Lightweight uv image for testing
 #   - $MINIFORGE_IMAGE: Conda/Mamba environment for Python packaging
 #
 # All external images are pinned with SHA256 digests for supply chain security.
@@ -67,7 +55,7 @@
 # 1. Add them to the .snippets section below
 # 2. Update this documentation with the snippet name and purpose
 # 3. Consider if the snippet should be in this file (global) or a specific
-#    child pipeline file (kit-extensions.yml has its own .kit-snippets)
+#    child pipeline file
 # ==============================================================================
 
 include:
@@ -214,6 +202,8 @@ default:
     PARENT_COMMIT_BRANCH: $CI_COMMIT_BRANCH
     # Required for deployment jobs in warp-gitlab-ci that use commit reference names
     PARENT_COMMIT_REF_NAME: $CI_COMMIT_REF_NAME
+    # Required for Artifactory metadata (commit SHA on published artifacts)
+    PARENT_COMMIT_SHA: $CI_COMMIT_SHA
     # Cache directories - must be explicitly passed to ensure consistent paths
     PM_PACKAGES_ROOT: "$PARENT_PROJECT_DIR/packman-repo"
     PIP_CACHE_DIR: "$PARENT_PROJECT_DIR/.cache/pip"

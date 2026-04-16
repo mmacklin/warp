@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import unittest
 from typing import Any
@@ -1320,6 +1308,51 @@ def test_garbage_collection(test, device):
 
 # =======================================================================
 
+# Module-level constant used as a fallback when the closure cell is empty.
+_CELL_CONTENT = wp.constant(42)
+
+
+def _make_kernel_with_empty_cell():
+    """Create a kernel where a closure variable's cell is empty at definition time.
+
+    ``_CELL_CONTENT`` is assigned later in this function, which makes
+    Python treat it as a local variable and create a closure cell for
+    ``_template``.  Using ``module="unique"`` forces eager hashing (which
+    calls ``resolve_external_reference``) at ``wp.kernel()`` time, before
+    the assignment executes.  The empty cell must not raise ``ValueError``;
+    it falls through to the global for hashing purposes.  At launch time
+    the cell is populated, so the kernel sees the local value (99).
+    """
+
+    def _template(a: wp.array(dtype=int)):
+        a[0] = _CELL_CONTENT
+
+    # module="unique" triggers eager hashing at kernel creation time,
+    # while _CELL_CONTENT's closure cell is still empty.
+    k = wp.kernel(_template, module="unique")
+
+    # This assignment causes _CELL_CONTENT to be a local in this
+    # function, creating a closure cell in _template that is empty when
+    # wp.kernel() processes it above.
+    _CELL_CONTENT = wp.constant(99)
+    return k
+
+
+_empty_cell_kernel = _make_kernel_with_empty_cell()
+
+
+def test_empty_closure_cell(test, device):
+    """Test that a kernel with an empty closure cell at hash time does not
+    raise ``ValueError: Cell is empty``
+    """
+    with wp.ScopedDevice(device):
+        a = wp.zeros(1, dtype=int)
+        wp.launch(_empty_cell_kernel, dim=1, inputs=[a])
+        test.assertEqual(a.numpy()[0], 99)
+
+
+# =======================================================================
+
 
 class TestCodeGenInstancing(unittest.TestCase):
     pass
@@ -1486,13 +1519,9 @@ add_function_test(
 )
 add_function_test(TestCodeGenInstancing, func=test_garbage_collection, name="test_garbage_collection", devices=devices)
 
+# empty closure cell fallback
+add_function_test(TestCodeGenInstancing, func=test_empty_closure_cell, name="test_empty_closure_cell", devices=devices)
+
 
 if __name__ == "__main__":
-    wp.clear_kernel_cache()
-    import time
-
-    start_time = time.time()
-    wp.force_load(max_workers=4, device=wp.get_device())  # test parallel compiling and loading of modules (GH-1086)
-    end_time = time.time()
-    print(f"Time taken: {end_time - start_time} seconds")
-    # unittest.main(verbosity=2)
+    unittest.main(verbosity=2)

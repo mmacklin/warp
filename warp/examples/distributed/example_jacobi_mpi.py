@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 """An example implementation of a distributed Jacobi solver using MPI.
 
 This example shows how to solve the Laplace equation using Jacobi iteration on
@@ -106,13 +94,13 @@ def calc_decomp_1d(total_points: int, rank: int, total_ranks: int) -> tuple[int,
 
 @wp.kernel
 def jacobi_update(
-    a: wp.array2d(dtype=wptype),
+    a: wp.array2d[wptype],
     iy_start: int,
     iy_end: int,
     nx: int,
     calculate_norm: bool,
-    a_new: wp.array2d(dtype=wptype),
-    l2_norm: wp.array(dtype=wptype),
+    a_new: wp.array2d[wptype],
+    l2_norm: wp.array[wptype],
 ):
     i, j = wp.tid()
 
@@ -142,8 +130,8 @@ def initialize_boundaries(
     nx: int,
     ny: int,
     offset: int,
-    a: wp.array2d(dtype=wptype),
-    a_new: wp.array2d(dtype=wptype),
+    a: wp.array2d[wptype],
+    a_new: wp.array2d[wptype],
 ):
     i = wp.tid()
 

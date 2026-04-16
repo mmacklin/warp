@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import sys
 import unittest
@@ -114,6 +102,9 @@ def test_print_boolean_kernel(value: wp.bool):
 
 
 def test_print(test, device):
+    if sys.platform == "win32":
+        test.skipTest("Skipping test on Windows due to unreliable stdout capture")
+
     wp.load_module(device=device)
     capture = StdOutCapture()
     capture.begin()
@@ -121,23 +112,24 @@ def test_print(test, device):
     wp.synchronize_device(device)
     s = capture.end()
 
-    # We skip the win32 comparison for now since the capture sometimes is an empty string
-    if sys.platform != "win32":
-        test.assertRegex(
-            s,
-            rf"1{os.linesep}"
-            rf"this is a string{os.linesep}"
-            rf"this is another string{os.linesep}"
-            rf"this is a float 457\.500000{os.linesep}"
-            rf"this is an int 123{os.linesep}"
-            rf"0=0, 1=1, 2=2, 3=3, 4=4, 5=5, 6=6, 7=7, "
-            rf"8=8, 9=9, 10=10, 11=11, 12=12, 13=13, 14=14, 15=15, "
-            rf"16=16, 17=17, 18=18, 19=19, 20=20, 21=21, 22=22, 23=23, "
-            rf"24=24, 25=25, 26=26, 27=27, 28=28, 29=29, 30=30, 31=31{os.linesep}",
-        )
+    test.assertRegex(
+        s,
+        rf"1{os.linesep}"
+        rf"this is a string{os.linesep}"
+        rf"this is another string{os.linesep}"
+        rf"this is a float 457\.500000{os.linesep}"
+        rf"this is an int 123{os.linesep}"
+        rf"0=0, 1=1, 2=2, 3=3, 4=4, 5=5, 6=6, 7=7, "
+        rf"8=8, 9=9, 10=10, 11=11, 12=12, 13=13, 14=14, 15=15, "
+        rf"16=16, 17=17, 18=18, 19=19, 20=20, 21=21, 22=22, 23=23, "
+        rf"24=24, 25=25, 26=26, 27=27, 28=28, 29=29, 30=30, 31=31{os.linesep}",
+    )
 
 
 def test_print_numeric(test, device):
+    if sys.platform == "win32":
+        test.skipTest("Skipping test on Windows due to unreliable stdout capture")
+
     wp.load_module(device=device)
 
     capture = StdOutCapture()
@@ -146,22 +138,20 @@ def test_print_numeric(test, device):
     wp.synchronize_device(device)
     s = capture.end()
 
-    # We skip the win32 comparison for now since the capture sometimes is an empty string
-    if sys.platform != "win32":
-        test.assertRegex(
-            s,
-            rf"17{os.linesep}"
-            rf"17{os.linesep}"
-            rf"17{os.linesep}"
-            rf"17{os.linesep}"
-            rf"17{os.linesep}"
-            rf"17{os.linesep}"
-            rf"17{os.linesep}"
-            rf"17{os.linesep}"
-            rf"17{os.linesep}"
-            rf"17{os.linesep}"
-            rf"17{os.linesep}",
-        )
+    test.assertRegex(
+        s,
+        rf"17{os.linesep}"
+        rf"17{os.linesep}"
+        rf"17{os.linesep}"
+        rf"17{os.linesep}"
+        rf"17{os.linesep}"
+        rf"17{os.linesep}"
+        rf"17{os.linesep}"
+        rf"17{os.linesep}"
+        rf"17{os.linesep}"
+        rf"17{os.linesep}"
+        rf"17{os.linesep}",
+    )
 
     capture = StdOutCapture()
     capture.begin()
@@ -169,48 +159,47 @@ def test_print_numeric(test, device):
     wp.synchronize_device(device)
     s = capture.end()
 
-    # We skip the win32 comparison for now since the capture sometimes is an empty string
-    if sys.platform != "win32":
-        test.assertRegex(
-            s,
-            rf"-1{os.linesep}"
-            rf"-1{os.linesep}"
-            rf"-1{os.linesep}"
-            rf"-1{os.linesep}"
-            rf"255{os.linesep}"
-            rf"65535{os.linesep}"
-            rf"4294967295{os.linesep}"
-            rf"18446744073709551615{os.linesep}"
-            rf"-1{os.linesep}"
-            rf"-1{os.linesep}"
-            rf"-1{os.linesep}",
-        )
+    test.assertRegex(
+        s,
+        rf"-1{os.linesep}"
+        rf"-1{os.linesep}"
+        rf"-1{os.linesep}"
+        rf"-1{os.linesep}"
+        rf"255{os.linesep}"
+        rf"65535{os.linesep}"
+        rf"4294967295{os.linesep}"
+        rf"18446744073709551615{os.linesep}"
+        rf"-1{os.linesep}"
+        rf"-1{os.linesep}"
+        rf"-1{os.linesep}",
+    )
 
     capture = StdOutCapture()
     capture.begin()
     test_print_numeric_func(-1)
     s = capture.end()
 
-    # We skip the win32 comparison for now since the capture sometimes is an empty string
-    if sys.platform != "win32":
-        test.assertRegex(
-            s,
-            rf"True{os.linesep}"
-            rf"-1{os.linesep}"
-            rf"-1{os.linesep}"
-            rf"-1{os.linesep}"
-            rf"-1{os.linesep}"
-            rf"255{os.linesep}"
-            rf"65535{os.linesep}"
-            rf"4294967295{os.linesep}"
-            rf"18446744073709551615{os.linesep}"
-            rf"-1{os.linesep}"
-            rf"-1{os.linesep}"
-            rf"-1{os.linesep}",
-        )
+    test.assertRegex(
+        s,
+        rf"True{os.linesep}"
+        rf"-1{os.linesep}"
+        rf"-1{os.linesep}"
+        rf"-1{os.linesep}"
+        rf"-1{os.linesep}"
+        rf"255{os.linesep}"
+        rf"65535{os.linesep}"
+        rf"4294967295{os.linesep}"
+        rf"18446744073709551615{os.linesep}"
+        rf"-1{os.linesep}"
+        rf"-1{os.linesep}"
+        rf"-1{os.linesep}",
+    )
 
 
 def test_print_boolean(test, device):
+    if sys.platform == "win32":
+        test.skipTest("Skipping test on Windows due to unreliable stdout capture")
+
     wp.load_module(device=device)
     capture = StdOutCapture()
     capture.begin()
@@ -218,9 +207,7 @@ def test_print_boolean(test, device):
     wp.synchronize_device(device)
     s = capture.end()
 
-    # We skip the win32 comparison for now since the capture sometimes is an empty string
-    if sys.platform != "win32":
-        test.assertRegex(s, rf"True{os.linesep}False{os.linesep}")
+    test.assertRegex(s, rf"True{os.linesep}False{os.linesep}")
 
 
 @wp.kernel
@@ -251,6 +238,9 @@ for T in generic_print_types:
 
 
 def test_print_adjoint(test, device):
+    if sys.platform == "win32":
+        test.skipTest("Skipping test on Windows due to unreliable stdout capture")
+
     for scalar_type in wp._src.types.scalar_types:
         # scalar
         capture = StdOutCapture()
@@ -266,9 +256,7 @@ def test_print_adjoint(test, device):
         wp.synchronize_device(device)
         s = capture.end()
 
-        # We skip the win32 comparison for now since the capture sometimes is an empty string
-        if sys.platform != "win32":
-            test.assertRegex(s, rf"17{os.linesep}adj: 42{os.linesep}")
+        test.assertRegex(s, rf"17{os.linesep}adj: 42{os.linesep}")
 
         for dim in (2, 3, 4):
             # vector
@@ -283,11 +271,9 @@ def test_print_adjoint(test, device):
             wp.synchronize_device(device)
             s = capture.end()
 
-            # We skip the win32 comparison for now since the capture sometimes is an empty string
-            if sys.platform != "win32":
-                expected_forward = " ".join(str(int(x)) for x in v) + " "
-                expected_adjoint = " ".join(str(int(x)) for x in adj_v)
-                test.assertRegex(s, rf"{expected_forward}{os.linesep}adj: {expected_adjoint}{os.linesep}")
+            expected_forward = " ".join(str(int(x)) for x in v) + " "
+            expected_adjoint = " ".join(str(int(x)) for x in adj_v)
+            test.assertRegex(s, rf"{expected_forward}{os.linesep}adj: {expected_adjoint}{os.linesep}")
 
             # matrix
             mat_type = wp.types.matrix((dim, dim), scalar_type)
@@ -301,18 +287,16 @@ def test_print_adjoint(test, device):
             wp.synchronize_device(device)
             s = capture.end()
 
-            # We skip the win32 comparison for now since the capture sometimes is an empty string
-            if sys.platform != "win32":
-                expected_forward = ""
-                expected_adjoint = ""
-                for row in range(dim):
-                    if row == 0:
-                        adj_prefix = "adj: "
-                    else:
-                        adj_prefix = "     "
-                    expected_forward += " ".join(str(int(x)) for x in m[row]) + f" {os.linesep}"
-                    expected_adjoint += adj_prefix + " ".join(str(int(x)) for x in adj_m[row]) + f"{os.linesep}"
-                test.assertRegex(s, rf"{expected_forward}{expected_adjoint}")
+            expected_forward = ""
+            expected_adjoint = ""
+            for row in range(dim):
+                if row == 0:
+                    adj_prefix = "adj: "
+                else:
+                    adj_prefix = "     "
+                expected_forward += " ".join(str(int(x)) for x in m[row]) + f" {os.linesep}"
+                expected_adjoint += adj_prefix + " ".join(str(int(x)) for x in adj_m[row]) + f"{os.linesep}"
+            test.assertRegex(s, rf"{expected_forward}{expected_adjoint}")
 
     # Booleans
     capture = StdOutCapture()
@@ -321,9 +305,7 @@ def test_print_adjoint(test, device):
     wp.synchronize_device(device)
     s = capture.end()
 
-    # We skip the win32 comparison for now since the capture sometimes is an empty string
-    if sys.platform != "win32":
-        test.assertRegex(s, rf"True{os.linesep}adj: False{os.linesep}")
+    test.assertRegex(s, rf"True{os.linesep}adj: False{os.linesep}")
 
     # structs, not printable yet
     capture = StdOutCapture()
@@ -334,11 +316,9 @@ def test_print_adjoint(test, device):
     wp.synchronize_device(device)
     s = capture.end()
 
-    # We skip the win32 comparison for now since the capture sometimes is an empty string
-    if sys.platform != "win32":
-        test.assertRegex(
-            s, rf"<type without print implementation>{os.linesep}adj: <type without print implementation>{os.linesep}"
-        )
+    test.assertRegex(
+        s, rf"<type without print implementation>{os.linesep}adj: <type without print implementation>{os.linesep}"
+    )
 
     # arrays, not printable
     capture = StdOutCapture()
@@ -349,15 +329,13 @@ def test_print_adjoint(test, device):
     wp.synchronize_device(device)
     s = capture.end()
 
-    # We skip the win32 comparison for now since the capture sometimes is an empty string
-    if sys.platform != "win32":
-        test.assertRegex(
-            s, rf"<type without print implementation>{os.linesep}adj: <type without print implementation>{os.linesep}"
-        )
+    test.assertRegex(
+        s, rf"<type without print implementation>{os.linesep}adj: <type without print implementation>{os.linesep}"
+    )
 
 
 def test_print_error_variadic_arg_count(test, device):
-    @wp.kernel
+    @wp.kernel(module="unique")
     def kernel():
         # fmt: off
         wp.printf(
@@ -404,5 +382,4 @@ add_function_test(
 
 
 if __name__ == "__main__":
-    wp.clear_kernel_cache()
     unittest.main(verbosity=2)

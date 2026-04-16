@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 ###########################################################################
 # Example Burgers
@@ -146,7 +134,7 @@ class Example:
         # For simplicity, use nodal integration so that inertia matrix is diagonal
         trial = fem.make_trial(space=vector_space, domain=domain)
         matrix_inertia = fem.integrate(
-            vel_mass_form, fields={"u": trial, "v": self._test}, output_dtype=wp.float32, assembly="nodal"
+            vel_mass_form, fields={"u": trial, "v": self._test}, output_dtype=float, assembly="nodal"
         )
         self._inv_mass_matrix = wp.sparse.bsr_copy(matrix_inertia)
         fem_example_utils.invert_diagonal_bsr_matrix(self._inv_mass_matrix)
@@ -234,7 +222,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--device", type=str, default=None, help="Override the default Warp device.")
     parser.add_argument("--resolution", type=int, default=50, help="Grid resolution.")
-    parser.add_argument("--num_frames", type=int, default=250, help="Total number of frames.")
+    parser.add_argument("--num-frames", type=int, default=250, help="Total number of frames.")
     parser.add_argument("--degree", choices=(0, 1), type=int, default=1, help="Discretization order.")
     parser.add_argument(
         "--headless",
@@ -252,8 +240,7 @@ if __name__ == "__main__":
             degree=args.degree,
         )
 
-        for k in range(args.num_frames):
-            print(f"Frame {k}:")
+        for _k, _ in fem_example_utils.progress_bar(args.num_frames, quiet=args.quiet):
             example.step()
             example.render()
 

@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 from typing import Any, Optional
 
@@ -20,6 +8,7 @@ from warp._src.fem import cache
 from warp._src.fem.geometry import GeometryPartition, WholeGeometryPartition
 from warp._src.fem.types import NULL_ELEMENT_INDEX, NULL_NODE_INDEX
 from warp._src.fem.utils import compress_node_indices
+from warp._src.utils import warn
 
 from .function_space import FunctionSpace
 from .topology import SpaceTopology
@@ -63,7 +52,7 @@ class SpacePartition:
     def space_node_indices(self) -> wp.array:
         """Return the global function space indices for nodes in this partition"""
 
-    def rebuild(self, device: Optional = None, temporary_store: Optional[cache.TemporaryStore] = None):
+    def rebuild(self, device: Optional = None, temporary_store: cache.TemporaryStore | None = None):
         """Rebuild the space partition indices"""
         pass
 
@@ -168,7 +157,7 @@ class NodePartition(SpacePartition):
         with_halo: bool = True,
         max_node_count: int = -1,
         device=None,
-        temporary_store: Optional[cache.TemporaryStore] = None,
+        temporary_store: cache.TemporaryStore | None = None,
     ):
         super().__init__(space_topology=space_topology, geo_partition=geo_partition)
 
@@ -187,7 +176,7 @@ class NodePartition(SpacePartition):
 
         self.rebuild(device, temporary_store)
 
-    def rebuild(self, device: Optional = None, temporary_store: Optional[cache.TemporaryStore] = None):
+    def rebuild(self, device: Optional = None, temporary_store: cache.TemporaryStore | None = None):
         self._compute_node_indices_from_sides(device, self._with_halo, self._max_node_count, temporary_store)
 
     def node_count(self) -> int:
@@ -364,6 +353,8 @@ class NodePartition(SpacePartition):
 
         # Compute global to local indices
         if self._space_to_partition is None or self._space_to_partition.shape != node_indices.shape:
+            if self._space_to_partition is not None:
+                self._space_to_partition.release()
             self._space_to_partition = cache.borrow_temporary_like(node_indices, temporary_store)
 
         wp.launch(
@@ -378,6 +369,8 @@ class NodePartition(SpacePartition):
 
         # Copy to shrunk-to-fit array
         if self._node_indices is None or self._node_indices.shape[0] != self.node_count():
+            if self._node_indices is not None:
+                self._node_indices.release()
             self._node_indices = cache.borrow_temporary(
                 temporary_store, shape=(self.node_count(),), dtype=int, device=device
             )
@@ -414,9 +407,9 @@ class NodePartition(SpacePartition):
 
 
 def make_space_partition(
-    space: Optional[FunctionSpace] = None,
-    geometry_partition: Optional[GeometryPartition] = None,
-    space_topology: Optional[SpaceTopology] = None,
+    space: FunctionSpace | None = None,
+    geometry_partition: GeometryPartition | None = None,
+    space_topology: SpaceTopology | None = None,
     with_halo: bool = True,
     max_node_count: int = -1,
     device=None,
@@ -437,6 +430,13 @@ def make_space_partition(
     Returns:
         the resulting space partition
     """
+
+    if space is not None:
+        warn(
+            "The `space` argument of `make_space_partition` is deprecated and will be removed in 1.14. "
+            "Please use `space_topology` instead.",
+            DeprecationWarning,
+        )
 
     if space_topology is None:
         space_topology = space.topology

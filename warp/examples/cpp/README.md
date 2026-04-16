@@ -103,7 +103,7 @@ Examples use Warp's AOT (Ahead-Of-Time) header (`warp/native/aot.h`) which provi
 - Automatic CUDA detection and configuration
 - Error checking macros (`CHECK_CU`, `CHECK_CUDA`)
 - Common Warp type definitions via `builtin.h`:
-  - `wp::launch_bounds_t` - Thread count and grid dimensions
+  - `wp::launch_bounds_t<N>` - Thread count and grid dimensions (templated on dimensionality)
   - `wp::array_t<T>` - Array descriptor with pointer, shape, strides
   - `wp::vec_t<N, T>`, `wp::mat_t<N, M, T>` - Vector and matrix types
 
@@ -118,7 +118,7 @@ These examples are designed to run from within the Warp repository.
 
 ### Requirements
 
-- **Python 3.8+**
+- **Python 3.10+**
 - **CUDA Toolkit**:
   - `00_cubin_launch`: **12.0+** (Warp's minimum requirement)
   - `01_source_include`: **12.8+** (required for `sm_120` compilation)

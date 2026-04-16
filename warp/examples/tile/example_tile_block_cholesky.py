@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 ###########################################################################
 # Example Tile Block Cholesky
@@ -35,9 +23,9 @@ wp.set_module_options({"enable_backward": False})
 def create_blocked_cholesky_kernel(block_size: int):
     @wp.kernel
     def blocked_cholesky_kernel(
-        A: wp.array(dtype=float, ndim=2),
-        L: wp.array(dtype=float, ndim=2),
-        active_matrix_size_arr: wp.array(dtype=int, ndim=1),
+        A: wp.array2d[float],
+        L: wp.array2d[float],
+        active_matrix_size_arr: wp.array[int],
     ):
         """Compute the Cholesky factorization of a symmetric positive definite matrix ``A`` in blocks.
 
@@ -123,11 +111,11 @@ def create_blocked_cholesky_kernel(block_size: int):
 def create_blocked_cholesky_solve_kernel(block_size: int):
     @wp.kernel
     def blocked_cholesky_solve_kernel(
-        L: wp.array(dtype=float, ndim=2),
-        b: wp.array(dtype=float, ndim=2),
-        x: wp.array(dtype=float, ndim=2),
-        y: wp.array(dtype=float, ndim=2),
-        active_matrix_size_arr: wp.array(dtype=int, ndim=1),
+        L: wp.array2d[float],
+        b: wp.array2d[float],
+        x: wp.array2d[float],
+        y: wp.array2d[float],
+        active_matrix_size_arr: wp.array[int],
     ):
         """Solve ``A x = b`` given the Cholesky factor ``L (A = L L^T)`` using blocked forward and backward substitution.
 
@@ -371,8 +359,8 @@ def test_cholesky_solver(n, warp_solver: BlockCholeskySolver, headless: bool = F
         print(f"Solution residual norm: {res_norm:.3e}")
 
     # Initialize Warp arrays
-    A_wp = wp.array(A_padded, dtype=wp.float32, device=device)
-    b_wp = wp.array(b_padded, dtype=wp.float32, device=device).reshape((padded_n, 1))
+    A_wp = wp.array(A_padded, dtype=float, device=device)
+    b_wp = wp.array(b_padded, dtype=float, device=device).reshape((padded_n, 1))
     x_wp = wp.zeros_like(b_wp)
 
     # Create and use the Cholesky solver
@@ -397,7 +385,7 @@ def test_cholesky_solver(n, warp_solver: BlockCholeskySolver, headless: bool = F
 
 
 @wp.kernel
-def assign_int_kernel(arr: wp.array(dtype=int, ndim=1), value: int):
+def assign_int_kernel(arr: wp.array[int], value: int):
     """Assign an integer value into the first element of an array."""
     arr[0] = value
 
@@ -428,13 +416,13 @@ def test_cholesky_solver_graph_capture(device):
         b_padded[:max_equations, :] = b_np
 
         # Create Warp arrays from padded numpy arrays
-        A_wp = wp.array(A_padded, dtype=wp.float32, ndim=2)
-        b_wp = wp.array(b_padded, dtype=wp.float32, ndim=2)
+        A_wp = wp.array(A_padded, dtype=float, ndim=2)
+        b_wp = wp.array(b_padded, dtype=float, ndim=2)
 
         # Create result array
         x_wp = wp.zeros_like(b_wp)
         # Create array for equation system size
-        n_wp = wp.array([1], dtype=wp.int32)
+        n_wp = wp.array([1], dtype=int)
 
         # Create a stream for graph capture
         stream = wp.Stream(device)
@@ -470,7 +458,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--device", type=str, default=None, help="Override the default Warp device.")
-    parser.add_argument("--graph_capture", action="store_true", help="Test graph capture.")
+    parser.add_argument("--graph-capture", action="store_true", help="Test graph capture.")
     parser.add_argument("-N", type=int, default=8, help="Number of matrices to test.")
     parser.add_argument(
         "--headless",

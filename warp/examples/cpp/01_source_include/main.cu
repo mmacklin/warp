@@ -1,19 +1,5 @@
-/*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: Apache-2.0
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 /**
  * Warp C++ Integration: Source Inclusion with Automatic Differentiation
@@ -100,7 +86,7 @@ int main()
 
     // Prepare Warp structures
     // CRITICAL: Using positional initialization for MSVC compatibility
-    wp::launch_bounds_t dim = { { N_SAMPLES, 0, 0, 0 }, 1, size_t(N_SAMPLES) };
+    wp::launch_bounds_t<1> dim = { { N_SAMPLES }, size_t(N_SAMPLES), false };
 
     wp::array_t<wp::float32> arr_params(d_params, 2);
     wp::array_t<wp::float32> arr_x(d_x, N_SAMPLES);
@@ -162,7 +148,7 @@ int main()
 
         // Update parameters on GPU: params -= (learning_rate / N_SAMPLES) * gradients
         float normalized_lr = LEARNING_RATE / N_SAMPLES;
-        update_params_cuda_kernel_forward<<<1, 2>>>({ { 2, 0, 0, 0 }, 1, 2 }, normalized_lr, adj_params, arr_params);
+        update_params_cuda_kernel_forward<<<1, 2>>>({ { 2 }, size_t(2), false }, normalized_lr, adj_params, arr_params);
         CHECK_CUDA(cudaGetLastError());
 
         if (iter % 10 == 0) {

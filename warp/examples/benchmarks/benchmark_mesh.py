@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 """Compare Mesh query performance between single-threaded and tiled (thread-block parallel) queries.
 
@@ -36,9 +24,9 @@ WARM_UP = 5  # Number of warm-up iterations
 @wp.kernel
 def mesh_query_aabb_kernel(
     mesh_id: wp.uint64,
-    query_lowers: wp.array(dtype=wp.vec3),
-    query_uppers: wp.array(dtype=wp.vec3),
-    hit_counts: wp.array(dtype=int),
+    query_lowers: wp.array[wp.vec3],
+    query_uppers: wp.array[wp.vec3],
+    hit_counts: wp.array[int],
 ):
     i = wp.tid()
     query = wp.mesh_query_aabb(mesh_id, query_lowers[i], query_uppers[i])
@@ -55,9 +43,9 @@ def mesh_query_aabb_kernel(
 @wp.kernel
 def tile_mesh_query_aabb_kernel(
     mesh_id: wp.uint64,
-    query_lowers: wp.array(dtype=wp.vec3),
-    query_uppers: wp.array(dtype=wp.vec3),
-    hit_counts: wp.array(dtype=int),
+    query_lowers: wp.array[wp.vec3],
+    query_uppers: wp.array[wp.vec3],
+    hit_counts: wp.array[int],
 ):
     i, _j = wp.tid()
     query = wp.tile_mesh_query_aabb(mesh_id, query_lowers[i], query_uppers[i])

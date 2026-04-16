@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 ###########################################################################
 # Example Marching Cubes
@@ -81,7 +69,7 @@ def make_field(
     smooth_min_radius: float,
     dim: int,
     time: float,
-    out_data: wp.array3d(dtype=float),
+    out_data: wp.array3d[float],
 ):
     """Kernel to generate a SDF volume based on primitives."""
     i, j, k = wp.tid()
@@ -174,12 +162,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--device", type=str, default=None, help="Override the default Warp device.")
     parser.add_argument(
-        "--stage_path",
+        "--stage-path",
         type=lambda x: None if x == "None" else str(x),
         default="example_marching_cubes.usd",
         help="Path to the output USD file.",
     )
-    parser.add_argument("--num_frames", type=int, default=240, help="Total number of frames.")
+    parser.add_argument("--num-frames", type=int, default=240, help="Total number of frames.")
     parser.add_argument("--verbose", action="store_true", help="Print out additional status messages during execution.")
 
     args = parser.parse_known_args()[0]

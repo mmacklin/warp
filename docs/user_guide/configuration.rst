@@ -51,11 +51,11 @@ The options for a module can also be queried using :func:`wp.get_module_options(
 +--------------------------------------+---------+-------------+--------------------------------------------------------------------------+
 | Field                                | Type    |Default Value| Description                                                              |
 +======================================+=========+=============+==========================================================================+
-|``mode``                              | String  | Global      | A module-level override of the :attr:`warp.config.mode` setting.         |
-|                                      |         | setting     |                                                                          |
+|``mode``                              | String  | ``None``    | A module-level override of the :attr:`warp.config.mode` setting.         |
+|                                      |         |             | ``None`` defers to the global setting at compile time.                   |
 +--------------------------------------+---------+-------------+--------------------------------------------------------------------------+
-|``optimization_level``                | Integer | Global      | A module-level override of the :attr:`warp.config.optimization_level`    |
-|                                      |         | setting     | setting.                                                                 |
+|``optimization_level``                | Integer | ``None``    | A module-level override of the :attr:`warp.config.optimization_level`    |
+|                                      |         |             | setting. ``None`` defers to the global setting at compile time.          |
 +--------------------------------------+---------+-------------+--------------------------------------------------------------------------+
 |``max_unroll``                        | Integer | Global      | A module-level override of the :attr:`warp.config.max_unroll` setting.   |
 |                                      |         | setting     |                                                                          |
@@ -87,18 +87,79 @@ The options for a module can also be queried using :func:`wp.get_module_options(
 |``strip_hash``                        | Boolean | ``False``   | If ``True``, avoids using a content-based hash to identify the module    |
 |                                      |         |             | and its functions.                                                       |
 +--------------------------------------+---------+-------------+--------------------------------------------------------------------------+
+|``enable_mathdx_gemm``                | Boolean | ``None``    | A module-level override of the :attr:`warp.config.enable_mathdx_gemm`    |
+|                                      |         |             | setting. ``None`` defers to the global setting at compile time.          |
++--------------------------------------+---------+-------------+--------------------------------------------------------------------------+
 
 Kernel Settings
 ---------------
 
-Backward-pass compilation can be disabled on a per-kernel basis by passing the ``enable_backward`` argument into the :func:`@wp.kernel <warp.kernel>` decorator
-as in the following example:
+Kernel-level settings can be passed as arguments to the :func:`@wp.kernel <warp.kernel>` decorator.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 20 20 10 50
+
+   * - Field
+     - Type
+     - Default Value
+     - Description
+   * - ``enable_backward``
+     - Boolean
+     - ``None``
+     - If ``False``, the backward pass will not be generated for this kernel.
+       If ``None``, inherits from the module/global setting.
+   * - ``module``
+     - Module | ``"unique"`` | str
+     - ``None``
+     - Controls which module the kernel belongs to. If ``"unique"``, the kernel
+       is assigned to a new module named after the kernel (with a hash suffix). If a
+       plain string is provided, the kernel is registered in the module with
+       that name. If ``None``, the module is inferred from the function's module.
+   * - ``launch_bounds``
+     - int | tuple
+     - ``None``
+     - CUDA ``__launch_bounds__`` attribute for the kernel. Can be an int
+       (``maxThreadsPerBlock``) or a tuple of 1--2 ints
+       ``(maxThreadsPerBlock, minBlocksPerMultiprocessor)``. Only applies to
+       CUDA kernels. The ``block_dim`` parameter in :func:`warp.launch` must
+       not exceed the ``maxThreadsPerBlock`` value specified here.
+   * - ``module_options``
+     - dict
+     - ``None``
+     - A dict of module-level compilation options to apply to the kernel's
+       module. Requires ``module="unique"``; raises ``ValueError`` otherwise.
+       Keys are validated against the module's known options (see
+       `Module Settings`_ above). For shared modules, use
+       :func:`wp.set_module_options() <warp.set_module_options>` instead.
 
 .. code-block:: python
 
     @wp.kernel(enable_backward=False)
     def scale_2(
-        x: wp.array(dtype=float),
-        y: wp.array(dtype=float),
+        x: wp.array[float],
+        y: wp.array[float],
     ):
         y[0] = x[0] ** 2.0
+
+
+    @wp.kernel(module="unique")
+    def isolated_kernel(a: wp.array[float], b: wp.array[float]):
+        # This kernel will be registered in a new unique module created
+        # just for this kernel and its dependent functions and structs
+        tid = wp.tid()
+        b[tid] = a[tid] + 1.0
+
+
+    @wp.kernel(launch_bounds=(256, 1))
+    def bounded_kernel(a: wp.array[float]):
+        # CUDA __launch_bounds__ will be set to (256, 1)
+        tid = wp.tid()
+        a[tid] = a[tid] * 2.0
+
+
+    @wp.kernel(module_options={"fast_math": True}, module="unique")
+    def fast_kernel(a: wp.array(dtype=float), b: wp.array(dtype=float)):
+        # fast_math is applied to this kernel's unique module
+        tid = wp.tid()
+        b[tid] = a[tid] + 1.0

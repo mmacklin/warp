@@ -1,19 +1,5 @@
-/*
- * SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: Apache-2.0
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 #pragma once
 
@@ -1288,6 +1274,10 @@ CUDA_CALLABLE inline void adj_where(
 // stub for the case where we have an nested array inside a struct and
 // atomic add the whole struct onto an array (e.g.: during backwards pass)
 template <typename T> CUDA_CALLABLE inline void atomic_add(array_t<T>*, array_t<T>) { }
+
+// stub for the case where we have an indexed array inside a struct and
+// atomic add the whole struct onto an array (e.g.: during backwards pass)
+template <typename T> CUDA_CALLABLE inline void atomic_add(indexedarray_t<T>*, indexedarray_t<T>) { }
 
 // for float and vector types this is just an alias for an atomic add
 template <typename T> CUDA_CALLABLE inline void adj_atomic_add(T* buf, T value) { atomic_add(buf, value); }

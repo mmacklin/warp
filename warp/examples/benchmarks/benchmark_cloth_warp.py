@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import warp as wp
 
@@ -20,13 +8,13 @@ wp.clear_kernel_cache()
 
 @wp.kernel
 def eval_springs(
-    x: wp.array(dtype=wp.vec3),
-    v: wp.array(dtype=wp.vec3),
-    spring_indices: wp.array(dtype=int),
-    spring_rest_lengths: wp.array(dtype=float),
-    spring_stiffness: wp.array(dtype=float),
-    spring_damping: wp.array(dtype=float),
-    f: wp.array(dtype=wp.vec3),
+    x: wp.array[wp.vec3],
+    v: wp.array[wp.vec3],
+    spring_indices: wp.array[int],
+    spring_rest_lengths: wp.array[float],
+    spring_stiffness: wp.array[float],
+    spring_damping: wp.array[float],
+    f: wp.array[wp.vec3],
 ):
     tid = wp.tid()
 
@@ -64,10 +52,10 @@ def eval_springs(
 
 @wp.kernel
 def integrate_particles(
-    x: wp.array(dtype=wp.vec3),
-    v: wp.array(dtype=wp.vec3),
-    f: wp.array(dtype=wp.vec3),
-    w: wp.array(dtype=float),
+    x: wp.array[wp.vec3],
+    v: wp.array[wp.vec3],
+    f: wp.array[wp.vec3],
+    w: wp.array[float],
     dt: float,
 ):
     tid = wp.tid()

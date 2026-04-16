@@ -1,19 +1,5 @@
-/*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: Apache-2.0
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 #pragma once
 
@@ -22,9 +8,14 @@
 namespace wp {
 
 // Data type constants (must match texture.cpp and Python side)
-#define WP_TEXTURE_DTYPE_UINT8  0
-#define WP_TEXTURE_DTYPE_UINT16 1
+#define WP_TEXTURE_DTYPE_UINT8   0
+#define WP_TEXTURE_DTYPE_UINT16  1
 #define WP_TEXTURE_DTYPE_FLOAT32 2
+#define WP_TEXTURE_DTYPE_INT8    3
+#define WP_TEXTURE_DTYPE_INT16   4
+#define WP_TEXTURE_DTYPE_FLOAT16 5
+#define WP_TEXTURE_DTYPE_UINT32  6
+#define WP_TEXTURE_DTYPE_INT32   7
 
 // Filter mode constants
 #define WP_TEXTURE_FILTER_CLOSEST 0
@@ -36,21 +27,115 @@ namespace wp {
 #define WP_TEXTURE_ADDRESS_MIRROR 2
 #define WP_TEXTURE_ADDRESS_BORDER 3
 
-// CPU texture descriptor - mirrors the struct in texture.cpp
-// This is what the tex handle points to on CPU
-struct cpu_texture2d_data {
-    void* data;
-    int32 width;
-    int32 height;
-    int32 num_channels;
-    int32 dtype;
-    int32 filter_mode;
-    int32 address_mode_u;  // Per-axis address mode for U
-    int32 address_mode_v;  // Per-axis address mode for V
-    bool use_normalized_coords;  // If true, coords in [0,1]; if false, in texel space
-};
+// Helper function to get bytes per channel from dtype
+inline int get_texture_bytes_per_channel(int dtype)
+{
+    switch (dtype) {
+    case WP_TEXTURE_DTYPE_UINT8:
+    case WP_TEXTURE_DTYPE_INT8:
+        return 1;
+    case WP_TEXTURE_DTYPE_UINT16:
+    case WP_TEXTURE_DTYPE_INT16:
+    case WP_TEXTURE_DTYPE_FLOAT16:
+        return 2;
+    case WP_TEXTURE_DTYPE_UINT32:
+    case WP_TEXTURE_DTYPE_INT32:
+    case WP_TEXTURE_DTYPE_FLOAT32:
+        return 4;
+    default:
+        return 0;
+    }
+}
 
-struct cpu_texture3d_data {
+// Texture class for CPU or other hardware without texture units
+struct Texture {
+
+    // 1D texture constructor
+    Texture(
+        int32 width,
+        int32 num_channels,
+        int32 dtype,
+        int32 filter_mode,
+        int32 address_mode_u,
+        bool use_normalized_coords
+    )
+        : data(nullptr)
+        , width(width)
+        , height(0)
+        , depth(0)
+        , num_channels(num_channels)
+        , dtype(dtype)
+        , filter_mode(filter_mode)
+        , address_mode_u(address_mode_u)
+        , address_mode_v(0)
+        , address_mode_w(0)
+        , use_normalized_coords(use_normalized_coords)
+    {
+        size_t data_size = size_t(width) * num_channels * get_texture_bytes_per_channel(dtype);
+        data = new uint8[data_size];
+    }
+
+    // 2D texture constructor
+    Texture(
+        int32 width,
+        int32 height,
+        int32 num_channels,
+        int32 dtype,
+        int32 filter_mode,
+        int32 address_mode_u,
+        int32 address_mode_v,
+        bool use_normalized_coords
+    )
+        : data(nullptr)
+        , width(width)
+        , height(height)
+        , depth(0)
+        , num_channels(num_channels)
+        , dtype(dtype)
+        , filter_mode(filter_mode)
+        , address_mode_u(address_mode_u)
+        , address_mode_v(address_mode_v)
+        , address_mode_w(0)
+        , use_normalized_coords(use_normalized_coords)
+    {
+        size_t data_size = size_t(width) * height * num_channels * get_texture_bytes_per_channel(dtype);
+        data = new uint8[data_size];
+    }
+
+    // 3D texture constructor
+    Texture(
+        int32 width,
+        int32 height,
+        int32 depth,
+        int32 num_channels,
+        int32 dtype,
+        int32 filter_mode,
+        int32 address_mode_u,
+        int32 address_mode_v,
+        int32 address_mode_w,
+        bool use_normalized_coords
+    )
+        : data(nullptr)
+        , width(width)
+        , height(height)
+        , depth(depth)
+        , num_channels(num_channels)
+        , dtype(dtype)
+        , filter_mode(filter_mode)
+        , address_mode_u(address_mode_u)
+        , address_mode_v(address_mode_v)
+        , address_mode_w(address_mode_w)
+        , use_normalized_coords(use_normalized_coords)
+    {
+        size_t data_size = size_t(width) * height * depth * num_channels * get_texture_bytes_per_channel(dtype);
+        data = new uint8[data_size];
+    }
+
+    Texture(const Texture&) = delete;
+    Texture& operator=(const Texture&) = delete;
+
+    ~Texture() { delete[] (uint8*)data; }
+
     void* data;
     int32 width;
     int32 height;
@@ -66,8 +151,28 @@ struct cpu_texture3d_data {
 
 // Texture descriptor passed to kernels
 // Contains the CUDA texture object handle (GPU) or pointer to cpu_texture*_data (CPU)
+struct texture1d_t {
+    uint64 tex;  // CUtexObject handle (GPU) or Texture* (CPU)
+    int32 width;
+    int32 num_channels;
+
+    CUDA_CALLABLE inline texture1d_t()
+        : tex(0)
+        , width(0)
+        , num_channels(0)
+    {
+    }
+
+    CUDA_CALLABLE inline texture1d_t(uint64 tex, int32 width, int32 num_channels)
+        : tex(tex)
+        , width(width)
+        , num_channels(num_channels)
+    {
+    }
+};
+
 struct texture2d_t {
-    uint64 tex;  // CUtexObject handle (GPU) or cpu_texture2d_data* (CPU)
+    uint64 tex;  // CUtexObject handle (GPU) or Texture* (CPU)
     int32 width;
     int32 height;
     int32 num_channels;
@@ -90,7 +195,7 @@ struct texture2d_t {
 };
 
 struct texture3d_t {
-    uint64 tex;  // CUtexObject handle (GPU) or cpu_texture3d_data* (CPU)
+    uint64 tex;  // CUtexObject handle (GPU) or Texture* (CPU)
     int32 width;
     int32 height;
     int32 depth;
@@ -113,6 +218,13 @@ struct texture3d_t {
         , num_channels(num_channels)
     {
     }
+};
+
+struct cuda_array_desc_t {
+    int32 ndim;
+    int32 shape[3];
+    int32 num_channels;
+    int32 dtype;
 };
 
 // ============================================================================
@@ -187,6 +299,8 @@ inline int cpu_apply_address_mode_index(int idx, int size, int address_mode)
 }
 
 // Check if index is within bounds (for border mode)
+inline bool cpu_in_bounds_1d(int x, int w) { return x >= 0 && x < w; }
+
 inline bool cpu_in_bounds_2d(int x, int y, int w, int h) { return x >= 0 && x < w && y >= 0 && y < h; }
 
 inline bool cpu_in_bounds_3d(int x, int y, int z, int w, int h, int d)
@@ -194,10 +308,82 @@ inline bool cpu_in_bounds_3d(int x, int y, int z, int w, int h, int d)
     return x >= 0 && x < w && y >= 0 && y < h && z >= 0 && z < d;
 }
 
-// Fetch a single texel value (normalized to [0,1] for uint types, as-is for float)
-inline float cpu_fetch_texel_2d(const cpu_texture2d_data* tex, int x, int y, int channel)
+// Convert IEEE 754 half-precision bits to float (for CPU float16 texture support)
+inline float cpu_half_to_float(uint16_t h)
 {
-    // Border mode and invalid channels return 0
+    uint32_t sign = (uint32_t)(h >> 15) << 31;
+    uint32_t exp = (h >> 10) & 0x1F;
+    uint32_t mantissa = h & 0x3FF;
+
+    uint32_t result;
+    if (exp == 0) {
+        if (mantissa == 0) {
+            result = sign;
+        } else {
+            // Denormalized: convert to normalized float
+            exp = 1;
+            while (!(mantissa & 0x400)) {
+                mantissa <<= 1;
+                exp--;
+            }
+            mantissa &= 0x3FF;
+            result = sign | ((uint32_t)(exp + 127 - 15) << 23) | ((uint32_t)mantissa << 13);
+        }
+    } else if (exp == 31) {
+        // Inf or NaN
+        result = sign | 0x7F800000u | ((uint32_t)mantissa << 13);
+    } else {
+        result = sign | ((uint32_t)(exp + 127 - 15) << 23) | ((uint32_t)mantissa << 13);
+    }
+
+    union {
+        uint32_t u;
+        float f;
+    } conv;
+    conv.u = result;
+    return conv.f;
+}
+
+// Fetch a single texel value.
+// Unsigned integers are normalized to [0, 1], signed integers to [-1, 1],
+// float types are returned as-is.
+inline float cpu_fetch_texel_1d(const Texture* tex, int x, int channel)
+{
+    if (!cpu_in_bounds_1d(x, tex->width) || channel < 0 || channel >= tex->num_channels) {
+        return 0.0f;
+    }
+
+    int idx = x * tex->num_channels + channel;
+
+    switch (tex->dtype) {
+    case WP_TEXTURE_DTYPE_UINT8:
+        return ((const uint8_t*)tex->data)[idx] / 255.0f;
+    case WP_TEXTURE_DTYPE_UINT16:
+        return ((const uint16_t*)tex->data)[idx] / 65535.0f;
+    case WP_TEXTURE_DTYPE_UINT32:
+        return ((const uint32_t*)tex->data)[idx] / 4294967295.0f;
+    case WP_TEXTURE_DTYPE_INT8: {
+        float v = ((const int8_t*)tex->data)[idx] / 127.0f;
+        return v < -1.0f ? -1.0f : v;
+    }
+    case WP_TEXTURE_DTYPE_INT16: {
+        float v = ((const int16_t*)tex->data)[idx] / 32767.0f;
+        return v < -1.0f ? -1.0f : v;
+    }
+    case WP_TEXTURE_DTYPE_INT32: {
+        float v = ((const int32_t*)tex->data)[idx] / 2147483647.0f;
+        return v < -1.0f ? -1.0f : v;
+    }
+    case WP_TEXTURE_DTYPE_FLOAT16:
+        return cpu_half_to_float(((const uint16_t*)tex->data)[idx]);
+    case WP_TEXTURE_DTYPE_FLOAT32:
+    default:
+        return ((const float*)tex->data)[idx];
+    }
+}
+
+inline float cpu_fetch_texel_2d(const Texture* tex, int x, int y, int channel)
+{
     if (!cpu_in_bounds_2d(x, y, tex->width, tex->height) || channel < 0 || channel >= tex->num_channels) {
         return 0.0f;
     }
@@ -209,15 +395,30 @@ inline float cpu_fetch_texel_2d(const cpu_texture2d_data* tex, int x, int y, int
         return ((const uint8_t*)tex->data)[idx] / 255.0f;
     case WP_TEXTURE_DTYPE_UINT16:
         return ((const uint16_t*)tex->data)[idx] / 65535.0f;
+    case WP_TEXTURE_DTYPE_UINT32:
+        return ((const uint32_t*)tex->data)[idx] / 4294967295.0f;
+    case WP_TEXTURE_DTYPE_INT8: {
+        float v = ((const int8_t*)tex->data)[idx] / 127.0f;
+        return v < -1.0f ? -1.0f : v;
+    }
+    case WP_TEXTURE_DTYPE_INT16: {
+        float v = ((const int16_t*)tex->data)[idx] / 32767.0f;
+        return v < -1.0f ? -1.0f : v;
+    }
+    case WP_TEXTURE_DTYPE_INT32: {
+        float v = ((const int32_t*)tex->data)[idx] / 2147483647.0f;
+        return v < -1.0f ? -1.0f : v;
+    }
+    case WP_TEXTURE_DTYPE_FLOAT16:
+        return cpu_half_to_float(((const uint16_t*)tex->data)[idx]);
     case WP_TEXTURE_DTYPE_FLOAT32:
     default:
         return ((const float*)tex->data)[idx];
     }
 }
 
-inline float cpu_fetch_texel_3d(const cpu_texture3d_data* tex, int x, int y, int z, int channel)
+inline float cpu_fetch_texel_3d(const Texture* tex, int x, int y, int z, int channel)
 {
-    // Border mode and invalid channels return 0
     if (!cpu_in_bounds_3d(x, y, z, tex->width, tex->height, tex->depth) || channel < 0
         || channel >= tex->num_channels) {
         return 0.0f;
@@ -230,14 +431,66 @@ inline float cpu_fetch_texel_3d(const cpu_texture3d_data* tex, int x, int y, int
         return ((const uint8_t*)tex->data)[idx] / 255.0f;
     case WP_TEXTURE_DTYPE_UINT16:
         return ((const uint16_t*)tex->data)[idx] / 65535.0f;
+    case WP_TEXTURE_DTYPE_UINT32:
+        return ((const uint32_t*)tex->data)[idx] / 4294967295.0f;
+    case WP_TEXTURE_DTYPE_INT8: {
+        float v = ((const int8_t*)tex->data)[idx] / 127.0f;
+        return v < -1.0f ? -1.0f : v;
+    }
+    case WP_TEXTURE_DTYPE_INT16: {
+        float v = ((const int16_t*)tex->data)[idx] / 32767.0f;
+        return v < -1.0f ? -1.0f : v;
+    }
+    case WP_TEXTURE_DTYPE_INT32: {
+        float v = ((const int32_t*)tex->data)[idx] / 2147483647.0f;
+        return v < -1.0f ? -1.0f : v;
+    }
+    case WP_TEXTURE_DTYPE_FLOAT16:
+        return cpu_half_to_float(((const uint16_t*)tex->data)[idx]);
     case WP_TEXTURE_DTYPE_FLOAT32:
     default:
         return ((const float*)tex->data)[idx];
     }
 }
 
+// Sample a single channel with linear interpolation (1D)
+inline float cpu_sample_1d_channel(const Texture* tex, float u, int channel)
+{
+    // Convert to texel space if using normalized coordinates
+    float coord_u = tex->use_normalized_coords ? u : (u / (float)tex->width);
+
+    float tx = cpu_apply_address_mode_1d(coord_u, tex->width, tex->address_mode_u);
+
+    if (tex->filter_mode == WP_TEXTURE_FILTER_CLOSEST) {
+        // Nearest neighbor
+        int x = (int)floor(tx + 0.5f);
+
+        if (tex->address_mode_u != WP_TEXTURE_ADDRESS_BORDER) {
+            x = cpu_clamp_index(x, tex->width);
+        }
+
+        return cpu_fetch_texel_1d(tex, x, channel);
+    } else {
+        // Linear interpolation
+        int x0 = (int)floor(tx);
+        int x1 = x0 + 1;
+
+        float fx = tx - x0;
+
+        // Apply address mode to neighbor indices (properly handles wrap/mirror at edges)
+        x0 = cpu_apply_address_mode_index(x0, tex->width, tex->address_mode_u);
+        x1 = cpu_apply_address_mode_index(x1, tex->width, tex->address_mode_u);
+
+        float v0 = cpu_fetch_texel_1d(tex, x0, channel);
+        float v1 = cpu_fetch_texel_1d(tex, x1, channel);
+
+        // Linear interpolation
+        return v0 * (1.0f - fx) + v1 * fx;
+    }
+}
+
 // Sample a single channel with bilinear interpolation (2D)
-inline float cpu_sample_2d_channel(const cpu_texture2d_data* tex, float u, float v, int channel)
+inline float cpu_sample_2d_channel(const Texture* tex, float u, float v, int channel)
 {
     // Convert to texel space if using normalized coordinates
     float coord_u = tex->use_normalized_coords ? u : (u / (float)tex->width);
@@ -288,7 +541,7 @@ inline float cpu_sample_2d_channel(const cpu_texture2d_data* tex, float u, float
 }
 
 // Sample a single channel with trilinear interpolation (3D)
-inline float cpu_sample_3d_channel(const cpu_texture3d_data* tex, float u, float v, float w, int channel)
+inline float cpu_sample_3d_channel(const Texture* tex, float u, float v, float w, int channel)
 {
     // Convert to texel space if using normalized coordinates
     float coord_u = tex->use_normalized_coords ? u : (u / (float)tex->width);
@@ -364,10 +617,41 @@ inline float cpu_sample_3d_channel(const cpu_texture3d_data* tex, float u, float
 // Texture Sampling Functions
 // ============================================================================
 
+// TODO: Implement texture fetch functions for Clang CUDA JIT (currently stubbed, texture API is not supported)
+#if defined(__clang__) && defined(__CUDA__)
+template <typename T> __device__ T tex1D(unsigned long long texObj, float x)
+{
+    T v {};
+    return v;
+}
+template <typename T> __device__ T tex2D(unsigned long long texObj, float x, float y)
+{
+    T v {};
+    return v;
+}
+template <typename T> __device__ T tex3D(unsigned long long texObj, float x, float y, float z)
+{
+    T v {};
+    return v;
+}
+#endif
+
 // Helper to convert CUDA types to Warp types
 template <typename T> struct texture_sample_helper;
 
 template <> struct texture_sample_helper<float> {
+    static CUDA_CALLABLE float sample_1d(const texture1d_t& tex, float u)
+    {
+#if defined(__CUDA_ARCH__)
+        return tex1D<float>(tex.tex, u);
+#else
+        if (tex.tex == 0)
+            return 0.0f;
+        const Texture* cpu_tex = (const Texture*)tex.tex;
+        return cpu_sample_1d_channel(cpu_tex, u, 0);
+#endif
+    }
+
     static CUDA_CALLABLE float sample_2d(const texture2d_t& tex, float u, float v)
     {
 #if defined(__CUDA_ARCH__)
@@ -375,7 +659,7 @@ template <> struct texture_sample_helper<float> {
 #else
         if (tex.tex == 0)
             return 0.0f;
-        const cpu_texture2d_data* cpu_tex = (const cpu_texture2d_data*)tex.tex;
+        const Texture* cpu_tex = (const Texture*)tex.tex;
         return cpu_sample_2d_channel(cpu_tex, u, v, 0);
 #endif
     }
@@ -387,7 +671,7 @@ template <> struct texture_sample_helper<float> {
 #else
         if (tex.tex == 0)
             return 0.0f;
-        const cpu_texture3d_data* cpu_tex = (const cpu_texture3d_data*)tex.tex;
+        const Texture* cpu_tex = (const Texture*)tex.tex;
         return cpu_sample_3d_channel(cpu_tex, u, v, w, 0);
 #endif
     }
@@ -396,6 +680,19 @@ template <> struct texture_sample_helper<float> {
 };
 
 template <> struct texture_sample_helper<vec2f> {
+    static CUDA_CALLABLE vec2f sample_1d(const texture1d_t& tex, float u)
+    {
+#if defined(__CUDA_ARCH__)
+        float2 val = tex1D<float2>(tex.tex, u);
+        return vec2f(val.x, val.y);
+#else
+        if (tex.tex == 0)
+            return vec2f(0.0f, 0.0f);
+        const Texture* cpu_tex = (const Texture*)tex.tex;
+        return vec2f(cpu_sample_1d_channel(cpu_tex, u, 0), cpu_sample_1d_channel(cpu_tex, u, 1));
+#endif
+    }
+
     static CUDA_CALLABLE vec2f sample_2d(const texture2d_t& tex, float u, float v)
     {
 #if defined(__CUDA_ARCH__)
@@ -404,7 +701,7 @@ template <> struct texture_sample_helper<vec2f> {
 #else
         if (tex.tex == 0)
             return vec2f(0.0f, 0.0f);
-        const cpu_texture2d_data* cpu_tex = (const cpu_texture2d_data*)tex.tex;
+        const Texture* cpu_tex = (const Texture*)tex.tex;
         return vec2f(cpu_sample_2d_channel(cpu_tex, u, v, 0), cpu_sample_2d_channel(cpu_tex, u, v, 1));
 #endif
     }
@@ -417,7 +714,7 @@ template <> struct texture_sample_helper<vec2f> {
 #else
         if (tex.tex == 0)
             return vec2f(0.0f, 0.0f);
-        const cpu_texture3d_data* cpu_tex = (const cpu_texture3d_data*)tex.tex;
+        const Texture* cpu_tex = (const Texture*)tex.tex;
         return vec2f(cpu_sample_3d_channel(cpu_tex, u, v, w, 0), cpu_sample_3d_channel(cpu_tex, u, v, w, 1));
 #endif
     }
@@ -426,6 +723,22 @@ template <> struct texture_sample_helper<vec2f> {
 };
 
 template <> struct texture_sample_helper<vec4f> {
+    static CUDA_CALLABLE vec4f sample_1d(const texture1d_t& tex, float u)
+    {
+#if defined(__CUDA_ARCH__)
+        float4 val = tex1D<float4>(tex.tex, u);
+        return vec4f(val.x, val.y, val.z, val.w);
+#else
+        if (tex.tex == 0)
+            return vec4f(0.0f, 0.0f, 0.0f, 0.0f);
+        const Texture* cpu_tex = (const Texture*)tex.tex;
+        return vec4f(
+            cpu_sample_1d_channel(cpu_tex, u, 0), cpu_sample_1d_channel(cpu_tex, u, 1),
+            cpu_sample_1d_channel(cpu_tex, u, 2), cpu_sample_1d_channel(cpu_tex, u, 3)
+        );
+#endif
+    }
+
     static CUDA_CALLABLE vec4f sample_2d(const texture2d_t& tex, float u, float v)
     {
 #if defined(__CUDA_ARCH__)
@@ -434,7 +747,7 @@ template <> struct texture_sample_helper<vec4f> {
 #else
         if (tex.tex == 0)
             return vec4f(0.0f, 0.0f, 0.0f, 0.0f);
-        const cpu_texture2d_data* cpu_tex = (const cpu_texture2d_data*)tex.tex;
+        const Texture* cpu_tex = (const Texture*)tex.tex;
         return vec4f(
             cpu_sample_2d_channel(cpu_tex, u, v, 0), cpu_sample_2d_channel(cpu_tex, u, v, 1),
             cpu_sample_2d_channel(cpu_tex, u, v, 2), cpu_sample_2d_channel(cpu_tex, u, v, 3)
@@ -450,7 +763,7 @@ template <> struct texture_sample_helper<vec4f> {
 #else
         if (tex.tex == 0)
             return vec4f(0.0f, 0.0f, 0.0f, 0.0f);
-        const cpu_texture3d_data* cpu_tex = (const cpu_texture3d_data*)tex.tex;
+        const Texture* cpu_tex = (const Texture*)tex.tex;
         return vec4f(
             cpu_sample_3d_channel(cpu_tex, u, v, w, 0), cpu_sample_3d_channel(cpu_tex, u, v, w, 1),
             cpu_sample_3d_channel(cpu_tex, u, v, w, 2), cpu_sample_3d_channel(cpu_tex, u, v, w, 3)
@@ -460,6 +773,12 @@ template <> struct texture_sample_helper<vec4f> {
 
     static CUDA_CALLABLE vec4f zero() { return vec4f(0.0f, 0.0f, 0.0f, 0.0f); }
 };
+
+// 1D texture sampling with scalar coordinate
+template <typename T> CUDA_CALLABLE T texture_sample(const texture1d_t& tex, float u)
+{
+    return texture_sample_helper<T>::sample_1d(tex, u);
+}
 
 // 2D texture sampling with vec2 coordinates
 template <typename T> CUDA_CALLABLE T texture_sample(const texture2d_t& tex, const vec2f& uv)
@@ -486,6 +805,13 @@ template <typename T> CUDA_CALLABLE T texture_sample(const texture3d_t& tex, flo
 }
 
 // Adjoint stubs for texture sampling (non-differentiable for now)
+template <typename T>
+CUDA_CALLABLE void
+adj_texture_sample(const texture1d_t& tex, float u, texture1d_t& adj_tex, float& adj_u, const T& adj_ret)
+{
+    // Texture sampling is not differentiable in this implementation
+}
+
 template <typename T>
 CUDA_CALLABLE void
 adj_texture_sample(const texture2d_t& tex, const vec2f& uv, texture2d_t& adj_tex, vec2f& adj_uv, const T& adj_ret)
@@ -525,6 +851,7 @@ CUDA_CALLABLE void adj_texture_sample(
 }
 
 // Type aliases for code generation
+using Texture1D = texture1d_t;
 using Texture2D = texture2d_t;
 using Texture3D = texture3d_t;
 
@@ -532,6 +859,24 @@ using Texture3D = texture3d_t;
 // Adjoint Support for Texture Types (required when textures are array dtypes)
 // Textures are not differentiable, so these are essentially no-ops
 // ============================================================================
+
+// 1D Texture operations
+CUDA_CALLABLE inline texture1d_t add(const texture1d_t& a, const texture1d_t& b)
+{
+    // Textures are not addable; return first argument unchanged
+    return a;
+}
+
+CUDA_CALLABLE inline texture1d_t& operator+=(texture1d_t& a, const texture1d_t& b)
+{
+    // No-op: textures have no gradients to accumulate
+    return a;
+}
+
+CUDA_CALLABLE inline void adj_atomic_add(texture1d_t* p, const texture1d_t& t)
+{
+    // No-op: textures are not differentiable
+}
 
 // 2D Texture operations
 CUDA_CALLABLE inline texture2d_t add(const texture2d_t& a, const texture2d_t& b)

@@ -1,24 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import ctypes
 import errno
 import hashlib
 import json
 import os
-import platform
 import shutil
 import threading
 import time
@@ -41,6 +28,8 @@ def build_cuda(
     cu_path,
     arch,
     output_path,
+    *,
+    pch_dir,
     config="release",
     optimization_level=3,
     verify_fp=False,
@@ -50,6 +39,9 @@ def build_cuda(
     compile_time_trace=False,
     ltoirs=None,
     fatbins=None,
+    arch_suffix="",
+    llvm_cuda=False,
+    use_precompiled_headers=True,
 ) -> None:
     with open(cu_path, "rb") as src_file:
         src = src_file.read()
@@ -58,7 +50,7 @@ def build_cuda(
     inc_path = os.path.join(warp_home, "native").encode("utf-8")
     output_path = output_path.encode("utf-8")
 
-    if warp.config.llvm_cuda:
+    if llvm_cuda:
         warp._src.context.runtime.llvm.wp_compile_cuda(src, cu_path_bytes, inc_path, output_path, False)
 
     else:
@@ -75,11 +67,15 @@ def build_cuda(
             fatbins
         )
         arr_link_input_types = (ctypes.c_int * num_link)(*link_input_types)
-        kernel_cache_dir_bytes = warp.config.kernel_cache_dir.encode("utf-8")
+        # Per-thread directory shared across module compilations for PCH reuse,
+        # isolated between threads and processes to avoid .pch races.
+        pch_dir_bytes = pch_dir.encode("utf-8") if pch_dir else None
+        arch_suffix_bytes = arch_suffix.encode("utf-8")
         err = warp._src.context.runtime.core.wp_cuda_compile_program(
             src,
             program_name_bytes,
             arch,
+            arch_suffix_bytes,
             inc_path,
             0,
             None,
@@ -91,9 +87,9 @@ def build_cuda(
             fuse_fp,
             lineinfo,
             compile_time_trace,
-            warp.config.use_precompiled_headers,
+            use_precompiled_headers,
             output_path,
-            kernel_cache_dir_bytes,
+            pch_dir_bytes,
             num_link,
             arr_link,
             arr_link_sizes,
@@ -111,18 +107,31 @@ def load_cuda(input_path, device):
     return warp._src.context.runtime.core.wp_cuda_load_module(device.context, input_path.encode("utf-8"))
 
 
-def build_cpu(obj_path, cpp_path, mode="release", verify_fp=False, fast_math=False, fuse_fp=True):
+def build_cpu(
+    obj_path,
+    cpp_path,
+    mode="release",
+    verify_fp=False,
+    fast_math=False,
+    fuse_fp=True,
+    extra_flags="",
+    optimization_level=2,
+    verbose=False,
+    use_precompiled_headers=False,
+    pch_dir=None,
+    block_dim=256,
+    enable_tiles_in_stack_memory=True,
+):
     with open(cpp_path, "rb") as cpp:
         src = cpp.read()
     cpp_path = cpp_path.encode("utf-8")
     inc_path = os.path.join(warp_home, "native").encode("utf-8")
     obj_path = obj_path.encode("utf-8")
 
-    # Determine enable_tiles_in_stack_memory value
-    enable_tiles_in_stack = warp.config.enable_tiles_in_stack_memory
-    if enable_tiles_in_stack is None:
-        # Default to True on aarch64 (Linux ARM), False otherwise
-        enable_tiles_in_stack = platform.machine() == "aarch64"
+    flags_list = extra_flags.split()
+    flags_array = (ctypes.c_char_p * (len(flags_list) + 1))(*[f.encode("utf-8") for f in flags_list], None)
+
+    pch_dir_bytes = pch_dir.encode("utf-8") if pch_dir else None
 
     err = warp._src.context.runtime.llvm.wp_compile_cpp(
         src,
@@ -132,7 +141,13 @@ def build_cpu(obj_path, cpp_path, mode="release", verify_fp=False, fast_math=Fal
         mode == "debug",
         verify_fp,
         fuse_fp,
-        enable_tiles_in_stack,
+        enable_tiles_in_stack_memory,
+        flags_array,
+        optimization_level,
+        verbose,
+        use_precompiled_headers,
+        pch_dir_bytes,
+        block_dim,
     )
     if err != 0:
         raise Exception(f"CPU kernel build failed with error code {err}")
@@ -148,10 +163,13 @@ def init_kernel_cache(path=None):
     """
 
     if path is not None:
-        cache_root_dir = os.path.realpath(path)
+        base_dir = os.path.realpath(path)
+        cache_root_dir = os.path.join(base_dir, warp.config.version)
     elif "WARP_CACHE_PATH" in os.environ:
-        cache_root_dir = os.path.realpath(os.environ.get("WARP_CACHE_PATH"))
+        base_dir = os.path.realpath(os.environ.get("WARP_CACHE_PATH"))
+        cache_root_dir = os.path.join(base_dir, warp.config.version)
     else:
+        base_dir = None
         cache_root_dir = appdirs.user_cache_dir(appname="warp", appauthor="NVIDIA", version=warp.config.version)
 
         if os.name == "nt" and os.path.isabs(cache_root_dir) and not cache_root_dir.startswith("\\\\?\\"):
@@ -166,6 +184,23 @@ def init_kernel_cache(path=None):
     warp.config.kernel_cache_dir = cache_root_dir
 
     os.makedirs(warp.config.kernel_cache_dir, exist_ok=True)
+
+    # Warn about stale kernel artifacts in the unversioned base directory.
+    # Prior to Warp 1.13, custom cache paths were used without a version
+    # subdirectory, so old artifacts may linger in the parent directory.
+    if base_dir is not None and os.path.isdir(base_dir):
+        try:
+            with os.scandir(base_dir) as entries:
+                has_stale = any(entry.is_dir() and entry.name.startswith("wp_") for entry in entries)
+        except OSError:
+            has_stale = False
+        if has_stale:
+            from warp._src.utils import warn  # noqa: PLC0415
+
+            warn(
+                f"Kernel cache artifacts from a previous Warp version were found in '{base_dir}'. "
+                f"These will be ignored. You can safely delete them.",
+            )
 
 
 def clear_kernel_cache() -> None:
@@ -536,12 +571,9 @@ def build_lto_solver(
                 max_smem_is_estimate = True
                 for d in warp.get_cuda_devices():
                     if d.arch == arch:
-                        # We can directly query the max shared memory for this device
-                        queried_bytes = warp._src.context.runtime.core.wp_cuda_get_max_shared_memory(d.context)
-                        if queried_bytes > 0:
-                            max_smem_bytes = queried_bytes
-                            max_smem_is_estimate = False
-                            break
+                        max_smem_bytes = d.max_shared_memory_per_block
+                        max_smem_is_estimate = False
+                        break
                 if smem_estimate_bytes > max_smem_bytes:
                     source = "estimated limit" if max_smem_is_estimate else "device-reported limit"
                     hint = (

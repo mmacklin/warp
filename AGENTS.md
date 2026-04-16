@@ -1,239 +1,68 @@
-# AGENTS.md
+# Warp Development Guidelines
 
-Instructions for AI coding agents working on the Warp codebase.
+- Prefer `uv run` to run Python (`uv run script.py`, `uv run -m module_name`, `uv run python -c "..."`), or activate `.venv` first. Do not use the system Python directly.
+  - With extras: `uv run --extra dev -m warp.tests`
+  - With additional packages: `uv run --with rich script.py`
+- If `warp/bin/` is empty, build first with `build_lib.py` (or `--quick`).
+- Never use `python -c "..."` to run temporary scripts that define `@wp.kernel` functions—always write to a `.py` file because Warp's codegen calls `inspect.getsourcelines()`, which fails for code not in a file.
+- Always capitalize proper names in docstrings and error messages (NumPy, not numpy; Warp, not warp).
+- Create a feature branch before committing—never commit directly to `main`. Use `username/short-description`.
+- Always use imperative mood in commit messages ("Fix X", not "Fixed X"), ~50 char subject, reference issues as `(GH-XXX)`. Body explains *why*, not what.
+- Always use `git commit --signoff` (or `-s`) to add a `Signed-off-by` line (DCO).
+- After rebasing, diff `CHANGELOG.md` against the target branch to catch duplicate entries or other issues from clean but incorrect merges.
+- CI lives in both GitLab (`.gitlab-ci.yml`) and GitHub (`.github/workflows/`). Lightweight jobs (linting, docs, packaging) may exist in both—keep them in sync. GPU-dependent jobs differ by platform.
+- Pin GitHub Actions to commit hashes, not tags. Good: `uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86`. Bad: `uses: astral-sh/setup-uv@v4`.
+- Let uv infer Python version from `.python-version`. Use `uv python install` without arguments.
 
-## Project Overview
+Run `uvx pre-commit run --files <files>` to format changed files, or `-a` for all files. Rebuild native libraries only after changes to `warp/native/` C++/CUDA code:
 
-Warp is a Python framework for writing high-performance simulation and graphics code. It JIT compiles Python functions to efficient kernel code that runs on CPU or CUDA GPUs. The codebase includes Python (`warp/`), C++/CUDA native code (`warp/native/`), and documentation (`docs/`).
+- Standard build: `uv run build_lib.py` (~5 min)
+- Quick build: `uv run build_lib.py --quick` (~2-4 min)
+  - Only use if CUDA driver version ≥ Toolkit version
+  - Check: `nvidia-smi` (driver) vs Toolkit (set via WARP_CUDA_PATH, CUDA_HOME, CUDA_PATH, or `which nvcc`)
 
-**Architecture:** The native library (`build_lib.py`) statically embeds:
+Build docs (~1 min) with `uv run --extra docs build_docs.py 2>&1 | tee /tmp/build_docs.log` so you can inspect warnings without re-running.
 
-- **NVRTC** — CUDA runtime compiler for GPU kernels (Linux/Windows only)
-- **LLVM/Clang** — Compiler for CPU kernels (warp-clang library)
-- **libmathdx** — NVIDIA math library (cuBLASDx/cuFFTDx) for tile operations (Linux/Windows only)
+## PR Instructions
 
-**Kernel cache:** JIT compilation artifacts live in a cache directory (see `warp/_src/build.py:init_kernel_cache`). This includes generated `.cpp`/`.cu` files from `codegen.py` and compiled binaries (`.cubin`, `.ptx`, `.o`).
+- If opening a pull request on GitHub, use the template in `.github/PULL_REQUEST_TEMPLATE.md`.
+- If opening a merge request on GitLab, use the template in `.gitlab/merge_request_templates/Default.md`. If a GitHub issue exists for the change, end the MR title with a reference (e.g., `[GH-123]`).
+- If a change modifies user-facing behavior, append an entry to the end of the `Unreleased` section of CHANGELOG.md. Use imperative present tense ("Add X"), include issue refs `([GH-XXX](https://github.com/NVIDIA/warp/issues/XXX))`, and avoid internal implementation details.
+- For complex features, consider adding a design doc in `design/`. See `design/README.md` for guidelines.
 
-## Core Concepts
+## Tests
 
-**Kernels:** Computational kernels are Python functions decorated with `@wp.kernel`. They are JIT-compiled to C++/CUDA and executed in parallel across threads. Kernels must use typed arguments, cannot `return` values, and use only a subset of Python. Use `wp.tid()` to get the thread index.
+Always use `unittest`, not pytest.
 
-```python
-@wp.kernel
-def example(data: wp.array(dtype=wp.float32)):
-    i = wp.tid()  # Thread index
-    data[i] = wp.float32(i)
-```
+- Run all tests (~10-20 min): `uv run --extra dev -m warp.tests -s autodetect`
+- Run all tests in a specific file: `uv run warp/tests/test_modules_lite.py`
+- Prefer running multiple test classes in parallel over running test files one at a time in a loop: `uv run --extra dev -m warp.tests -s autodetect -k TestArray -k TestCodeGen -k TestFunc`
+- Always add new test modules to `default_suite` in `warp/tests/unittest_suites.py`.
+- Use standard `unittest.TestCase` methods when tests target a fixed device (e.g., CPU-only). Use `add_function_test()` only when tests need to run across multiple devices via `get_test_devices()`.
+- Avoid timing-based assertions (e.g., asserting speedup ratios)—they are flaky in parallel CI environments with variable CPU load.
+- Never call `wp.clear_kernel_cache()` or `wp.clear_lto_cache()` in test files—not in `__main__` blocks, test methods, or module scope. Cache clearing is not multi-process-safe; concurrent clears cause LLVM crashes. The test suite runner and `build_lib.py` already handle this.
+- Use `np.testing.assert_allclose()` instead of `np.allclose()` for detailed error messages on failure.
+- Explicit synchronization is rarely needed for correct behavior—most operations (e.g., `.numpy()`) implicitly synchronize. The exception is unit tests where a test function doesn't call an implicit sync before returning; add `wp.synchronize_device()` there due to the async nature of the CUDA API. Prefer `wp.synchronize_device()` over `wp.synchronize()` (the latter syncs all devices).
 
-**Launching kernels:** Use `wp.launch(kernel, dim=..., inputs=[...])` to execute a kernel. The `dim` specifies the number of parallel threads. Kernel results are written to arrays passed as arguments.
+## Docstrings
 
-**Arrays:** `wp.array` wraps GPU/CPU memory allocations. Create with `wp.zeros()`, `wp.ones()`, `wp.empty()`, or `wp.array(numpy_data)`. Arrays have a `dtype` (scalar or composite like `wp.vec3`) and `device` (`"cuda:0"` or `"cpu"`).
+Follow Google-style docstrings. Use doctest for code examples where practical.
 
-**User functions:** Use `@wp.func` for reusable code callable from kernels. Unlike kernels, functions can return values.
-
-**Structs:** Use `@wp.struct` for user-defined composite types that can be passed to kernels or used as array dtypes.
-
-**Automatic differentiation:** Warp supports reverse-mode autodiff. Create arrays with `requires_grad=True`, wrap kernel launches in `with wp.Tape() as tape:`, then call `tape.backward(loss)` to compute gradients via `array.grad`.
-
-**Interoperability:** Warp arrays interoperate with NumPy (`wp.array(numpy_arr)`, `warp_arr.numpy()`), PyTorch, and JAX.
-
-## Python Execution
-
-**Preferred:** Use `uv run` for all Python execution (matches CI/CD):
-
-```bash
-uv run script.py
-uv run -m module_name
-uv run -m warp.tests
-```
-
-**With extras or additional packages:**
-
-```bash
-# Install dev extras (linting, testing tools)
-uv run --extra dev -m warp.tests
-
-# Add a package not in pyproject.toml extras
-uv run --with rich script.py
-uv run --with pandas analyze.py
-```
-
-**Fallback:** If `uv` is not installed, activate a virtual environment first:
-
-```bash
-source .venv/bin/activate
-python script.py
-```
-
-**Never:** Run bare `python`/`python3` without environment isolation—this uses system Python with potentially wrong dependencies.
-
-## Testing
-
-Warp uses **unittest**, not pytest.
-
-**Run all tests** (~10-20 min):
-
-```bash
-uv run --extra dev -m warp.tests -s autodetect
-```
-
-**Run specific test file:**
-
-```bash
-uv run warp/tests/test_modules_lite.py
-```
-
-**Common options** (see `uv run -m warp.tests --help` or `warp/_src/thirdparty/unittest_parallel.py`):
-
-- `-s autodetect` — Auto-discover all test files
-- `-p "test_*.py"` — Match specific file pattern
-- `-k "cuda"` — Run tests matching substring
-- `--serial-fallback` — Single-process mode for debugging
-
-**Adding tests:** New test modules should be added to `default_suite` in `warp/tests/unittest_suites.py`.
-
-## Code Style
-
-### Formatting
-
-Code is formatted automatically via pre-commit hooks:
-
-- **Python**: Ruff (linting + formatting)
-- **C++/CUDA**: clang-format
-
-Run `uvx pre-commit run --all-files` to format (or `pre-commit run --all-files` if installed).
-
-### Type Hints
-
-- Put type hints in function signatures, not docstrings
-- Use `wp.DeviceLike` for flexible device input, `wp.Device` when only Device objects accepted
-
-### Docstrings
-
-Follow Google-style docstring conventions with these Warp-specific guidelines:
-
-- Document `__init__` parameters in the **class docstring**, not the `__init__` method
+- Document `__init__` parameters in the class docstring, not the `__init__` method
 - Don't repeat default values from signatures—Sphinx autodoc shows them automatically
-- Use double backticks for code elements in docstrings (RST syntax): ``` ``.nvdb`` ```, ``` ``"none"`` ```
+- Use double backticks for code elements and parameter cross-references (RST syntax): ``` ``data`` ```, ``` ``.nvdb`` ```—not italics (`*data*`)
+- Use attribute docstrings (`"""..."""` after members) for enum/class constant docs, not `#:` comments—Sphinx supports both but only attribute docstrings work in VSCode/Pylance
+- Use Sphinx roles for cross-references: `:class:`warp.array``, `:func:`warp.launch``, `:mod:`warp.render``, `:attr:`FILTER_LINEAR``
+- In `builtins.py`, use `Args:` and `Returns:` (Google style), not `:param:` and `:returns:` (RST style)
 
-### Cross-References
+## Codebase Internals
 
-Use Sphinx roles: `:class:`warp.array``, `:func:`warp.launch``, `:mod:`warp.render``
-
-## CHANGELOG.md
-
-When adding entries to CHANGELOG.md:
-
-**Entry format:**
-
-- Start with imperative verb: Add, Remove, Fix, Change, Deprecate, etc.
-- Use present tense
-- Include issue refs: `([GH-XXX](https://github.com/NVIDIA/warp/issues/XXX))`
-- Use backticks for code: `` `wp.function_name()` ``
-
-**Sections:**
-
-- **Added** — New features
-- **Removed** — Deleted functionality
-- **Deprecated** — Marked for future removal
-- **Changed** — Modified behavior
-- **Fixed** — Bug fixes
-- **Documentation** — Doc improvements
-
-**Avoid:**
-
-- Starting with "The" or "This"
-- Past tense ("added", "fixed")
-- Vague descriptions without context
-- Referencing internal implementation details users wouldn't understand
-
-## Commit Messages
-
-**Subject line:**
-
-- Start with imperative verb: Fix, Add, Remove, Refactor, Update, etc.
-- Limit to ~50 characters (72 max)
-- Capitalize first word
-- No trailing period
-- Include issue reference when applicable: `(GH-XXX)`
-
-**Test:** A good subject completes the sentence: "If applied, this commit will ___"
-
-**Body (for non-trivial changes):**
-
-- Blank line after subject
-- Wrap at 72 characters
-- Explain *why*, not just what changed (the code explains *how*)
-- Use `-` bullet points for multiple items
-
-## Building
-
-Rebuild native libraries (only needed after changes to `warp/native/` C++/CUDA code):
-
-```bash
-uv run build_lib.py
-```
-
-See [docs/user_guide/installation.rst](docs/user_guide/installation.rst) for build requirements (CUDA Toolkit, compilers) and Docker builds.
-
-**Build documentation:**
-
-```bash
-uv run --extra docs build_docs.py           # Build HTML docs
-uv run --extra docs build_docs.py --doctest # Run doctest validation
-```
-
-Use `build_docs.py` instead of `make` or `sphinx-build` directly—it runs `docs/generate_reference.py` as a prerequisite. New documentation with code blocks should use doctest where practical (note: output from `wp.print()`/`wp.printf()` is not captured by doctest).
-
-## Project Structure
-
-```
-.                   # Repository root
-├── warp/           # Python package
-│   ├── _src/       # Internal implementation (private)
-│   ├── native/     # C++/CUDA source
-│   ├── tests/      # Test files (test_*.py)
-│   └── examples/   # Example scripts
-├── asv/            # ASV benchmarks
-├── docs/           # Sphinx documentation
-├── CHANGELOG.md    # Release notes
-└── pyproject.toml  # Package configuration
-```
-
-**Public API:** Internal implementation lives in `warp/_src/` and is re-exported through `warp/__init__.py`. Public-facing code (examples, documentation) should import from `warp`, not `warp._src`. Internal code in `warp/_src/` should import directly from other `warp/_src/` modules:
-
-```python
-# Public-facing code (examples, docs)
-import warp as wp
-
-# Internal code (warp/_src/*.py)
-from warp._src.types import float32
-```
-
-**Native bindings:** Warp uses ctypes to interface with the native library. Function signatures are registered in the `Runtime` class's `__init__` method in `warp/_src/context.py`.
-
-**Built-Ins:** `warp/_src/builtins.py` defines functions callable from Warp kernels (and sometimes Python). Key attributes:
-
-- `export=True` — Exposed in `warp` namespace (registered via `add_builtin()`)
-- `hidden=True` — Not documented
-- `is_differentiable=False` — No adjoint defined
-
-Built-ins are registered at runtime on `import warp`. For type checkers/IDE autocomplete, `warp/__init__.pyi` provides stubs (generated by `build_docs.py`).
-
-**CI/CD:** The project is hosted on both GitLab and GitHub with separate pipelines:
-
-- **GitLab**: `.gitlab-ci.yml` and `.gitlab/ci/`
-- **GitHub**: `.github/workflows/`
-
-## GitHub Issues and Pull Requests
-
-**Issues:** Should generally follow one of the templates in `.github/ISSUE_TEMPLATE/` (bug report, feature request, question, documentation), but additional sections can be added.
-
-**Pull requests:** Follow `.github/PULL_REQUEST_TEMPLATE.md` structure, but additional sections can be added to provide more context.
-
-## Additional Resources
-
-- [Contribution Guide](docs/user_guide/contribution_guide.rst)
-- [CONTRIBUTING.md](CONTRIBUTING.md) — DCO sign-off requirements for external contributors
-- [docs/user_guide/compatibility.rst](docs/user_guide/compatibility.rst) — Support policy and support matrix
-- [README.md](README.md) — Installation, examples, and build requirements
+- The native library (`build_lib.py`) statically embeds: NVRTC (CUDA runtime compiler, Linux/Windows only), LLVM/Clang (CPU kernel compiler), and libmathdx (cuBLASDx/cuFFTDx for tile operations, Linux/Windows only).
+- JIT compilation artifacts (`.cpp`/`.cu` from `codegen.py`, `.cubin`/`.ptx`/`.o`) live in a kernel cache directory (see `warp/_src/build.py:init_kernel_cache`).
+- Refer to `warp/examples/` for reference patterns for kernels, launches, and array usage.
+- Always import from `warp` in public-facing code, not `warp._src`. In internal code, import directly from `warp/_src/` modules. Public API is re-exported through `warp/__init__.py`.
+- `warp._src.utils` imports `warp._src.context` at module level—importing from `utils` in early-loaded modules (e.g., `texture.py`) causes circular imports. Use lazy imports (`from warp._src.utils import ... # noqa: PLC0415` inside functions) when needed.
+- Use `warp._src.utils.warn()` instead of `warnings.warn()`—it routes warnings to stdout (some applications don't want Warp writing to stderr).
+- Use `DeviceLike` type annotation (from `warp._src.context`) for `device` parameters. Import under `TYPE_CHECKING` to avoid circular imports.
+- Native bindings use ctypes; function signatures are registered in `Runtime.__init__` in `warp/_src/context.py`.
+- If you modify `warp/_src/builtins.py`, run `build_docs.py` to regenerate `warp/__init__.pyi`.

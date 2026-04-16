@@ -1,19 +1,5 @@
-/*
- * SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: Apache-2.0
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 #pragma once
 
@@ -77,8 +63,9 @@
 __device__ inline void __debugbreak() { __brkpt(); }
 #endif
 
-#if defined(__clang__) && defined(__CUDA__)
-// clang compiling CUDA code, host and device (NOTE: Used when building core library with Clang)
+#if defined(__clang__) && defined(__CUDA__) && !defined(WP_NO_CRT)
+// clang compiling CUDA code, host and device (NOTE: Used when building core library with Clang).
+// Excluded for JIT-compiled kernels (WP_NO_CRT) where cuda_crt.h provides __half.
 #include <cuda_fp16.h>
 #endif
 
@@ -181,6 +168,58 @@ struct half {
 static_assert(sizeof(half) == 2, "Size of half / float16 type must be 2-bytes");
 
 typedef half float16;
+
+// Approximate division/reciprocal intrinsics
+#if defined(__CUDA_ARCH__)
+
+inline __device__ float approx_rcp(float a)
+{
+    float r;
+    asm("rcp.approx.f32 %0, %1;" : "=f"(r) : "f"(a));
+    return r;
+}
+
+inline __device__ double approx_rcp(double a)
+{
+    double r;
+    asm("rcp.approx.ftz.f64 %0, %1;" : "=d"(r) : "d"(a));
+    return r;
+}
+
+inline __device__ float16 approx_rcp(float16 a)
+{
+    return float16(approx_rcp(float(a)));  // No approx PTX for f16; use fp32 approx rcp
+}
+
+inline __device__ float approx_div(float a, float b)
+{
+    float r;
+    asm("div.approx.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+    return r;
+}
+
+inline __device__ double approx_div(double a, double b)
+{
+    // No div.approx.f64 in PTX; use rcp then multiply
+    return a * approx_rcp(b);
+}
+
+inline __device__ float16 approx_div(float16 a, float16 b)
+{
+    return float16(approx_div(float(a), float(b)));  // No approx PTX for f16; use fp32 approx div
+}
+
+#else
+
+// CPU fallbacks: exact division
+inline CUDA_CALLABLE float approx_rcp(float a) { return 1.0f / a; }
+inline CUDA_CALLABLE double approx_rcp(double a) { return 1.0 / a; }
+inline CUDA_CALLABLE float16 approx_rcp(float16 a) { return float16(1.0f / float(a)); }
+inline CUDA_CALLABLE float approx_div(float a, float b) { return a / b; }
+inline CUDA_CALLABLE double approx_div(double a, double b) { return a / b; }
+inline CUDA_CALLABLE float16 approx_div(float16 a, float16 b) { return float16(float(a) / float(b)); }
+
+#endif
 
 #if defined(__CUDA_ARCH__)
 
@@ -307,9 +346,6 @@ inline CUDA_CALLABLE T bit_xor(T a, T b) { return a^b; } \
 inline CUDA_CALLABLE T lshift(T a, T b) { return a<<b; } \
 inline CUDA_CALLABLE T rshift(T a, T b) { return a>>b; } \
 inline CUDA_CALLABLE T invert(T x) { return ~x; } \
-inline CUDA_CALLABLE bool isfinite(T x) { return ::isfinite(double(x)); } \
-inline CUDA_CALLABLE bool isnan(T x) { return ::isnan(double(x)); } \
-inline CUDA_CALLABLE bool isinf(T x) { return ::isinf(double(x)); } \
 inline CUDA_CALLABLE void adj_mul(T a, T b, T& adj_a, T& adj_b, T adj_ret) { } \
 inline CUDA_CALLABLE void adj_div(T a, T b, T ret, T& adj_a, T& adj_b, T adj_ret) { } \
 inline CUDA_CALLABLE void adj_add(T a, T b, T& adj_a, T& adj_b, T adj_ret) { } \
@@ -329,10 +365,7 @@ inline CUDA_CALLABLE void adj_bit_or(T a, T b, T& adj_a, T& adj_b, T adj_ret) { 
 inline CUDA_CALLABLE void adj_bit_xor(T a, T b, T& adj_a, T& adj_b, T adj_ret) { } \
 inline CUDA_CALLABLE void adj_lshift(T a, T b, T& adj_a, T& adj_b, T adj_ret) { } \
 inline CUDA_CALLABLE void adj_rshift(T a, T b, T& adj_a, T& adj_b, T adj_ret) { } \
-inline CUDA_CALLABLE void adj_invert(T x, T adj_x, T& adj_ret) { } \
-inline CUDA_CALLABLE void adj_isnan(const T&, T&, bool) { } \
-inline CUDA_CALLABLE void adj_isinf(const T&, T&, bool) { } \
-inline CUDA_CALLABLE void adj_isfinite(const T&, T&, bool) { }
+inline CUDA_CALLABLE void adj_invert(T x, T adj_x, T& adj_ret) { }
 
 inline CUDA_CALLABLE int8 abs(int8 x) { return ::abs(x); }
 inline CUDA_CALLABLE int16 abs(int16 x) { return ::abs(x); }
@@ -474,6 +507,20 @@ inline CUDA_CALLABLE void adj_isfinite(const T&, T&, bool) { }
 DECLARE_FLOAT_OPS(float16)
 DECLARE_FLOAT_OPS(float32)
 DECLARE_FLOAT_OPS(float64)
+
+// Adjoint for approximate scalar division
+#define DECLARE_ADJ_APPROX_DIV(T) \
+inline CUDA_CALLABLE void adj_approx_div(T a, T b, T ret, T& adj_a, T& adj_b, T adj_ret) \
+{ \
+    adj_a += approx_div(adj_ret, b); \
+    adj_b -= approx_div(T(adj_ret * ret), b); \
+}
+
+DECLARE_ADJ_APPROX_DIV(float16)
+DECLARE_ADJ_APPROX_DIV(float32)
+DECLARE_ADJ_APPROX_DIV(float64)
+
+#undef DECLARE_ADJ_APPROX_DIV
 
 
 // basic ops for float types
@@ -1263,12 +1310,10 @@ template <typename T> CUDA_CALLABLE inline void adj_neg(const T& x, T& adj_x, co
 template <typename T> CUDA_CALLABLE inline bool unot(const T& b) { return !b; }
 template <typename T> CUDA_CALLABLE inline void adj_unot(const T& b, T& adj_b, const bool& adj_ret) { }
 
-const int LAUNCH_MAX_DIMS = 4;  // should match types.py
-
-struct launch_bounds_t {
-    int shape[LAUNCH_MAX_DIMS];  // size of each dimension
-    int ndim;  // number of valid dimension
-    size_t size;  // total number of threads
+template <int N> struct launch_bounds_t {
+    int shape[N];
+    size_t size;
+    bool tiled;  // when true, launch_coord divides out block_dim() before unraveling
 };
 
 // represents coordinate in the launch grid
@@ -1279,33 +1324,6 @@ struct launch_coord_t {
     int l;
 };
 
-// unravels a linear thread index to the corresponding launch grid coord (up to 4d)
-inline CUDA_CALLABLE launch_coord_t launch_coord(size_t linear, const launch_bounds_t& bounds)
-{
-    launch_coord_t coord = { 0, 0, 0, 0 };
-
-    if (bounds.ndim > 3) {
-        coord.l = linear % bounds.shape[3];
-        linear /= bounds.shape[3];
-    }
-
-    if (bounds.ndim > 2) {
-        coord.k = linear % bounds.shape[2];
-        linear /= bounds.shape[2];
-    }
-
-    if (bounds.ndim > 1) {
-        coord.j = linear % bounds.shape[1];
-        linear /= bounds.shape[1];
-    }
-
-    if (bounds.ndim > 0) {
-        coord.i = linear;
-    }
-
-    return coord;
-}
-
 inline CUDA_CALLABLE int block_dim()
 {
 #if defined(__CUDA_ARCH__)
@@ -1315,7 +1333,38 @@ inline CUDA_CALLABLE int block_dim()
 #endif
 }
 
-inline CUDA_CALLABLE int tid(size_t index, const launch_bounds_t& bounds)
+// unravels a linear thread index to the corresponding launch grid coord (up to 4d)
+template <int N> inline CUDA_CALLABLE launch_coord_t launch_coord(size_t linear, const launch_bounds_t<N>& bounds)
+{
+    launch_coord_t coord = { 0, 0, 0, 0 };
+
+    // For tiled kernels, strip the intra-tile thread index before unraveling
+    if (bounds.tiled)
+        linear /= block_dim();
+
+    if constexpr (N > 3) {
+        coord.l = linear % bounds.shape[3];
+        linear /= bounds.shape[3];
+    }
+
+    if constexpr (N > 2) {
+        coord.k = linear % bounds.shape[2];
+        linear /= bounds.shape[2];
+    }
+
+    if constexpr (N > 1) {
+        coord.j = linear % bounds.shape[1];
+        linear /= bounds.shape[1];
+    }
+
+    if constexpr (N > 0) {
+        coord.i = linear;
+    }
+
+    return coord;
+}
+
+template <int N> inline CUDA_CALLABLE int tid(size_t index, const launch_bounds_t<N>& bounds)
 {
     // For the 1-D tid() we need to warn the user if we're about to provide a truncated index
     // Only do this in _DEBUG when called from device to avoid excessive register allocation
@@ -1325,32 +1374,34 @@ inline CUDA_CALLABLE int tid(size_t index, const launch_bounds_t& bounds)
     }
 #endif
 
-    launch_coord_t c = launch_coord(index, bounds);
-    return static_cast<int>(c.i);
+    launch_coord_t coord = launch_coord(index, bounds);
+    return static_cast<int>(coord.i);
 }
 
-inline CUDA_CALLABLE_DEVICE void tid(int& i, int& j, size_t index, const launch_bounds_t& bounds)
+template <int N> inline CUDA_CALLABLE_DEVICE void tid(int& i, int& j, size_t index, const launch_bounds_t<N>& bounds)
 {
-    launch_coord_t c = launch_coord(index, bounds);
-    i = c.i;
-    j = c.j;
+    launch_coord_t coord = launch_coord(index, bounds);
+    i = coord.i;
+    j = coord.j;
 }
 
-inline CUDA_CALLABLE_DEVICE void tid(int& i, int& j, int& k, size_t index, const launch_bounds_t& bounds)
+template <int N>
+inline CUDA_CALLABLE_DEVICE void tid(int& i, int& j, int& k, size_t index, const launch_bounds_t<N>& bounds)
 {
-    launch_coord_t c = launch_coord(index, bounds);
-    i = c.i;
-    j = c.j;
-    k = c.k;
+    launch_coord_t coord = launch_coord(index, bounds);
+    i = coord.i;
+    j = coord.j;
+    k = coord.k;
 }
 
-inline CUDA_CALLABLE_DEVICE void tid(int& i, int& j, int& k, int& l, size_t index, const launch_bounds_t& bounds)
+template <int N>
+inline CUDA_CALLABLE_DEVICE void tid(int& i, int& j, int& k, int& l, size_t index, const launch_bounds_t<N>& bounds)
 {
-    launch_coord_t c = launch_coord(index, bounds);
-    i = c.i;
-    j = c.j;
-    k = c.k;
-    l = c.l;
+    launch_coord_t coord = launch_coord(index, bounds);
+    i = coord.i;
+    j = coord.j;
+    k = coord.k;
+    l = coord.l;
 }
 
 // should match types.py
@@ -1825,7 +1876,13 @@ template <typename T> CUDA_CALLABLE inline void adj_atomic_xor(T* buf, T* adj_bu
 // bool and printf are defined outside of the wp namespace in crt.h, hence
 // their adjoint counterparts are also defined in the global namespace.
 template <typename T> CUDA_CALLABLE inline void adj_bool(T, T&, bool) { }
+// Variadic functions are not supported in CUDA device code when compiled with Clang.
+// Since adj_printf is a no-op, we use a template overload to accept and ignore any arguments.
+#if defined(__clang__) && defined(__CUDA__)
+template <typename... Args> inline CUDA_CALLABLE void adj_printf(const char* fmt, Args...) { }
+#else
 inline CUDA_CALLABLE void adj_printf(const char* fmt, ...) { }
+#endif
 
 // clang-format off
 // These includes must remain in this order due to dependencies

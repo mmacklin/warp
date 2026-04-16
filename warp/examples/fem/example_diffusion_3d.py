@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 ###########################################################################
 # Example Diffusion 3D
@@ -193,7 +181,7 @@ if __name__ == "__main__":
     parser.add_argument("--serendipity", action="store_true", default=False, help="Use Serendipity basis functions.")
     parser.add_argument("--viscosity", type=float, default=2.0, help="Fluid viscosity parameter.")
     parser.add_argument(
-        "--boundary_compliance", type=float, default=0.0, help="Dirichlet boundary condition compliance."
+        "--boundary-compliance", type=float, default=0.0, help="Dirichlet boundary condition compliance."
     )
     parser.add_argument(
         "--mesh", choices=("grid", "tet", "hex", "nano", "anano", "tri", "quad"), default="grid", help="Mesh type."

@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 """The ``warp`` package provides array types and functions for creating and manipulating
 multi-dimensional data on CPU and CUDA devices. It includes kernel and function decorators
@@ -187,18 +175,27 @@ from warp._src.types import Bvh as Bvh
 from warp._src.types import Mesh as Mesh
 from warp._src.types import HashGrid as HashGrid
 from warp._src.types import Volume as Volume
-from warp._src.types import Texture as Texture
-from warp._src.types import Texture2D as Texture2D
-from warp._src.types import Texture3D as Texture3D
-from warp._src.texture import TextureFilterMode as TextureFilterMode
-from warp._src.texture import TextureAddressMode as TextureAddressMode
 from warp._src.types import BvhQuery as BvhQuery
 from warp._src.types import BvhQueryTiled as BvhQueryTiled
 from warp._src.types import HashGridQuery as HashGridQuery
+from warp._src.types import HashGridQueryD as HashGridQueryD
+from warp._src.types import HashGridQueryH as HashGridQueryH
 from warp._src.types import MeshQueryAABB as MeshQueryAABB
 from warp._src.types import MeshQueryAABBTiled as MeshQueryAABBTiled
 from warp._src.types import MeshQueryPoint as MeshQueryPoint
 from warp._src.types import MeshQueryRay as MeshQueryRay
+
+
+# category: Textures
+
+from warp._src.texture import Texture as Texture
+from warp._src.texture import Texture1D as Texture1D
+from warp._src.texture import Texture2D as Texture2D
+from warp._src.texture import Texture3D as Texture3D
+from warp._src.texture import TextureResourceFlags as TextureResourceFlags
+from warp._src.texture import GLTextureResource as GLTextureResource
+from warp._src.texture import TextureFilterMode as TextureFilterMode
+from warp._src.texture import TextureAddressMode as TextureAddressMode
 
 
 # category: Runtime
@@ -206,10 +203,13 @@ from warp._src.types import MeshQueryRay as MeshQueryRay
 from warp._src.context import init as init
 
 from warp._src.context import is_cpu_available as is_cpu_available
+from warp._src.context import is_cubql_available as is_cubql_available
 from warp._src.context import is_cuda_available as is_cuda_available
 
 from warp._src.build import clear_kernel_cache as clear_kernel_cache
 from warp._src.build import clear_lto_cache as clear_lto_cache
+
+from warp._src.context import print_diagnostics as print_diagnostics
 
 
 # category: Kernel Programming
@@ -243,6 +243,7 @@ from warp._src.context import Module as Module
 
 from warp._src.context import launch as launch
 from warp._src.context import launch_tiled as launch_tiled
+from warp._src.context import get_suggested_block_size as get_suggested_block_size
 from warp._src.context import synchronize as synchronize
 
 
@@ -264,6 +265,8 @@ from warp._src.context import get_cuda_devices as get_cuda_devices
 from warp._src.context import get_cuda_device_count as get_cuda_device_count
 from warp._src.context import get_cuda_device as get_cuda_device
 from warp._src.context import get_cuda_supported_archs as get_cuda_supported_archs
+from warp._src.context import get_cuda_toolkit_version as get_cuda_toolkit_version
+from warp._src.context import get_cuda_driver_version as get_cuda_driver_version
 
 from warp._src.context import map_cuda_device as map_cuda_device
 from warp._src.context import unmap_cuda_device as unmap_cuda_device
@@ -474,6 +477,27 @@ def __getattr__(name):
     elif name == "vec":
         return get_deprecated_api(_types, "warp", "vector", old_attr_path="warp.vec")
 
+    # Lazy-import deprecated submodule namespaces (e.g., warp.torch -> warp._src.torch).
+    #
+    # A plain `return importlib.import_module(f".{name}", __package__)` isn't safe
+    # here because these deprecated wrapper modules call `warn_deprecated_namespace()`
+    # at module load time. That warning can be triggered by external introspection
+    # tools -- most notably CPython's pickle, whose `whichmodule()` iterates through
+    # every module in `sys.modules` calling `getattr(module, name)` to locate globals.
+    # When pickle probes `getattr(warp, "torch")`, this `__getattr__` fires, the
+    # submodule is imported, and its module-level deprecation warning is emitted.
+    # Depending on the warning configuration this can crash the caller (e.g.,
+    # PyTorch's inductor FX graph cache pickler, whose C implementation only catches
+    # `AttributeError` from `getattr` -- any other exception propagates and aborts
+    # compilation).
+    #
+    # To avoid this, we suppress `warn_deprecated_namespace()` when *we* are the ones
+    # triggering the import (via the `_importing_deprecated_namespace` flag). Explicit
+    # `import warp.torch` by user code bypasses `__getattr__` entirely, so the
+    # module-level warning still fires in that case. Per-symbol deprecation warnings
+    # (handled by each submodule's own `__getattr__` + `get_deprecated_api`) are
+    # unaffected.
+
     if name in (
         "build_dll",
         "build",
@@ -493,7 +517,18 @@ def __getattr__(name):
         "utils",
     ):
         import importlib  # noqa: PLC0415
+        import sys  # noqa: PLC0415
 
-        return importlib.import_module(f".{name}", __package__)
+        full_name = f"{__package__}.{name}"
+        if full_name in sys.modules:
+            return sys.modules[full_name]
+
+        from warp._src import utils as _warp_utils  # noqa: PLC0415
+
+        _warp_utils._importing_deprecated_namespace = True
+        try:
+            return importlib.import_module(f".{name}", __package__)
+        finally:
+            _warp_utils._importing_deprecated_namespace = False
 
     raise AttributeError(f"module 'warp' has no attribute '{name}'")

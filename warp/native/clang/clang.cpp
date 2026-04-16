@@ -1,19 +1,5 @@
-/*
- * SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: Apache-2.0
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 #include "../native/crt.h"
 #include "../version.h"
@@ -36,12 +22,16 @@
 
 #include <clang/Basic/TargetInfo.h>
 #include <clang/CodeGen/CodeGenAction.h>
+#include <clang/Frontend/FrontendActions.h>
 #include <clang/Lex/PreprocessorOptions.h>
 #include <llvm/ExecutionEngine/GenericValue.h>
 #include <llvm/ExecutionEngine/JITEventListener.h>
 #include <llvm/ExecutionEngine/JITLink/JITLinkMemoryManager.h>
+#include <llvm/ExecutionEngine/Orc/DebugObjectManagerPlugin.h>
+#include <llvm/ExecutionEngine/Orc/EPCDebugObjectRegistrar.h>
 #include <llvm/ExecutionEngine/Orc/ExecutionUtils.h>
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
+#include <llvm/ExecutionEngine/Orc/ObjectLinkingLayer.h>
 #include <llvm/ExecutionEngine/Orc/RTDyldObjectLinkingLayer.h>
 #include <llvm/ExecutionEngine/Orc/TargetProcess/TargetExecutionUtils.h>
 #include <llvm/ExecutionEngine/SectionMemoryManager.h>
@@ -55,6 +45,11 @@
 #include <llvm/PassRegistry.h>
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Target/TargetMachine.h>
+#if LLVM_VERSION_MAJOR >= 16
+#include <llvm/TargetParser/Host.h>
+#else
+#include <llvm/Support/Host.h>
+#endif
 
 #if defined(_WIN64)
 extern "C" void __chkstk();
@@ -89,6 +84,11 @@ static const char* target_triple = "x86_64-pc-windows-elf";
 static const char* target_triple = LLVM_DEFAULT_TARGET_TRIPLE;
 #endif
 
+// Minimum CUDA compute capability that supports all of Warp's features.
+// Since we always emit PTX (forward-compatible), targeting the minimum
+// ensures the output runs on all supported GPUs.
+static const char* cuda_target_arch = "sm_75";
+
 static void initialize_llvm()
 {
     llvm::InitializeAllTargetInfos();
@@ -97,17 +97,47 @@ static void initialize_llvm()
     llvm::InitializeAllAsmPrinters();
 }
 
-static std::unique_ptr<llvm::Module> source_to_llvm(
-    bool is_cuda,
+struct HostCpuInfo {
+    std::string name;  // e.g. "znver5", "apple-m2", or "generic"
+    std::string features;  // comma-separated, for TargetMachine: "+avx2,+fma,..."
+    std::vector<std::string> feature_list;  // individual flags, for -target-feature args
+};
+
+// Thread-safe: C++11 guarantees local static initialization is synchronized.
+static const HostCpuInfo& get_host_cpu_info()
+{
+    static HostCpuInfo info = []() {
+        HostCpuInfo result;
+        result.name = llvm::sys::getHostCPUName().str();
+
+        llvm::StringMap<bool> feature_map;
+        llvm::sys::getHostCPUFeatures(feature_map);
+
+        for (const auto& f : feature_map) {
+            std::string flag = (f.second ? "+" : "-") + f.first().str();
+            result.feature_list.push_back(flag);
+            if (!result.features.empty())
+                result.features += ",";
+            result.features += flag;
+        }
+
+        return result;
+    }();
+    return info;
+}
+
+static std::unique_ptr<clang::CompilerInstance> create_compiler(
     const std::string& input_file,
-    const char* cpp_src,
     const char* include_dir,
+    bool is_cuda,
     bool debug,
     bool verify_fp,
-    llvm::LLVMContext& context,
-    bool tiles_in_stack_memory
+    bool tiles_in_stack_memory,
+    const char** extra_flags = nullptr,  // null-terminated array of flag strings, or nullptr for none
+    int optimization_level = 3
 )
 {
+    auto compiler_instance = std::make_unique<clang::CompilerInstance>();
     // Compilation arguments
     std::vector<const char*> args;
     args.push_back(input_file.c_str());
@@ -115,21 +145,63 @@ static std::unique_ptr<llvm::Module> source_to_llvm(
     args.push_back("-I");
     args.push_back(include_dir);
 
-    args.push_back(debug ? "-O0" : "-O2");
+    args.push_back("-std=c++17");
+
+    if (debug) {
+        args.push_back("-O0");
+    } else {
+        switch (optimization_level) {
+        case 0:
+            args.push_back("-O0");
+            break;
+        case 1:
+            args.push_back("-O1");
+            break;
+        case 2:
+            args.push_back("-O2");
+            break;
+        default:
+            args.push_back("-O3");
+            break;
+        }
+    }
 
     if (is_cuda) {
         args.push_back("-triple");
         args.push_back("nvptx64-nvidia-cuda");
 
         args.push_back("-target-cpu");
-        args.push_back("sm_70");
+        args.push_back(cuda_target_arch);
     } else {
         args.push_back("-triple");
         args.push_back(target_triple);
 
+        // Append extra flags to args. Our "driver" expands -march=native inline
+        // into -target-cpu and -target-feature flags, preserving flag order.
+        // Other flags are passed through to the Clang frontend as-is.
+        if (extra_flags) {
+            for (const char** flag = extra_flags; *flag; ++flag) {
+                if (strcmp(*flag, "-march=native") == 0) {
+                    const auto& cpu = get_host_cpu_info();
+                    if (cpu.name != "generic") {
+                        args.push_back("-target-cpu");
+                        args.push_back(cpu.name.c_str());
+                    }
+                    for (const auto& feat : cpu.feature_list) {
+                        args.push_back("-target-feature");
+                        args.push_back(feat.c_str());
+                    }
+                } else {
+                    args.push_back(*flag);
+                }
+            }
+        }
+
 #if defined(__x86_64__) || defined(_M_X64)
+        // F16C is required for _Float16 conversions in builtin.h. Duplicate
+        // flags are harmless (last-wins semantics), so add unconditionally.
         args.push_back("-target-feature");
-        args.push_back("+f16c");  // Enables support for _Float16
+        args.push_back("+f16c");
 #endif
 
 #if defined(__aarch64__)
@@ -161,9 +233,7 @@ static std::unique_ptr<llvm::Module> source_to_llvm(
     );
 #endif
 
-    clang::CompilerInstance compiler_instance;
-
-    auto& compiler_invocation = compiler_instance.getInvocation();
+    auto& compiler_invocation = compiler_instance->getInvocation();
     clang::CompilerInvocation::CreateFromArgs(compiler_invocation, args, *diagnostic_engine);
 
     if (debug) {
@@ -174,12 +244,8 @@ static std::unique_ptr<llvm::Module> source_to_llvm(
 #endif
     }
 
-    // Map code to a MemoryBuffer
-    std::unique_ptr<llvm::MemoryBuffer> buffer = llvm::MemoryBuffer::getMemBufferCopy(cpp_src);
-    compiler_invocation.getPreprocessorOpts().addRemappedFile(input_file.c_str(), buffer.get());
-
     if (!debug) {
-        compiler_instance.getPreprocessorOpts().addMacroDef("NDEBUG");
+        compiler_instance->getPreprocessorOpts().addMacroDef("NDEBUG");
     }
 
     if (is_cuda) {
@@ -187,33 +253,127 @@ static std::unique_ptr<llvm::Module> source_to_llvm(
         // CUDA compilation." But this normally happens in the __clang_cuda_runtime_wrapper.h header, which we don't
         // include. The __CUDA__ and __CUDA_ARCH__ macros are internally defined by
         // llvm-project/clang/lib/Frontend/InitPreprocessor.cpp
-        compiler_instance.getPreprocessorOpts().addMacroDef("__CUDACC__");
+        compiler_instance->getPreprocessorOpts().addMacroDef("__CUDACC__");
 
-        compiler_instance.getLangOpts().CUDA = 1;
-        compiler_instance.getLangOpts().CUDAIsDevice = 1;
+        compiler_instance->getLangOpts().CUDA = 1;
+        compiler_instance->getLangOpts().CUDAIsDevice = 1;
     } else {
         if (verify_fp) {
-            compiler_instance.getPreprocessorOpts().addMacroDef("WP_VERIFY_FP");
+            compiler_instance->getPreprocessorOpts().addMacroDef("WP_VERIFY_FP");
         }
 
         if (tiles_in_stack_memory) {
-            compiler_instance.getPreprocessorOpts().addMacroDef("WP_ENABLE_TILES_IN_STACK_MEMORY");
+            compiler_instance->getPreprocessorOpts().addMacroDef("WP_ENABLE_TILES_IN_STACK_MEMORY");
         }
 
-        compiler_instance.getLangOpts().MicrosoftExt = 1;  // __forceinline / __int64
-        compiler_instance.getLangOpts().DeclSpecKeyword = 1;  // __declspec
+        compiler_instance->getLangOpts().MicrosoftExt = 1;  // __forceinline / __int64
+        compiler_instance->getLangOpts().DeclSpecKeyword = 1;  // __declspec
     }
 
+    // For LLVM >= 21, transfer ownership of the DiagnosticConsumer to the
+    // CompilerInstance so it outlives create_compiler's scope. First release
+    // the DiagnosticsEngine's ownership to avoid a double-free.
+    // For LLVM < 21, passing nullptr makes createDiagnostics create its own
+    // internal printer (text_diagnostic_printer was already released into
+    // diagnostic_engine above).
+#if LLVM_VERSION_MAJOR >= 21
+    diagnostic_engine->setClient(diagnostic_engine->getClient(), /*ShouldOwnClient=*/false);
+#endif
 #if LLVM_VERSION_MAJOR >= 22
-    compiler_instance.createDiagnostics(diagnostic_engine->getClient(), false);
+    compiler_instance->createDiagnostics(diagnostic_engine->getClient(), true);
 #elif LLVM_VERSION_MAJOR == 21
-    compiler_instance.createDiagnostics(*llvm::vfs::getRealFileSystem(), diagnostic_engine->getClient(), false);
+    compiler_instance->createDiagnostics(*llvm::vfs::getRealFileSystem(), diagnostic_engine->getClient(), true);
 #else
-    compiler_instance.createDiagnostics(text_diagnostic_printer.get(), false);
+    compiler_instance->createDiagnostics(text_diagnostic_printer.get(), false);
 #endif
 
+    return compiler_instance;
+}
+
+static bool generate_pch(
+    const char* include_dir,
+    const std::string& pch_path,
+    bool debug,
+    bool verify_fp,
+    bool tiles_in_stack_memory,
+    const char** extra_flags,
+    bool verbose,
+    int block_dim
+)
+{
+    if (verbose) {
+        std::cout << "Warp: Generating precompiled header: " << pch_path << std::endl;
+    }
+
+    std::string input_file = "pch_gen.cpp";
+
+    auto compiler
+        = create_compiler(input_file, include_dir, false, debug, verify_fp, tiles_in_stack_memory, extra_flags);
+
+    // Create a source buffer that includes the main header.
+    // WP_NO_CRT skips system headers (assert.h, math.h, etc.) which aren't
+    // available in our embedded Clang — matching codegen.py's module headers.
+    // WP_TILE_BLOCK_DIM must match the value used by the module to avoid
+    // template instantiation mismatches in tile.h.
+    std::string pch_src = "#define WP_TILE_BLOCK_DIM " + std::to_string(block_dim)
+        + "\n"
+          "#define WP_NO_CRT\n"
+          "#include \"builtin.h\"\n";
+    std::unique_ptr<llvm::MemoryBuffer> buffer = llvm::MemoryBuffer::getMemBufferCopy(pch_src);
+    compiler->getInvocation().getPreprocessorOpts().addRemappedFile(input_file.c_str(), buffer.get());
+
+    compiler->getFrontendOpts().OutputFile = pch_path;
+
+    clang::GeneratePCHAction generate_pch_action;
+    bool success = compiler->ExecuteAction(generate_pch_action);
+    (void)buffer.release();
+
+    if (success && verbose) {
+        std::cout << "Warp: Precompiled header generated successfully" << std::endl;
+    }
+
+    return success;
+}
+
+static std::unique_ptr<llvm::Module> source_to_llvm(
+    bool is_cuda,
+    const std::string& input_file,
+    const char* cpp_src,
+    const char* include_dir,
+    bool debug,
+    bool verify_fp,
+    llvm::LLVMContext& context,
+    bool tiles_in_stack_memory,
+    const char** extra_flags = nullptr,  // null-terminated array of flag strings, or nullptr for none
+    int optimization_level = 3,
+    const char* pch_path = nullptr
+)
+{
+    auto compiler = create_compiler(
+        input_file, include_dir, is_cuda, debug, verify_fp, tiles_in_stack_memory, extra_flags, optimization_level
+    );
+
+    // Map code to a MemoryBuffer
+    std::unique_ptr<llvm::MemoryBuffer> buffer = llvm::MemoryBuffer::getMemBufferCopy(cpp_src);
+    compiler->getInvocation().getPreprocessorOpts().addRemappedFile(input_file.c_str(), buffer.get());
+
+    // Use precompiled header if available (CPU path only)
+    if (pch_path && !is_cuda) {
+        compiler->getPreprocessorOpts().ImplicitPCHInclude = pch_path;
+        // Suppress macro redefinition warnings — both the PCH and the module
+        // source define macros like WP_TILE_BLOCK_DIM to the same value
+        // (matching block_dim), and Clang warns on any redefinition.
+        compiler->getDiagnostics().setSeverityForGroup(
+            clang::diag::Flavor::WarningOrError, "macro-redefined", clang::diag::Severity::Ignored
+        );
+    }
+
     clang::EmitLLVMOnlyAction emit_llvm_only_action(&context);
-    bool success = compiler_instance.ExecuteAction(emit_llvm_only_action);
+    bool success = compiler->ExecuteAction(emit_llvm_only_action);
+
+    // Ownership of the buffer was transferred to the SourceManager during
+    // ExecuteAction() (RetainRemappedFileBuffers defaults to false).
+    // Release the unique_ptr to avoid a double-free.
     (void)buffer.release();
 
     return success ? std::move(emit_llvm_only_action.takeModule()) : nullptr;
@@ -229,14 +389,77 @@ WP_API int wp_compile_cpp(
     bool debug,
     bool verify_fp,
     bool fuse_fp,
-    bool tiles_in_stack_memory
+    bool tiles_in_stack_memory,
+    const char** extra_flags,
+    int optimization_level,
+    bool verbose,
+    bool use_precompiled_headers,
+    const char* pch_dir,
+    int block_dim
 )
 {
     initialize_llvm();
 
-    llvm::LLVMContext context;
-    std::unique_ptr<llvm::Module> module
-        = source_to_llvm(false, input_file, cpp_src, include_dir, debug, verify_fp, context, tiles_in_stack_memory);
+    // Determine PCH path if requested.
+    // Each block_dim value gets its own PCH file because tile.h templates
+    // are instantiated with WP_TILE_BLOCK_DIM baked into the PCH.
+    std::string pch_path_str;
+    const char* pch_path = nullptr;
+    if (use_precompiled_headers && pch_dir) {
+        // Encode preprocessor-affecting flags into the filename so that
+        // modules with different settings get separate PCH files.
+        // Note: extra_flags are not encoded — they are assumed constant
+        // within a session. If they differ, Clang rejects the PCH and
+        // the fallback path handles it.
+        pch_path_str = std::string(pch_dir) + "/builtin_bd" + std::to_string(block_dim) + (verify_fp ? "_vfp" : "")
+            + (debug ? "_dbg" : "") + (tiles_in_stack_memory ? "_tis" : "") + ".pch";
+
+        // Check if the PCH file already exists
+        FILE* f = fopen(pch_path_str.c_str(), "rb");
+        if (f) {
+            fclose(f);
+            if (verbose) {
+                std::cout << "Warp: Using existing precompiled header: " << pch_path_str << std::endl;
+            }
+        } else {
+            // Generate the PCH file
+            if (!generate_pch(
+                    include_dir, pch_path_str, debug, verify_fp, tiles_in_stack_memory, extra_flags, verbose, block_dim
+                )) {
+                std::cerr << "Warp: PCH generation failed, compiling without precompiled headers" << std::endl;
+                remove(pch_path_str.c_str());
+                pch_path_str.clear();
+            }
+        }
+
+        if (!pch_path_str.empty()) {
+            pch_path = pch_path_str.c_str();
+        }
+    }
+
+    // Use a unique_ptr so we can replace the context on fallback retry.
+    // The LLVMContext must outlive the module through codegen.
+    auto llvm_context = std::make_unique<llvm::LLVMContext>();
+    std::unique_ptr<llvm::Module> module = source_to_llvm(
+        false, input_file, cpp_src, include_dir, debug, verify_fp, *llvm_context, tiles_in_stack_memory, extra_flags,
+        optimization_level, pch_path
+    );
+
+    // Fallback: if compilation failed with PCH, retry without it
+    if (!module && pch_path) {
+        std::cerr << "Warp: Compilation with PCH failed, retrying without precompiled headers" << std::endl;
+        // Delete the stale PCH so subsequent calls don't hit it again
+        if (remove(pch_path_str.c_str()) != 0) {
+            std::cerr << "Warp: Failed to remove stale PCH file: " << pch_path_str << std::endl;
+        }
+
+        // Need a fresh LLVMContext for the retry
+        llvm_context = std::make_unique<llvm::LLVMContext>();
+        module = source_to_llvm(
+            false, input_file, cpp_src, include_dir, debug, verify_fp, *llvm_context, tiles_in_stack_memory,
+            extra_flags, optimization_level, nullptr
+        );
+    }
 
     if (!module) {
         return -1;
@@ -249,8 +472,24 @@ WP_API int wp_compile_cpp(
     const llvm::Target* target = llvm::TargetRegistry::lookupTarget(target_triple, error);
 #endif
 
+    // Check if -march=native was requested to set the backend target accordingly.
+    bool use_native = false;
+    if (extra_flags) {
+        for (const char** flag = extra_flags; *flag; ++flag) {
+            if (strcmp(*flag, "-march=native") == 0) {
+                use_native = true;
+                break;
+            }
+        }
+    }
+
     const char* CPU = "generic";
     const char* features = "";
+    if (use_native) {
+        const auto& cpu = get_host_cpu_info();
+        CPU = cpu.name.c_str();
+        features = cpu.features.c_str();
+    }
     llvm::TargetOptions target_options;
     if (fuse_fp)
         target_options.AllowFPOpFusion = llvm::FPOpFusion::Standard;
@@ -258,13 +497,40 @@ WP_API int wp_compile_cpp(
         target_options.AllowFPOpFusion = llvm::FPOpFusion::Strict;
     llvm::Reloc::Model relocation_model = llvm::Reloc::PIC_;  // Position Independent Code
     llvm::CodeModel::Model code_model = llvm::CodeModel::Large;  // Don't make assumptions about displacement sizes
+
+#if LLVM_VERSION_MAJOR >= 18
+    llvm::CodeGenOptLevel codegen_opt;
+#else
+    llvm::CodeGenOpt::Level codegen_opt;
+#define CodeGenOptLevel CodeGenOpt
+#endif
+    if (debug) {
+        codegen_opt = llvm::CodeGenOptLevel::None;
+    } else {
+        switch (optimization_level) {
+        case 0:
+            codegen_opt = llvm::CodeGenOptLevel::None;
+            break;
+        case 1:
+            codegen_opt = llvm::CodeGenOptLevel::Less;
+            break;
+        case 2:
+            codegen_opt = llvm::CodeGenOptLevel::Default;
+            break;
+        default:
+            codegen_opt = llvm::CodeGenOptLevel::Aggressive;
+            break;
+        }
+    }
+
 #if LLVM_VERSION_MAJOR >= 20
     llvm::TargetMachine* target_machine = target->createTargetMachine(
-        llvm::Triple(target_triple), CPU, features, target_options, relocation_model, code_model
+        llvm::Triple(target_triple), CPU, features, target_options, relocation_model, code_model, codegen_opt
     );
 #else
-    llvm::TargetMachine* target_machine
-        = target->createTargetMachine(target_triple, CPU, features, target_options, relocation_model, code_model);
+    llvm::TargetMachine* target_machine = target->createTargetMachine(
+        target_triple, CPU, features, target_options, relocation_model, code_model, codegen_opt
+    );
 #endif
 
     module->setDataLayout(target_machine->createDataLayout());
@@ -309,18 +575,17 @@ WP_API int wp_compile_cuda(
 #else
     const llvm::Target* target = llvm::TargetRegistry::lookupTarget("nvptx64-nvidia-cuda", error);
 #endif
-
-    const char* CPU = "sm_70";
     const char* features = "+ptx75";  // Warp requires CUDA 11.5, which supports PTX ISA 7.5
     llvm::TargetOptions target_options;
     llvm::Reloc::Model relocation_model = llvm::Reloc::PIC_;
 #if LLVM_VERSION_MAJOR >= 20
     llvm::TargetMachine* target_machine = target->createTargetMachine(
-        llvm::Triple("nvptx64-nvidia-cuda"), CPU, features, target_options, relocation_model
+        llvm::Triple("nvptx64-nvidia-cuda"), cuda_target_arch, features, target_options, relocation_model
     );
 #else
-    llvm::TargetMachine* target_machine
-        = target->createTargetMachine("nvptx64-nvidia-cuda", CPU, features, target_options, relocation_model);
+    llvm::TargetMachine* target_machine = target->createTargetMachine(
+        "nvptx64-nvidia-cuda", cuda_target_arch, features, target_options, relocation_model
+    );
 #endif
 
     module->setDataLayout(target_machine->createDataLayout());
@@ -357,53 +622,130 @@ WP_API int wp_compile_cuda(
     return 0;
 }
 
-// Global JIT instance
-static llvm::orc::LLJIT* jit = nullptr;
+// Two JIT instances: one for JITLink (default) and one for RTDyld (legacy).
+// Both are created lazily on first use and kept alive so that modules loaded
+// with either linker remain valid when the user switches between them.
+static llvm::orc::LLJIT* jit_default = nullptr;
+static llvm::orc::LLJIT* jit_legacy = nullptr;
 
-// Load an object file into an in-memory DLL named `module_name`
-WP_API int wp_load_obj(const char* object_file, const char* module_name)
+// Return the JIT instance for the given linker mode, creating it if needed.
+// Note: not thread-safe.  The caller (wp_load_obj) is serialized by Python's
+// Module._compile / Module.load, but if parallel loading is ever introduced at
+// the C++ level a mutex would be needed here.
+static llvm::orc::LLJIT* get_or_create_jit(bool use_legacy_linker)
 {
-    if (!jit) {
-        initialize_llvm();
+    if (use_legacy_linker && jit_legacy)
+        return jit_legacy;
+    if (!use_legacy_linker && jit_default)
+        return jit_default;
 
-        auto jit_expected = llvm::orc::LLJITBuilder()
-                                .setObjectLinkingLayerCreator(
+    initialize_llvm();
+
+    llvm::orc::LLJITBuilder builder;
+
+    if (use_legacy_linker) {
+        builder.setObjectLinkingLayerCreator(
 #if LLVM_VERSION_MAJOR >= 21
-                                    [&](llvm::orc::ExecutionSession& session) {
+            [](llvm::orc::ExecutionSession& session)
 #else
-                                    [&](llvm::orc::ExecutionSession& session, const llvm::Triple& triple) {
+            [](llvm::orc::ExecutionSession& session, const llvm::Triple& triple)
 #endif
+                -> llvm::Expected<std::unique_ptr<llvm::orc::ObjectLayer>> {
 #if LLVM_VERSION_MAJOR >= 21
-                                        auto get_memory_manager = [](const llvm::MemoryBuffer&) {
+                auto get_memory_manager = [](const llvm::MemoryBuffer&) {
 #else
-                                        auto get_memory_manager = []() {
+                auto get_memory_manager = []() {
 #endif
-                                            return std::make_unique<llvm::SectionMemoryManager>();
-                                        };
-                                        auto obj_linking_layer = std::make_unique<llvm::orc::RTDyldObjectLinkingLayer>(
-                                            session, std::move(get_memory_manager)
-                                        );
+                    return std::make_unique<llvm::SectionMemoryManager>();
+                };
+                auto layer
+                    = std::make_unique<llvm::orc::RTDyldObjectLinkingLayer>(session, std::move(get_memory_manager));
 
-                                        // Register the event listener.
-                                        obj_linking_layer->registerJITEventListener(
-                                            *llvm::JITEventListener::createGDBRegistrationListener()
-                                        );
+                layer->registerJITEventListener(*llvm::JITEventListener::createGDBRegistrationListener());
 
-                                        // Make sure the debug info sections aren't stripped.
-                                        obj_linking_layer->setProcessAllSections(true);
+                // Make sure the debug info sections aren't stripped.
+                layer->setProcessAllSections(true);
 
-                                        return obj_linking_layer;
-                                    }
-                                )
-                                .create();
+                return layer;
+            }
+        );
+    } else {
+        builder.setObjectLinkingLayerCreator(
+#if LLVM_VERSION_MAJOR >= 21
+            [](llvm::orc::ExecutionSession& session)
+#else
+            [](llvm::orc::ExecutionSession& session, const llvm::Triple& triple)
+#endif
+                -> llvm::Expected<std::unique_ptr<llvm::orc::ObjectLayer>> {
+                auto layer = std::make_unique<llvm::orc::ObjectLinkingLayer>(session);
 
-        if (!jit_expected) {
-            std::cerr << "Failed to create JIT instance: " << toString(jit_expected.takeError()) << std::endl;
-            return -1;
-        }
+                if (WP_ENABLE_DEBUG) {
+                    // Register debug-object plugin for GDB/LLDB JIT debugging support.
+                    auto registrar = llvm::orc::createJITLoaderGDBRegistrar(session);
+                    if (registrar) {
+#if LLVM_VERSION_MAJOR >= 21
+                        layer->addPlugin(
+                            std::make_shared<llvm::orc::DebugObjectManagerPlugin>(
+                                session, std::move(*registrar), true, true
+                            )
+                        );
+#else
+                        layer->addPlugin(
+                            std::make_unique<llvm::orc::DebugObjectManagerPlugin>(session, std::move(*registrar))
+                        );
+#endif
+                    } else {
+                        llvm::consumeError(registrar.takeError());
+                        std::cout << "Warp notice: JIT debug support is not available with "
+                                     "this LLVM build. Step-through debugging of CPU kernels "
+                                     "requires building Warp with --build-llvm, or setting "
+                                     "wp.config.legacy_cpu_linker = True to use the legacy "
+                                     "RTDyld linker."
+                                  << std::endl;
+                    }
+                }
 
-        jit = (*jit_expected).release();
+                return layer;
+            }
+        );
     }
+
+    auto jit_expected = builder.create();
+
+    if (!jit_expected) {
+        std::cerr << "Failed to create JIT instance: " << toString(jit_expected.takeError()) << std::endl;
+        return nullptr;
+    }
+
+    auto* jit = (*jit_expected).release();
+    if (use_legacy_linker)
+        jit_legacy = jit;
+    else
+        jit_default = jit;
+    return jit;
+}
+
+// Find which JIT instance owns a module by name.
+static llvm::orc::LLJIT* find_jit_for_module(const char* module_name)
+{
+    if (jit_default && jit_default->getJITDylibByName(module_name))
+        return jit_default;
+    if (jit_legacy && jit_legacy->getJITDylibByName(module_name))
+        return jit_legacy;
+    return nullptr;
+}
+
+// Load an object file into an in-memory DLL named `module_name`.
+// When `use_legacy_linker` is true, the legacy RTDyld linker is used instead
+// of JITLink; this provides debug support with pre-built LLVM but is less
+// robust against virtual address space fragmentation.
+// Debug support (GDB/LLDB step-through) is enabled automatically in debug
+// builds (WP_ENABLE_DEBUG=1).
+WP_API int wp_load_obj(const char* object_file, const char* module_name, bool use_legacy_linker)
+{
+    auto* jit = get_or_create_jit(use_legacy_linker);
+    if (!jit)
+        return -1;
 
     auto dll = jit->createJITDylib(module_name);
 
@@ -462,7 +804,7 @@ WP_API int wp_load_obj(const char* object_file, const char* module_name)
             SYMBOL(memset_pattern16),
             SYMBOL(__sincos_stret), SYMBOL(__sincosf_stret),
 #else
-                                        SYMBOL(sincosf), SYMBOL_T(sincos, void (*)(double, double*, double*)),
+            SYMBOL(sincosf), SYMBOL_T(sincos, void (*)(double, double*, double*)),
 #endif
 #if LLVM_VERSION_MAJOR >= 18
         })));
@@ -494,10 +836,9 @@ WP_API int wp_load_obj(const char* object_file, const char* module_name)
 
 WP_API int wp_unload_obj(const char* module_name)
 {
-    if (!jit)  // If there's no JIT instance there are no object files loaded
-    {
+    auto* jit = find_jit_for_module(module_name);
+    if (!jit)
         return 0;
-    }
 
     auto* dll = jit->getJITDylibByName(module_name);
     llvm::Error error = jit->getExecutionSession().removeJITDylib(*dll);
@@ -512,6 +853,12 @@ WP_API int wp_unload_obj(const char* module_name)
 
 WP_API uint64_t wp_lookup(const char* dll_name, const char* function_name)
 {
+    auto* jit = find_jit_for_module(dll_name);
+    if (!jit) {
+        std::cerr << "Failed to find module: " << dll_name << std::endl;
+        return 0;
+    }
+
     auto* dll = jit->getJITDylibByName(dll_name);
 
     auto func = jit->lookup(*dll, function_name);
@@ -525,6 +872,13 @@ WP_API uint64_t wp_lookup(const char* dll_name, const char* function_name)
 }
 
 WP_API const char* wp_warp_clang_version() { return WP_VERSION_STRING; }
+
+WP_API const char* wp_llvm_version()
+{
+    static char version[64];
+    snprintf(version, sizeof(version), "%d.%d.%d", LLVM_VERSION_MAJOR, LLVM_VERSION_MINOR, LLVM_VERSION_PATCH);
+    return version;
+}
 
 }  // extern "C"
 

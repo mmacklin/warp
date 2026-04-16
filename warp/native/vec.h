@@ -1,19 +1,5 @@
-/*
- * SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: Apache-2.0
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 #pragma once
 
@@ -288,6 +274,27 @@ template <typename Type> inline CUDA_CALLABLE vec_t<3, Type> div(Type s, vec_t<3
 template <typename Type> inline CUDA_CALLABLE vec_t<2, Type> div(Type s, vec_t<2, Type> a)
 {
     return vec_t<2, Type>(s / a.c[0], s / a.c[1]);
+}
+
+// approximate division
+template <unsigned Length, typename Type>
+inline CUDA_CALLABLE vec_t<Length, Type> approx_div(vec_t<Length, Type> a, Type s)
+{
+    vec_t<Length, Type> ret;
+    for (unsigned i = 0; i < Length; ++i) {
+        ret[i] = approx_div(a[i], s);
+    }
+    return ret;
+}
+
+template <unsigned Length, typename Type>
+inline CUDA_CALLABLE vec_t<Length, Type> approx_div(Type s, vec_t<Length, Type> a)
+{
+    vec_t<Length, Type> ret;
+    for (unsigned i = 0; i < Length; ++i) {
+        ret[i] = approx_div(s, a[i]);
+    }
+    return ret;
 }
 
 template <unsigned Length, typename Type>
@@ -1495,6 +1502,30 @@ adj_div(Type s, vec_t<Length, Type> a, Type& adj_s, vec_t<Length, Type>& adj_a, 
 }
 
 template <unsigned Length, typename Type>
+inline CUDA_CALLABLE void adj_approx_div(
+    vec_t<Length, Type> a, Type s, vec_t<Length, Type>& adj_a, Type& adj_s, const vec_t<Length, Type>& adj_ret
+)
+{
+    adj_s -= approx_div(dot(a, adj_ret), (s * s));
+
+    for (unsigned i = 0; i < Length; ++i) {
+        adj_a[i] += approx_div(adj_ret[i], s);
+    }
+}
+
+template <unsigned Length, typename Type>
+inline CUDA_CALLABLE void adj_approx_div(
+    Type s, vec_t<Length, Type> a, Type& adj_s, vec_t<Length, Type>& adj_a, const vec_t<Length, Type>& adj_ret
+)
+{
+    for (unsigned i = 0; i < Length; ++i) {
+        Type inv = approx_rcp(a[i]);
+        adj_a[i] -= s * adj_ret[i] * inv * inv;
+        adj_s += adj_ret[i] * inv;
+    }
+}
+
+template <unsigned Length, typename Type>
 inline CUDA_CALLABLE void adj_cw_div(
     vec_t<Length, Type> a,
     vec_t<Length, Type> b,
@@ -1506,6 +1537,23 @@ inline CUDA_CALLABLE void adj_cw_div(
 {
     adj_a += cw_div(adj_ret, b);
     adj_b -= cw_mul(adj_ret, cw_div(ret, b));
+}
+
+// 5-arg overloads for tile operations (vec/scalar mixed types).
+// These forward to the existing 5-arg adj_div for vec/scalar which doesn't need ret.
+// The 6-arg adj_cw_div above is for vec/vec which needs ret for the gradient computation.
+template <unsigned Length, typename Type>
+inline CUDA_CALLABLE void
+adj_cw_div(vec_t<Length, Type> a, Type b, vec_t<Length, Type>& adj_a, Type& adj_b, const vec_t<Length, Type>& adj_ret)
+{
+    adj_div(a, b, adj_a, adj_b, adj_ret);
+}
+
+template <unsigned Length, typename Type>
+inline CUDA_CALLABLE void
+adj_cw_div(Type a, vec_t<Length, Type> b, Type& adj_a, vec_t<Length, Type>& adj_b, const vec_t<Length, Type>& adj_ret)
+{
+    adj_div(a, b, adj_a, adj_b, adj_ret);
 }
 
 template <unsigned Length, typename Type>
@@ -1782,7 +1830,7 @@ adj_dot(vec_t<3, Type> a, vec_t<3, Type> b, vec_t<3, Type>& adj_a, vec_t<3, Type
 
 template <unsigned Length, typename Type>
 inline CUDA_CALLABLE void
-adj_extract(const vec_t<Length, Type>& a, int idx, vec_t<Length, Type>& adj_a, int& adj_idx, Type& adj_ret)
+adj_extract(const vec_t<Length, Type>& a, int idx, vec_t<Length, Type>& adj_a, int adj_idx, Type& adj_ret)
 {
 #ifndef NDEBUG
     if (idx < -(int)Length || idx >= (int)Length) {

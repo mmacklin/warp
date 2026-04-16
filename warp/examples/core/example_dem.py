@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 ###########################################################################
 # Example DEM
@@ -54,9 +42,9 @@ def contact_force(n: wp.vec3, v: wp.vec3, c: float, k_n: float, k_d: float, k_f:
 @wp.kernel
 def apply_forces(
     grid: wp.uint64,
-    particle_x: wp.array(dtype=wp.vec3),
-    particle_v: wp.array(dtype=wp.vec3),
-    particle_f: wp.array(dtype=wp.vec3),
+    particle_x: wp.array[wp.vec3],
+    particle_v: wp.array[wp.vec3],
+    particle_f: wp.array[wp.vec3],
     radius: float,
     k_contact: float,
     k_damp: float,
@@ -104,9 +92,9 @@ def apply_forces(
 
 @wp.kernel
 def integrate(
-    x: wp.array(dtype=wp.vec3),
-    v: wp.array(dtype=wp.vec3),
-    f: wp.array(dtype=wp.vec3),
+    x: wp.array[wp.vec3],
+    v: wp.array[wp.vec3],
+    f: wp.array[wp.vec3],
     gravity: wp.vec3,
     dt: float,
     inv_mass: float,
@@ -221,12 +209,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--device", type=str, default=None, help="Override the default Warp device.")
     parser.add_argument(
-        "--stage_path",
+        "--stage-path",
         type=lambda x: None if x == "None" else str(x),
         default="example_dem.usd",
         help="Path to the output USD file.",
     )
-    parser.add_argument("--num_frames", type=int, default=200, help="Total number of frames.")
+    parser.add_argument("--num-frames", type=int, default=200, help="Total number of frames.")
 
     args = parser.parse_known_args()[0]
 

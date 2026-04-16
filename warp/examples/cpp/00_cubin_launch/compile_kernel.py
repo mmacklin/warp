@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 """Compile Warp kernel to CUBIN for C++ integration.
 
@@ -32,7 +20,7 @@ import warp as wp
 
 
 @wp.kernel
-def saxpy(alpha: wp.float32, x: wp.array(dtype=wp.float32), y: wp.array(dtype=wp.float32)):
+def saxpy(alpha: float, x: wp.array[float], y: wp.array[float]):
     """SAXPY: Single-Precision A·X Plus Y
 
     Computes: ``y = alpha * x + y``.

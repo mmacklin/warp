@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import unittest
 
@@ -524,6 +512,32 @@ def test_graph_destroy_during_capture(test, device):
         assert_np_equal(a.numpy(), np.full(n, 2, dtype=np.float32))
 
 
+def test_stream_synchronize_cpu(test, _):
+    with wp.ScopedDevice("cpu"):
+        # this should not raise an exception (like wp.synchronize_device())
+        wp.synchronize_stream()
+
+
+def test_synchronize_during_capture(test, device):
+    with wp.ScopedDevice(device):
+        with test.assertRaisesRegex(RuntimeError, "Cannot synchronize device"):
+            with wp.ScopedCapture():
+                wp.synchronize()
+
+        with test.assertRaisesRegex(RuntimeError, "Cannot synchronize device"):
+            with wp.ScopedCapture():
+                wp.synchronize_device()
+
+        with test.assertRaisesRegex(RuntimeError, "Cannot synchronize stream"):
+            with wp.ScopedCapture():
+                wp.synchronize_stream()
+
+        with test.assertRaisesRegex(RuntimeError, "Cannot synchronize event"):
+            e = wp.Event(device)
+            with wp.ScopedCapture():
+                wp.synchronize_event(e)
+
+
 devices = get_selected_cuda_test_devices()
 
 
@@ -686,6 +700,8 @@ add_function_test(TestStreams, "test_event_external", test_event_external, devic
 
 add_function_test(TestStreams, "test_graph_destroy_during_capture", test_graph_destroy_during_capture, devices=devices)
 
+add_function_test(TestStreams, "test_stream_synchronize_cpu", test_stream_synchronize_cpu, devices=None)
+add_function_test(TestStreams, "test_synchronize_during_capture", test_synchronize_during_capture, devices=devices)
+
 if __name__ == "__main__":
-    wp.clear_kernel_cache()
     unittest.main(verbosity=2)

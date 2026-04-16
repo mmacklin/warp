@@ -39,7 +39,7 @@ Workflow:
 This example runs from within the Warp repository.
 
 **Requirements:**
-- **Python 3.8+**
+- **Python 3.10+**
 - **CUDA Toolkit 12.8+** (includes `nvcc` compiler; 12.8+ required for `sm_120` support)
 - **NVIDIA GPU** (supports multiple architectures via multi-arch compilation)
 - **Build System**: GNU Make (Unix/Linux) or CMake 3.20+ (cross-platform)
@@ -138,8 +138,8 @@ Generates `generated/wp___main__.cu` with:
 #include "generated/wp___main__.cu"
 
 // Setup Warp structures
-wp::launch_bounds_t loss_dim = {{N_SAMPLES, 0, 0, 0}, 1, size_t(N_SAMPLES)};
-wp::launch_bounds_t update_dim = {{2, 0, 0, 0}, 1, 2};
+wp::launch_bounds_t<1> loss_dim = {{N_SAMPLES}, size_t(N_SAMPLES), false};
+wp::launch_bounds_t<1> update_dim = {{2}, 2, false};
 wp::array_t<wp::float32> arr_params(d_params, 2);
 wp::array_t<wp::float32> arr_x(d_x, N_SAMPLES);
 // ... other arrays ...

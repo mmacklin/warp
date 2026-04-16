@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 # ruff: noqa: PLC0415
 
@@ -367,6 +355,12 @@ def add_kernel(a: wp.array(dtype=float), b: wp.array(dtype=float), output: wp.ar
 
 
 @wp.kernel
+def add2d_kernel(a: wp.array2d(dtype=float), b: wp.array2d(dtype=float), output: wp.array2d(dtype=float)):
+    i, j = wp.tid()
+    output[i, j] = a[i, j] + b[i, j]
+
+
+@wp.kernel
 def axpy_kernel(x: wp.array(dtype=float), y: wp.array(dtype=float), alpha: float, out: wp.array(dtype=float)):
     tid = wp.tid()
     out[tid] = alpha * x[tid] + y[tid]
@@ -462,6 +456,25 @@ def multi_out_kernel_v3(
 
 @wp.kernel
 def scale_sum_square_kernel(a: wp.array(dtype=float), b: wp.array(dtype=float), s: float, c: wp.array(dtype=float)):
+    tid = wp.tid()
+    c[tid] = (a[tid] * s + b[tid]) ** 2.0
+
+
+# Kernels using subscript-style type hints (wp.array[dtype] syntax)
+@wp.kernel
+def add_kernel_subscript(a: wp.array[float], b: wp.array[float], output: wp.array[float]):
+    tid = wp.tid()
+    output[tid] = a[tid] + b[tid]
+
+
+@wp.kernel
+def scale_vec_kernel_subscript(a: wp.array[wp.vec2], s: float, output: wp.array[wp.vec2]):
+    tid = wp.tid()
+    output[tid] = a[tid] * s
+
+
+@wp.kernel
+def scale_sum_square_kernel_subscript(a: wp.array[float], b: wp.array[float], s: float, c: wp.array[float]):
     tid = wp.tid()
     c[tid] = (a[tid] * s + b[tid]) ** 2.0
 
@@ -1050,6 +1063,9 @@ def test_ffi_jax_callable_pmap_multi_stage(test, device):
 
 @unittest.skipUnless(_jax_version() >= (0, 5, 0), "Jax version too old")
 def test_ffi_callback(test, device):
+    if device.ordinal > 0:
+        test.skipTest("Flaky on device ordinal > 0: JAX FFI segfaults intermittently")
+
     # in-out arguments
     import jax.numpy as jp
 
@@ -1170,7 +1186,7 @@ def test_ffi_jax_kernel_autodiff_jit_of_grad_simple(test, device):
     grad_fn = jax.grad(loss, argnums=(0, 1))
 
     # more typical: jit(grad(...)) with static scalar
-    jitted_grad = jax.jit(lambda a, b, s: grad_fn(a, b, s), static_argnames=("s",))
+    jitted_grad = jax.jit(grad_fn, static_argnames=("s",))
 
     n = ARRAY_SIZE
     a = jp.arange(n, dtype=jp.float32)
@@ -1253,7 +1269,7 @@ def test_ffi_jax_kernel_autodiff_jit_of_grad_multi_output(test, device):
         return jp.sum(c + d)
 
     grad_fn = jax.grad(loss, argnums=(0, 1))
-    jitted_grad = jax.jit(lambda a, b, s: grad_fn(a, b, s), static_argnames=("s",))
+    jitted_grad = jax.jit(grad_fn, static_argnames=("s",))
 
     n = ARRAY_SIZE
     a = jp.arange(n, dtype=jp.float32)
@@ -1458,6 +1474,316 @@ def test_ffi_jax_kernel_autodiff_pmap_multi_output(test, device):
     assert_np_equal(np.asarray(db), ref_db)
 
 
+@unittest.skipUnless(_jax_version() >= (0, 5, 0), "Jax version too old")
+def test_ffi_vmap_add(test, device, vmap_method):
+    """Test basic batching over different input and output axes."""
+    import jax
+    import jax.numpy as jp
+
+    from warp.jax_experimental.ffi import jax_callable, jax_kernel
+
+    # jax reference implementation
+    def jax_add(a, b):
+        return a + b
+
+    # warp callable 1d
+    def warp_add1d(a: wp.array(dtype=float), b: wp.array(dtype=float), output: wp.array(dtype=float)):
+        wp.launch(add_kernel, dim=a.shape, inputs=[a, b, output])
+
+    # warp callable 2d
+    def warp_add2d(a: wp.array2d(dtype=float), b: wp.array2d(dtype=float), output: wp.array2d(dtype=float)):
+        wp.launch(add2d_kernel, dim=a.shape, inputs=[a, b, output])
+
+    jk_add1d = jax_kernel(add_kernel, vmap_method=vmap_method)
+    jk_add2d = jax_kernel(add2d_kernel, vmap_method=vmap_method)
+    jc_add1d = jax_callable(warp_add1d, vmap_method=vmap_method)
+    jc_add2d = jax_callable(warp_add2d, vmap_method=vmap_method)
+
+    with jax.default_device(wp.device_to_jax(device)):
+        # test 1d batching
+        a = jp.arange(3 * 4, dtype=jp.float32).reshape((3, 4))
+        b = jp.ones(3 * 4, dtype=jp.float32).reshape((3, 4))
+        for in_axis in range(2):
+            for out_axis in range(2):
+                expected = jax.jit(jax.vmap(jax_add, in_axes=in_axis, out_axes=out_axis))(a, b)
+
+                # test jax_kernel()
+                (output,) = jax.jit(jax.vmap(jk_add1d, in_axes=in_axis, out_axes=out_axis))(a, b)
+                test.assertEqual(output.shape, expected.shape)
+                assert_np_equal(np.asarray(output), np.asarray(expected))
+
+                # test jax_callable()
+                (output,) = jax.jit(jax.vmap(jc_add1d, in_axes=in_axis, out_axes=out_axis))(a, b)
+                test.assertEqual(output.shape, expected.shape)
+                assert_np_equal(np.asarray(output), np.asarray(expected))
+
+        # test 2d batching
+        a = jp.arange(2 * 3 * 4, dtype=jp.float32).reshape((2, 3, 4))
+        b = jp.ones(2 * 3 * 4, dtype=jp.float32).reshape((2, 3, 4))
+        for in_axis in range(3):
+            for out_axis in range(3):
+                expected = jax.jit(jax.vmap(jax_add, in_axes=in_axis, out_axes=out_axis))(a, b)
+
+                # test jax_kernel()
+                (output,) = jax.jit(jax.vmap(jk_add2d, in_axes=in_axis, out_axes=out_axis))(a, b)
+                test.assertEqual(output.shape, expected.shape)
+                assert_np_equal(np.asarray(output), np.asarray(expected))
+
+                # test jax_callable()
+                (output,) = jax.jit(jax.vmap(jc_add2d, in_axes=in_axis, out_axes=out_axis))(a, b)
+                test.assertEqual(output.shape, expected.shape)
+                assert_np_equal(np.asarray(output), np.asarray(expected))
+
+
+@wp.kernel
+def rowsum_kernel(matrix: wp.array2d(dtype=float), sums: wp.array1d(dtype=float)):
+    i, j = wp.tid()
+    wp.atomic_add(sums, i, matrix[i, j])
+
+
+@unittest.skipUnless(_jax_version() >= (0, 5, 0), "Jax version too old")
+def test_ffi_vmap_rowsum(test, device, vmap_method):
+    """Test in-out arguments with vmap."""
+    import jax
+    import jax.numpy as jp
+
+    from warp.jax_experimental.ffi import jax_callable, jax_kernel
+
+    # jax reference implementation
+    def jax_rowsum(matrix):
+        return jp.sum(matrix, axis=1)
+
+    # warp callable
+    def warp_rowsum(matrix: wp.array2d(dtype=float), sums: wp.array1d(dtype=float)):
+        wp.launch(rowsum_kernel, dim=matrix.shape, inputs=[matrix, sums])
+
+    jk_rowsum = jax_kernel(rowsum_kernel, in_out_argnames=["sums"], vmap_method=vmap_method)
+    jc_rowsum = jax_callable(warp_rowsum, in_out_argnames=["sums"], vmap_method=vmap_method)
+
+    with jax.default_device(wp.device_to_jax(device)):
+        # batched input with shape (2, 3, 4)
+        matrices = jp.arange(2 * 3 * 4, dtype=jp.float32).reshape((2, 3, 4))
+
+        # NOTE: need to pass zeroed sum arrays whose shape depends on the input batch dimension.
+
+        # --------------------------------------------------------------
+        # batch dim 0: 2 matrices with shape (3, 4), output shape (2, 3)
+        expected = jax.jit(jax.vmap(jax_rowsum, in_axes=0))(matrices)
+        sums = jp.zeros((2, 3), dtype=jp.float32)
+
+        # test jax_kernel()
+        (output,) = jax.jit(jax.vmap(jk_rowsum, in_axes=(0, 0)))(matrices, sums)
+        test.assertEqual(output.shape, expected.shape)
+        assert_np_equal(np.asarray(output), np.asarray(expected))
+
+        # test jax_callable()
+        (output,) = jax.jit(jax.vmap(jc_rowsum, in_axes=(0, 0)))(matrices, sums)
+        test.assertEqual(output.shape, expected.shape)
+        assert_np_equal(np.asarray(output), np.asarray(expected))
+
+        # --------------------------------------------------------------
+        # batch dim 1: 3 matrices with shape (2, 4), output shape (3, 2)
+        expected = jax.jit(jax.vmap(jax_rowsum, in_axes=1))(matrices)
+        sums = jp.zeros((3, 2), dtype=jp.float32)
+
+        # test jax_kernel()
+        (output,) = jax.jit(jax.vmap(jk_rowsum, in_axes=(1, 0)))(matrices, sums)
+        test.assertEqual(output.shape, expected.shape)
+        assert_np_equal(np.asarray(output), np.asarray(expected))
+
+        # test jax_callable()
+        (output,) = jax.jit(jax.vmap(jc_rowsum, in_axes=(1, 0)))(matrices, sums)
+        test.assertEqual(output.shape, expected.shape)
+        assert_np_equal(np.asarray(output), np.asarray(expected))
+
+        # --------------------------------------------------------------
+        # batch dim 2: 4 matrices with shape (2, 3), output shape (4, 2)
+        expected = jax.jit(jax.vmap(jax_rowsum, in_axes=2))(matrices)
+        sums = jp.zeros((4, 2), dtype=jp.float32)
+
+        # test jax_kernel()
+        (output,) = jax.jit(jax.vmap(jk_rowsum, in_axes=(2, 0)))(matrices, sums)
+        test.assertEqual(output.shape, expected.shape)
+        assert_np_equal(np.asarray(output), np.asarray(expected))
+
+        # test jax_callable()
+        (output,) = jax.jit(jax.vmap(jc_rowsum, in_axes=(2, 0)))(matrices, sums)
+        test.assertEqual(output.shape, expected.shape)
+        assert_np_equal(np.asarray(output), np.asarray(expected))
+
+
+@wp.kernel
+def lookup_kernel(table: wp.array(dtype=float), indices: wp.array(dtype=int), output: wp.array(dtype=float)):
+    i = wp.tid()
+    output[i] = table[indices[i]]
+
+
+@unittest.skipUnless(_jax_version() >= (0, 5, 0), "Jax version too old")
+def test_ffi_vmap_lookup(test, device, vmap_method):
+    """
+    Test the following vmap features:
+    - Unbatched inputs (lookup table).
+    - Custom launch and output dimensions for kernels (not inferred from argument shape).
+    - Custom output dimensions for callables.
+    """
+    import jax
+    import jax.numpy as jp
+
+    from warp.jax_experimental.ffi import jax_callable, jax_kernel
+
+    # jax reference implementation
+    def jax_lookup(a, indices):
+        return a[indices]
+
+    def warp_lookup(table: wp.array(dtype=float), indices: wp.array(dtype=int), output: wp.array(dtype=float)):
+        wp.launch(lookup_kernel, dim=indices.shape, inputs=[table, indices, output])
+
+    jk_lookup = jax_kernel(lookup_kernel, vmap_method=vmap_method)
+    jc_lookup = jax_callable(warp_lookup, vmap_method=vmap_method)
+
+    with jax.default_device(wp.device_to_jax(device)):
+        # lookup table (not batched)
+        N = 100
+        table = jp.arange(N, dtype=jp.float32)
+
+        # batched indices to look up
+        key = jax.random.key(42)
+        indices = jax.random.randint(key, (3, 5), 0, N, dtype=jp.int32)
+
+        # NOTE: use functools.partial() to pass output_dims (will be batched)
+
+        # ----------------------------------------------------------
+        # batch dim 0: 3 sets of 5 indices each, output shape (3, 5)
+        expected = jax.jit(jax.vmap(jax_lookup, in_axes=(None, 0)))(table, indices)
+
+        # test jax_kernel()
+        (output,) = jax.jit(jax.vmap(partial(jk_lookup, launch_dims=indices.shape[1]), in_axes=(None, 0)))(
+            table, indices
+        )
+        test.assertEqual(output.shape, expected.shape)
+        assert_np_equal(np.asarray(output), np.asarray(expected))
+
+        # test jax_callable()
+        (output,) = jax.jit(jax.vmap(partial(jc_lookup, output_dims=indices.shape[1]), in_axes=(None, 0)))(
+            table, indices
+        )
+        test.assertEqual(output.shape, expected.shape)
+        assert_np_equal(np.asarray(output), np.asarray(expected))
+
+        # ----------------------------------------------------------
+        # batch dim 1: 5 sets of 3 indices each, output shape (5, 3)
+        expected = jax.jit(jax.vmap(jax_lookup, in_axes=(None, 1)))(table, indices)
+
+        # test jax_kernel()
+        (output,) = jax.jit(jax.vmap(partial(jk_lookup, launch_dims=indices.shape[0]), in_axes=(None, 1)))(
+            table, indices
+        )
+        test.assertEqual(output.shape, expected.shape)
+        assert_np_equal(np.asarray(output), np.asarray(expected))
+
+        # test jax_callable()
+        (output,) = jax.jit(jax.vmap(partial(jc_lookup, output_dims=indices.shape[0]), in_axes=(None, 1)))(
+            table, indices
+        )
+        test.assertEqual(output.shape, expected.shape)
+        assert_np_equal(np.asarray(output), np.asarray(expected))
+
+
+@unittest.skipUnless(_jax_version() >= (0, 5, 0), "Jax version too old")
+def test_ffi_jax_kernel_subscript_scalar(test, device):
+    """Test jax_kernel with wp.array[float] subscript syntax for scalar dtypes."""
+    import jax.numpy as jp
+
+    from warp.jax_experimental.ffi import jax_kernel
+
+    jax_add = jax_kernel(add_kernel_subscript)
+
+    @jax.jit
+    def f():
+        n = ARRAY_SIZE
+        a = jp.arange(n, dtype=jp.float32)
+        b = jp.ones(n, dtype=jp.float32)
+        return jax_add(a, b)
+
+    with jax.default_device(wp.device_to_jax(device)):
+        (y,) = f()
+
+    jax.block_until_ready(y)
+
+    result = np.asarray(y)
+    expected = np.arange(1, ARRAY_SIZE + 1, dtype=np.float32)
+
+    assert_np_equal(result, expected)
+
+
+@unittest.skipUnless(_jax_version() >= (0, 5, 0), "Jax version too old")
+def test_ffi_jax_kernel_subscript_vec(test, device):
+    """Test jax_kernel with wp.array[wp.vec2] subscript syntax for vector dtypes."""
+    import jax.numpy as jp
+
+    from warp.jax_experimental.ffi import jax_kernel
+
+    jax_scale_vec = jax_kernel(scale_vec_kernel_subscript)
+
+    @jax.jit
+    def f():
+        a = jp.arange(ARRAY_SIZE, dtype=jp.float32).reshape((ARRAY_SIZE // 2, 2))
+        s = 2.0
+        return jax_scale_vec(a, s)
+
+    with jax.default_device(wp.device_to_jax(device)):
+        (b,) = f()
+
+    jax.block_until_ready(b)
+
+    expected = 2 * np.arange(ARRAY_SIZE, dtype=np.float32).reshape((ARRAY_SIZE // 2, 2))
+
+    assert_np_equal(b, expected)
+
+
+@unittest.skipUnless(_jax_version() >= (0, 5, 0), "Jax version too old")
+def test_ffi_jax_kernel_subscript_autodiff(test, device):
+    """Test jax_kernel with subscript syntax and enable_backward=True."""
+    if device.ordinal > 0:
+        test.skipTest("Flaky on device ordinal > 0: JAX FFI jit(grad()) returns zeros")
+
+    import jax
+    import jax.numpy as jp
+
+    from warp.jax_experimental.ffi import jax_kernel
+
+    jax_func = jax_kernel(
+        scale_sum_square_kernel_subscript,
+        num_outputs=1,
+        enable_backward=True,
+    )
+
+    from functools import partial
+
+    @partial(jax.jit, static_argnames=["s"])
+    def loss(a, b, s):
+        out = jax_func(a, b, s)[0]
+        return jp.sum(out)
+
+    n = ARRAY_SIZE
+    a = jp.arange(n, dtype=jp.float32)
+    b = jp.ones(n, dtype=jp.float32)
+    s = 2.0
+
+    with jax.default_device(wp.device_to_jax(device)):
+        da, db = jax.grad(loss, argnums=(0, 1))(a, b, s)
+
+    jax.block_until_ready([da, db])
+
+    a_np = np.arange(n, dtype=np.float32)
+    b_np = np.ones(n, dtype=np.float32)
+    ref_da = 2.0 * (a_np * s + b_np) * s
+    ref_db = 2.0 * (a_np * s + b_np)
+
+    assert_np_equal(np.asarray(da), ref_da)
+    assert_np_equal(np.asarray(db), ref_db)
+
+
 class TestJax(unittest.TestCase):
     pass
 
@@ -1586,6 +1912,26 @@ try:
             devices=jax_compatible_cuda_devices,
         )
 
+        # subscript-style type hint tests (wp.array[dtype] syntax)
+        add_function_test(
+            TestJax,
+            "test_ffi_jax_kernel_subscript_scalar",
+            test_ffi_jax_kernel_subscript_scalar,
+            devices=jax_compatible_cuda_devices,
+        )
+        add_function_test(
+            TestJax,
+            "test_ffi_jax_kernel_subscript_vec",
+            test_ffi_jax_kernel_subscript_vec,
+            devices=jax_compatible_cuda_devices,
+        )
+        add_function_test(
+            TestJax,
+            "test_ffi_jax_kernel_subscript_autodiff",
+            test_ffi_jax_kernel_subscript_autodiff,
+            devices=jax_compatible_cuda_devices,
+        )
+
         # ffi.jax_callable() tests
         add_function_test(
             TestJax,
@@ -1696,10 +2042,30 @@ try:
             devices=None,
         )
 
+        # vmap tests
+        for vmap_method in ["broadcast_all", "sequential"]:
+            add_function_test(
+                TestJax,
+                f"test_ffi_vmap_add_{vmap_method}",
+                partial(test_ffi_vmap_add, vmap_method=vmap_method),
+                devices=jax_compatible_cuda_devices,
+            )
+            add_function_test(
+                TestJax,
+                f"test_ffi_vmap_rowsum_{vmap_method}",
+                partial(test_ffi_vmap_rowsum, vmap_method=vmap_method),
+                devices=jax_compatible_cuda_devices,
+            )
+            add_function_test(
+                TestJax,
+                f"test_ffi_vmap_lookup_{vmap_method}",
+                partial(test_ffi_vmap_lookup, vmap_method=vmap_method),
+                devices=jax_compatible_cuda_devices,
+            )
+
 except Exception as e:
     print(f"Skipping Jax tests due to exception: {e}")
 
 
 if __name__ == "__main__":
-    wp.clear_kernel_cache()
     unittest.main(verbosity=2)

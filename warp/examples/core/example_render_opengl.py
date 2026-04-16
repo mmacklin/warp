@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 ###########################################################################
 # OpenGL renderer example
@@ -441,28 +429,27 @@ class Example:
 
 if __name__ == "__main__":
     import argparse
-    import distutils.util
 
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--device", type=str, default=None, help="Override the default Warp device.")
-    parser.add_argument("--num_tiles", type=int, default=4, help="Number of viewports to render in a single frame.")
+    parser.add_argument("--num-tiles", type=int, default=4, help="Number of viewports to render in a single frame.")
     parser.add_argument(
-        "--show_plot",
-        type=lambda x: bool(distutils.util.strtobool(x.strip())),
+        "--show-plot",
+        action=argparse.BooleanOptionalAction,
         default=True,
         help="Display the pixels in an additional matplotlib figure.",
     )
-    parser.add_argument("--render_mode", type=str, choices=("depth", "rgb"), default="depth", help="")
+    parser.add_argument("--render-mode", type=str, choices=("depth", "rgb"), default="depth", help="")
     parser.add_argument(
-        "--split_up_tiles",
-        type=lambda x: bool(distutils.util.strtobool(x.strip())),
+        "--split-up-tiles",
+        action=argparse.BooleanOptionalAction,
         default=True,
-        help="Whether to split tiles into subplots when --show_plot is True.",
+        help="Whether to split tiles into subplots when --show-plot is True.",
     )
-    parser.add_argument("--custom_tile_arrangement", action="store_true", help="Apply custom tile arrangement.")
+    parser.add_argument("--custom-tile-arrangement", action="store_true", help="Apply custom tile arrangement.")
     parser.add_argument(
-        "--use_imgui",
-        type=lambda x: bool(distutils.util.strtobool(x.strip())),
+        "--use-imgui",
+        action=argparse.BooleanOptionalAction,
         default=True,
         help="Enable or disable the ImGui window.",
     )
@@ -484,7 +471,7 @@ if __name__ == "__main__":
             if args.split_up_tiles:
                 pixels = wp.zeros(
                     (args.num_tiles, example.renderer.tile_height, example.renderer.tile_width, channels),
-                    dtype=wp.float32,
+                    dtype=float,
                 )
                 ncols = int(np.ceil(np.sqrt(args.num_tiles)))
                 nrows = int(np.ceil(args.num_tiles / float(ncols)))
@@ -521,7 +508,7 @@ if __name__ == "__main__":
             else:
                 fig = plt.figure(1)
                 pixels = wp.zeros(
-                    (example.renderer.screen_height, example.renderer.screen_width, channels), dtype=wp.float32
+                    (example.renderer.screen_height, example.renderer.screen_width, channels), dtype=float
                 )
                 if args.render_mode == "depth":
                     img_plot = plt.imshow(
@@ -544,7 +531,7 @@ if __name__ == "__main__":
 
                 if pixel_shape != pixels.shape:
                     # make sure we resize the pixels array to the right dimensions if the user resizes the window
-                    pixels = wp.zeros(pixel_shape, dtype=wp.float32)
+                    pixels = wp.zeros(pixel_shape, dtype=float)
 
                 example.renderer.get_pixels(pixels, split_up_tiles=args.split_up_tiles, mode=args.render_mode)
 

@@ -1,26 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import functools
 from enum import Enum
-from typing import Optional
 
+import warp as wp
 from warp._src.fem.geometry import Element
 from warp._src.fem.polynomial import Polynomial
 
 from .cube_shape_function import (
+    CubeBSplineShapeFunctions,
     CubeNedelecFirstKindShapeFunctions,
     CubeNonConformingPolynomialShapeFunctions,
     CubeRaviartThomasShapeFunctions,
@@ -31,6 +20,7 @@ from .cube_shape_function import (
 from .shape_function import ConstantShapeFunction, ShapeFunction
 from .square_shape_function import (
     SquareBipolynomialShapeFunctions,
+    SquareBSplineShapeFunctions,
     SquareNedelecFirstKindShapeFunctions,
     SquareNonConformingPolynomialShapeFunctions,
     SquareRaviartThomasShapeFunctions,
@@ -66,14 +56,17 @@ class ElementBasis(Enum):
     """Nédélec (first kind) H(curl) shape functions. Should be used with covariant function space."""
     RAVIART_THOMAS = "RT"
     """Raviart-Thomas H(div) shape functions. Should be used with contravariant function space."""
+    BSPLINE = "B"
+    """B-spline basis functions. Should be used with grid-based geometries only."""
 
 
 @functools.cache
 def make_element_shape_function(
     element: Element,
     degree: int,
-    element_basis: Optional[ElementBasis] = None,
-    family: Optional[Polynomial] = None,
+    element_basis: ElementBasis | None = None,
+    family: Polynomial | None = None,
+    scalar_type: type | None = None,
 ) -> ShapeFunction:
     """Equip a reference element with a shape function basis.
 
@@ -90,6 +83,9 @@ def make_element_shape_function(
         NotImplementedError: If the shape function is not implemented for the given element type
     """
 
+    if scalar_type is None:
+        scalar_type = wp.float32
+
     if element_basis is None:
         element_basis = ElementBasis.LAGRANGE
     elif element_basis == ElementBasis.SERENDIPITY and degree == 1:
@@ -97,55 +93,59 @@ def make_element_shape_function(
         element_basis = ElementBasis.LAGRANGE
 
     if degree == 0:
-        return ConstantShapeFunction(element)
+        return ConstantShapeFunction(element, scalar_type=scalar_type)
 
     if family is None:
         family = Polynomial.LOBATTO_GAUSS_LEGENDRE
 
     if element == Element.SQUARE:
         if element_basis == ElementBasis.NEDELEC_FIRST_KIND:
-            return SquareNedelecFirstKindShapeFunctions(degree=degree)
+            return SquareNedelecFirstKindShapeFunctions(degree=degree, scalar_type=scalar_type)
         if element_basis == ElementBasis.RAVIART_THOMAS:
-            return SquareRaviartThomasShapeFunctions(degree=degree)
+            return SquareRaviartThomasShapeFunctions(degree=degree, scalar_type=scalar_type)
         if element_basis == ElementBasis.NONCONFORMING_POLYNOMIAL:
-            return SquareNonConformingPolynomialShapeFunctions(degree=degree)
+            return SquareNonConformingPolynomialShapeFunctions(degree=degree, scalar_type=scalar_type)
         if element_basis == ElementBasis.SERENDIPITY and degree > 1:
-            return SquareSerendipityShapeFunctions(degree=degree, family=family)
+            return SquareSerendipityShapeFunctions(degree=degree, family=family, scalar_type=scalar_type)
+        if element_basis == ElementBasis.BSPLINE:
+            return SquareBSplineShapeFunctions(degree=degree, scalar_type=scalar_type)
 
-        return SquareBipolynomialShapeFunctions(degree=degree, family=family)
+        return SquareBipolynomialShapeFunctions(degree=degree, family=family, scalar_type=scalar_type)
     if element == Element.TRIANGLE:
         if element_basis == ElementBasis.NEDELEC_FIRST_KIND:
-            return TriangleNedelecFirstKindShapeFunctions(degree=degree)
+            return TriangleNedelecFirstKindShapeFunctions(degree=degree, scalar_type=scalar_type)
         if element_basis == ElementBasis.RAVIART_THOMAS:
-            return TriangleRaviartThomasShapeFunctions(degree=degree)
+            return TriangleRaviartThomasShapeFunctions(degree=degree, scalar_type=scalar_type)
         if element_basis == ElementBasis.NONCONFORMING_POLYNOMIAL:
-            return TriangleNonConformingPolynomialShapeFunctions(degree=degree)
+            return TriangleNonConformingPolynomialShapeFunctions(degree=degree, scalar_type=scalar_type)
         if element_basis == ElementBasis.SERENDIPITY and degree > 2:
             raise NotImplementedError("Serendipity variant not implemented yet for Triangle elements")
 
-        return TrianglePolynomialShapeFunctions(degree=degree)
+        return TrianglePolynomialShapeFunctions(degree=degree, scalar_type=scalar_type)
 
     if element == Element.CUBE:
         if element_basis == ElementBasis.NEDELEC_FIRST_KIND:
-            return CubeNedelecFirstKindShapeFunctions(degree=degree)
+            return CubeNedelecFirstKindShapeFunctions(degree=degree, scalar_type=scalar_type)
         if element_basis == ElementBasis.RAVIART_THOMAS:
-            return CubeRaviartThomasShapeFunctions(degree=degree)
+            return CubeRaviartThomasShapeFunctions(degree=degree, scalar_type=scalar_type)
         if element_basis == ElementBasis.NONCONFORMING_POLYNOMIAL:
-            return CubeNonConformingPolynomialShapeFunctions(degree=degree)
+            return CubeNonConformingPolynomialShapeFunctions(degree=degree, scalar_type=scalar_type)
         if element_basis == ElementBasis.SERENDIPITY and degree > 1:
-            return CubeSerendipityShapeFunctions(degree=degree, family=family)
+            return CubeSerendipityShapeFunctions(degree=degree, family=family, scalar_type=scalar_type)
+        if element_basis == ElementBasis.BSPLINE:
+            return CubeBSplineShapeFunctions(degree=degree, scalar_type=scalar_type)
 
-        return CubeTripolynomialShapeFunctions(degree=degree, family=family)
+        return CubeTripolynomialShapeFunctions(degree=degree, family=family, scalar_type=scalar_type)
     if element == Element.TETRAHEDRON:
         if element_basis == ElementBasis.NEDELEC_FIRST_KIND:
-            return TetrahedronNedelecFirstKindShapeFunctions(degree=degree)
+            return TetrahedronNedelecFirstKindShapeFunctions(degree=degree, scalar_type=scalar_type)
         if element_basis == ElementBasis.RAVIART_THOMAS:
-            return TetrahedronRaviartThomasShapeFunctions(degree=degree)
+            return TetrahedronRaviartThomasShapeFunctions(degree=degree, scalar_type=scalar_type)
         if element_basis == ElementBasis.NONCONFORMING_POLYNOMIAL:
-            return TetrahedronNonConformingPolynomialShapeFunctions(degree=degree)
+            return TetrahedronNonConformingPolynomialShapeFunctions(degree=degree, scalar_type=scalar_type)
         if element_basis == ElementBasis.SERENDIPITY and degree > 2:
             raise NotImplementedError("Serendipity variant not implemented yet for Tet elements")
 
-        return TetrahedronPolynomialShapeFunctions(degree=degree)
+        return TetrahedronPolynomialShapeFunctions(degree=degree, scalar_type=scalar_type)
 
     raise NotImplementedError(f"Unrecognized element type {element}")

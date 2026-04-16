@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 ###########################################################################
 # Example Fluid
@@ -31,7 +19,7 @@ grid_height = wp.constant(128)
 
 
 @wp.func
-def lookup_float(f: wp.array2d(dtype=float), x: int, y: int):
+def lookup_float(f: wp.array2d[float], x: int, y: int):
     x = wp.clamp(x, 0, grid_width - 1)
     y = wp.clamp(y, 0, grid_height - 1)
 
@@ -39,7 +27,7 @@ def lookup_float(f: wp.array2d(dtype=float), x: int, y: int):
 
 
 @wp.func
-def sample_float(f: wp.array2d(dtype=float), x: float, y: float):
+def sample_float(f: wp.array2d[float], x: float, y: float):
     lx = int(wp.floor(x))
     ly = int(wp.floor(y))
 
@@ -54,7 +42,7 @@ def sample_float(f: wp.array2d(dtype=float), x: float, y: float):
 
 
 @wp.func
-def lookup_vel(f: wp.array2d(dtype=wp.vec2), x: int, y: int):
+def lookup_vel(f: wp.array2d[wp.vec2], x: int, y: int):
     if x < 0 or x >= grid_width:
         return wp.vec2()
     if y < 0 or y >= grid_height:
@@ -64,7 +52,7 @@ def lookup_vel(f: wp.array2d(dtype=wp.vec2), x: int, y: int):
 
 
 @wp.func
-def sample_vel(f: wp.array2d(dtype=wp.vec2), x: float, y: float):
+def sample_vel(f: wp.array2d[wp.vec2], x: float, y: float):
     lx = int(wp.floor(x))
     ly = int(wp.floor(y))
 
@@ -80,10 +68,10 @@ def sample_vel(f: wp.array2d(dtype=wp.vec2), x: float, y: float):
 
 @wp.kernel
 def advect(
-    u0: wp.array2d(dtype=wp.vec2),
-    u1: wp.array2d(dtype=wp.vec2),
-    rho0: wp.array2d(dtype=float),
-    rho1: wp.array2d(dtype=float),
+    u0: wp.array2d[wp.vec2],
+    u1: wp.array2d[wp.vec2],
+    rho0: wp.array2d[float],
+    rho1: wp.array2d[float],
     dt: float,
 ):
     i, j = wp.tid()
@@ -100,7 +88,7 @@ def advect(
 
 
 @wp.kernel
-def divergence(u: wp.array2d(dtype=wp.vec2), div: wp.array2d(dtype=float)):
+def divergence(u: wp.array2d[wp.vec2], div: wp.array2d[float]):
     i, j = wp.tid()
 
     if i == grid_width - 1:
@@ -115,7 +103,7 @@ def divergence(u: wp.array2d(dtype=wp.vec2), div: wp.array2d(dtype=float)):
 
 
 @wp.kernel
-def pressure_solve(p0: wp.array2d(dtype=float), p1: wp.array2d(dtype=float), div: wp.array2d(dtype=float)):
+def pressure_solve(p0: wp.array2d[float], p1: wp.array2d[float], div: wp.array2d[float]):
     i, j = wp.tid()
 
     s1 = lookup_float(p0, i - 1, j)
@@ -130,7 +118,7 @@ def pressure_solve(p0: wp.array2d(dtype=float), p1: wp.array2d(dtype=float), div
 
 
 @wp.kernel
-def pressure_apply(p: wp.array2d(dtype=float), u: wp.array2d(dtype=wp.vec2)):
+def pressure_apply(p: wp.array2d[float], u: wp.array2d[wp.vec2]):
     i, j = wp.tid()
 
     if i == 0 or i == grid_width - 1:
@@ -145,7 +133,7 @@ def pressure_apply(p: wp.array2d(dtype=float), u: wp.array2d(dtype=wp.vec2)):
 
 
 @wp.kernel
-def integrate(u: wp.array2d(dtype=wp.vec2), rho: wp.array2d(dtype=float), dt: float):
+def integrate(u: wp.array2d[wp.vec2], rho: wp.array2d[float], dt: float):
     i, j = wp.tid()
 
     # gravity
@@ -159,7 +147,7 @@ def integrate(u: wp.array2d(dtype=wp.vec2), rho: wp.array2d(dtype=float), dt: fl
 
 
 @wp.kernel
-def init(rho: wp.array2d(dtype=float), u: wp.array2d(dtype=wp.vec2), radius: int, dir: wp.vec2):
+def init(rho: wp.array2d[float], u: wp.array2d[wp.vec2], radius: int, dir: wp.vec2):
     i, j = wp.tid()
 
     d = wp.length(wp.vec2(float(i - grid_width / 2), float(j - grid_height / 2)))
@@ -257,7 +245,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--device", type=str, default=None, help="Override the default Warp device.")
-    parser.add_argument("--num_frames", type=int, default=100000, help="Total number of frames.")
+    parser.add_argument("--num-frames", type=int, default=100000, help="Total number of frames.")
     parser.add_argument(
         "--headless",
         action="store_true",

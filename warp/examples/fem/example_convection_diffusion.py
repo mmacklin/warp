@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 ###########################################################################
 # Example Convection Diffusion
@@ -132,7 +120,9 @@ class Example:
         )
 
         # Solve linear system
-        fem_example_utils.bsr_cg(self._matrix, x=self._phi_field.dof_values, b=rhs, quiet=self._quiet, tol=1.0e-12)
+        fem_example_utils.bsr_cg(
+            self._matrix, x=self._phi_field.dof_values, b=rhs, quiet=not wp.config.verbose, tol=1.0e-12
+        )
 
     def render(self):
         self.renderer.begin_frame(time=self.current_frame * self.sim_dt)
@@ -149,9 +139,9 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default=None, help="Override the default Warp device.")
     parser.add_argument("--resolution", type=int, default=50, help="Grid resolution.")
     parser.add_argument("--degree", type=int, default=2, help="Polynomial degree of shape functions.")
-    parser.add_argument("--num_frames", type=int, default=250, help="Total number of frames.")
+    parser.add_argument("--num-frames", type=int, default=250, help="Total number of frames.")
     parser.add_argument("--viscosity", type=float, default=0.001, help="Fluid viscosity parameter.")
-    parser.add_argument("--ang_vel", type=float, default=1.0, help="Angular velocity.")
+    parser.add_argument("--ang-vel", type=float, default=1.0, help="Angular velocity.")
     parser.add_argument("--mesh", choices=("grid", "tri", "quad"), default="grid", help="Mesh type.")
     parser.add_argument(
         "--headless",
@@ -172,8 +162,7 @@ if __name__ == "__main__":
             ang_vel=args.ang_vel,
         )
 
-        for k in range(args.num_frames):
-            print(f"Frame {k}:")
+        for _k, _ in fem_example_utils.progress_bar(args.num_frames, quiet=args.quiet):
             example.step()
             example.render()
 

@@ -1,19 +1,5 @@
-/*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: Apache-2.0
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 /*
  * Example: Loading and launching Warp-compiled kernels from C++
@@ -116,7 +102,7 @@ int main(int argc, char** argv)
 
     // Prepare kernel parameters
     // CRITICAL: Using positional initialization for MSVC compatibility
-    wp::launch_bounds_t dim = { { ARRAY_SIZE, 0, 0, 0 }, 1, size_t(ARRAY_SIZE) };
+    wp::launch_bounds_t<1> dim = { { ARRAY_SIZE }, size_t(ARRAY_SIZE), false };
     wp::array_t<wp::float32> arr_x(d_x, ARRAY_SIZE);
     wp::array_t<wp::float32> arr_y(d_y, ARRAY_SIZE);
     wp::float32 alpha_scalar = ALPHA;

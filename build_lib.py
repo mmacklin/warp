@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.9"
+# requires-python = ">=3.10"
 # dependencies = [
 #     "numpy",
 # ]
@@ -7,18 +7,6 @@
 
 # SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 # This script is an 'offline' build of the core warp runtime libraries
 # designed to be executed as part of CI / developer workflows, not
@@ -27,6 +15,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import datetime
 import glob
 import os
@@ -34,11 +23,12 @@ import platform
 import shutil
 import subprocess
 import sys
+import time
 
 import build_llvm
 import warp._src.build_dll as build_dll
 import warp.config as config
-from warp._src.context import export_builtins
+from warp._src.generated_files import generate_exports_header_file, generate_version_header
 
 
 def handle_ci_nightly_build(base_path: str) -> str | None:
@@ -90,40 +80,6 @@ def handle_ci_nightly_build(base_path: str) -> str | None:
         update_git_hash_in_config(config_file, git_hash, dry_run=False)
 
     return dev_version_string
-
-
-def generate_version_header(base_path: str, version: str) -> None:
-    """Generate version.h with WP_VERSION_STRING macro."""
-    version_header_path = os.path.join(base_path, "warp", "native", "version.h")
-    current_year = datetime.date.today().year
-
-    copyright_notice = f"""/*
- * SPDX-FileCopyrightText: Copyright (c) {current_year} NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: Apache-2.0
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
-"""
-
-    with open(version_header_path, "w") as f:
-        f.write(copyright_notice)
-        f.write("#ifndef WP_VERSION_H\n")
-        f.write("#define WP_VERSION_H\n\n")
-        f.write(f'#define WP_VERSION_STRING "{version}"\n\n')
-        f.write("#endif  // WP_VERSION_H\n")
-
-    print(f"Generated {version_header_path} with version {version}")
 
 
 def find_cuda_sdk() -> str | None:
@@ -207,33 +163,45 @@ def find_libmathdx(cuda_toolkit_major_version: int, base_path: str) -> str | Non
     else:
         raise RuntimeError(f"Unsupported platform for libmathdx: {platform.system()}")
 
-    try:
-        output = subprocess.check_output(
-            [
-                packman,
-                "pull",
-                "--verbose",
-                "--platform",
-                f"{platform.system()}-{build_dll.machine_architecture()}".lower(),
-                "--include-tag",
-                f"cu{cuda_toolkit_major_version}",
-                os.path.join(base_path, "deps", "libmathdx-deps.packman.xml"),
-            ],
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        # Only print on verbose; caller controls this flag via build_dll.verbose_cmd
-        if build_dll.verbose_cmd:
-            print(output, end="")
-    except subprocess.CalledProcessError as e:
-        print(e.output)
+    packman_cmd = [
+        packman,
+        "pull",
+        "--verbose",
+        "--platform",
+        f"{platform.system()}-{build_dll.machine_architecture()}".lower(),
+        "--include-tag",
+        f"cu{cuda_toolkit_major_version}",
+        os.path.join(base_path, "deps", "libmathdx-deps.packman.xml"),
+    ]
 
-        # Check if the libmathdx target directory exists and is not a symbolic link
-        libmathdx_target_dir = os.path.join(base_path, "_build", "target-deps", "libmathdx")
-        if os.path.exists(libmathdx_target_dir) and not os.path.islink(libmathdx_target_dir):
-            print(f"\nError: {libmathdx_target_dir} exists and is not a symbolic link.")
-            print("Please try deleting this folder and running the script again.")
-        raise
+    retry_delays = [10, 30, 60]
+    max_attempts = 1 + len(retry_delays)
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            output = subprocess.check_output(
+                packman_cmd,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            # Only print on verbose; caller controls this flag via build_dll.verbose_cmd
+            if build_dll.verbose_cmd:
+                print(output, end="")
+            break
+        except subprocess.CalledProcessError as e:
+            if attempt < max_attempts:
+                delay = retry_delays[attempt - 1]
+                print(f"Failed to fetch libmathdx (attempt {attempt}/{max_attempts}). Retrying in {delay}s...")
+                time.sleep(delay)
+            else:
+                print(e.output)
+
+                # Check if the libmathdx target directory exists and is not a symbolic link
+                libmathdx_target_dir = os.path.join(base_path, "_build", "target-deps", "libmathdx")
+                if os.path.exists(libmathdx_target_dir) and not os.path.islink(libmathdx_target_dir):
+                    print(f"\nError: {libmathdx_target_dir} exists and is not a symbolic link.")
+                    print("Please try deleting this folder and running the script again.")
+                raise
 
     # Success
     return os.path.join(base_path, "_build", "target-deps", "libmathdx")
@@ -247,45 +215,6 @@ def lib_name(name: str) -> str:
         return f"lib{name}.dylib"
     else:
         return f"{name}.so"
-
-
-def generate_exports_header_file(base_path: str) -> None:
-    """Generates warp/native/exports.h, which lets built-in functions be callable from outside kernels."""
-    export_path = os.path.join(base_path, "warp", "native", "exports.h")
-    os.makedirs(os.path.dirname(export_path), exist_ok=True)
-
-    try:
-        with open(export_path, "w") as f:
-            copyright_notice = """/*
- * SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: Apache-2.0
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
-"""
-            f.write(copyright_notice)
-            export_builtins(f)
-
-        print(f"Finished writing {export_path}")
-    except FileNotFoundError:
-        print(f"Error: The file '{export_path}' was not found.")
-    except PermissionError:
-        print(f"Error: Permission denied. Unable to write to '{export_path}'.")
-    except OSError as e:
-        print(f"Error: An OS-related error occurred: {e}")
-    except Exception as e:
-        print(f"An unexpected error occurred: {e}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -302,11 +231,15 @@ def main(argv: list[str] | None = None) -> int:
         default="release",
         help="Build configuration mode",
     )
+    try:
+        available_cpus = len(os.sched_getaffinity(0))
+    except AttributeError:
+        available_cpus = os.cpu_count() or 4
     parser.add_argument(
         "-j",
         "--jobs",
         type=int,
-        default=4,
+        default=min(available_cpus, 8),
         help="Number of concurrent build tasks",
     )
     parser.add_argument(
@@ -347,6 +280,12 @@ def main(argv: list[str] | None = None) -> int:
 
     # Build options
     group_build = parser.add_argument_group("Build Options")
+    group_build.add_argument(
+        "--cuda",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Build with CUDA support (auto-detects CUDA Toolkit). Use --no-cuda for a CPU-only build",
+    )
     group_build.add_argument(
         "--clang-build-toolchain",
         action=argparse.BooleanOptionalAction,
@@ -421,6 +360,15 @@ def main(argv: list[str] | None = None) -> int:
         print("  Use --build-llvm to build LLVM from source")
         return 1
 
+    # Validate --no-cuda conflicts
+    if not args.cuda:
+        if args.cuda_path:
+            print("Error: --no-cuda and --cuda-path are mutually exclusive.")
+            return 1
+        if args.clang_build_toolchain:
+            print("Error: --clang-build-toolchain requires CUDA (incompatible with --no-cuda).")
+            return 1
+
     # Warn if building on Intel Mac (cross-compiling for ARM64)
     if platform.system() == "Darwin" and platform.machine() == "x86_64":
         print("=" * 80)
@@ -453,8 +401,11 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     # setup CUDA Toolkit path
-    if platform.system() == "Darwin":
+    if platform.system() == "Darwin" or not args.cuda:
+        if not args.cuda:
+            print("CUDA support disabled (--no-cuda)")
         args.cuda_path = None
+        args.libmathdx_path = None
     else:
         if not args.cuda_path:
             args.cuda_path = find_cuda_sdk()
@@ -526,11 +477,13 @@ def main(argv: list[str] | None = None) -> int:
             "native/texture.cpp",
             "native/mathdx.cpp",
             "native/coloring.cpp",
+            "native/fastcall.cpp",
         ]
         warp_cpp_paths = [os.path.join(build_path, cpp) for cpp in cpp_sources]
 
         if args.cuda_path is None:
-            print("Warning: CUDA toolchain not found, building without CUDA support")
+            if args.cuda:
+                print("Warning: CUDA toolchain not found, building without CUDA support")
             warp_cu_paths = None
         else:
             cuda_sources = [
@@ -558,14 +511,46 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
 
         warp_dll_path = os.path.join(build_path, f"bin/{lib_name('warp')}")
-        build_dll.build_dll(args, dll_path=warp_dll_path, cpp_paths=warp_cpp_paths, cu_paths=warp_cu_paths)
 
-        # build warp-clang.dll
-        if args.standalone:
-            if args.build_llvm:
+        # Build warp.dll and warp-clang.dll in parallel (only when not building LLVM from source)
+        # Object files use unique names per target (derived from dll_path) to avoid conflicts
+        if args.standalone and not args.build_llvm:
+            import concurrent.futures  # noqa: PLC0415
+
+            # Set up PATH before spawning threads to avoid concurrent os.environ mutation
+            build_dll.add_llvm_bin_to_path(args)
+
+            # Halve jobs per sub-build to avoid oversubscribing CPUs
+            parallel_args = copy.copy(args)
+            parallel_args.jobs = max(1, args.jobs // 2)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                warp_future = executor.submit(
+                    build_dll.build_dll,
+                    parallel_args,
+                    dll_path=warp_dll_path,
+                    cpp_paths=warp_cpp_paths,
+                    cu_paths=warp_cu_paths,
+                )
+                clang_future = executor.submit(build_llvm.build_warp_clang, parallel_args, lib_name("warp-clang"))
+
+                # Wait for both and report all errors
+                errors = []
+                for future in concurrent.futures.as_completed([warp_future, clang_future]):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        errors.append(e)
+                if errors:
+                    for e in errors:
+                        print(f"Build error: {e}")
+                    raise errors[0]
+        else:
+            build_dll.build_dll(args, dll_path=warp_dll_path, cpp_paths=warp_cpp_paths, cu_paths=warp_cu_paths)
+
+            if args.standalone:
                 build_llvm.build_llvm_clang_from_source(args)
-
-            build_llvm.build_warp_clang(args, lib_name("warp-clang"))
+                build_llvm.build_warp_clang(args, lib_name("warp-clang"))
 
     except Exception as e:
         print(f"Warp build error: {e}")
@@ -583,6 +568,8 @@ def main(argv: list[str] | None = None) -> int:
         else:
             # Clear kernel cache in subprocess (ensures fresh import of updated config.py)
             print("Clearing kernel cache...")
+            sys.stdout.flush()
+            sys.stderr.flush()
             result = subprocess.run(
                 [
                     sys.executable,
@@ -594,9 +581,25 @@ def main(argv: list[str] | None = None) -> int:
             )
             if result.returncode != 0:
                 print(f"Warning: Failed to clear kernel cache (exit code {result.returncode})")
+
+            # Flush build output before printing diagnostics so log ordering is correct
+            sys.stdout.flush()
+            sys.stderr.flush()
+
+            # Print build diagnostics (subprocess ensures fresh import of rebuilt libraries)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import warp; warp.print_diagnostics()",
+                ],
+                cwd=base_path,
+                check=False,
+            )
     except Exception as e:
         print(f"Unable to clear kernel cache: {e}")
 
+    print("Warp build succeeded")
     return 0
 
 

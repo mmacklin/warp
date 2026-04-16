@@ -1,17 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+
+from typing import Any
 
 import numpy as np
 
@@ -21,7 +11,7 @@ from warp._src.fem.geometry import Grid2D
 from warp._src.fem.polynomial import is_closed
 from warp._src.fem.types import NULL_NODE_INDEX, ElementIndex
 
-from .shape import SquareBipolynomialShapeFunctions, SquareShapeFunction
+from .shape import SquareBipolynomialShapeFunctions, SquareBSplineShapeFunctions, SquareShapeFunction
 from .topology import SpaceTopology, forward_base_topology
 
 _wp_module_name_ = "warp.fem.space.grid_2d_function_space"
@@ -30,17 +20,15 @@ _wp_module_name_ = "warp.fem.space.grid_2d_function_space"
 class Grid2DSpaceTopology(SpaceTopology):
     def __init__(self, grid: Grid2D, shape: SquareShapeFunction):
         self._shape = shape
+        self.TopologyArg = grid.SideArg
         super().__init__(grid, shape.NODES_PER_ELEMENT)
-
         self.element_node_index = self._make_element_node_index()
-
-    TopologyArg = Grid2D.SideArg
 
     @property
     def name(self):
         return f"{self.geometry.name}_{self._shape.name}"
 
-    def fill_topo_arg(self, arg: Grid2D.SideArg, device):
+    def fill_topo_arg(self, arg, device):
         self.geometry.fill_side_arg(arg, device)
 
     def node_count(self) -> int:
@@ -57,8 +45,8 @@ class Grid2DSpaceTopology(SpaceTopology):
 
         @cache.dynamic_func(suffix=self.name)
         def element_node_index(
-            cell_arg: Grid2D.CellArg,
-            topo_arg: Grid2D.SideArg,
+            cell_arg: self.geometry.CellArg,
+            topo_arg: self.TopologyArg,
             element_index: ElementIndex,
             node_index_in_elt: int,
         ):
@@ -89,7 +77,7 @@ class Grid2DSpaceTopology(SpaceTopology):
                 origin = Grid2D.orient(axis, cell) + wp.vec2i(type_instance, 0)
 
                 side = Grid2D.Side(axis, origin)
-                side_index = Grid2D.side_index(topo_arg, side)
+                side_index = self.geometry._side_index(topo_arg, side)
 
                 vertex_count = (res[0] + 1) * (res[1] + 1)
 
@@ -106,7 +94,7 @@ class Grid2DSpaceTopology(SpaceTopology):
         return wp.vec2i(x, y)
 
     @wp.func
-    def _vertex_index(cell_arg: Grid2D.CellArg, cell_index: ElementIndex, vidx_in_cell: int):
+    def _vertex_index(cell_arg: Any, cell_index: ElementIndex, vidx_in_cell: int):
         res = cell_arg.res
         x_stride = res[1] + 1
 
@@ -128,7 +116,7 @@ class GridBipolynomialSpaceTopology(SpaceTopology):
 
         @cache.dynamic_func(suffix=self.name)
         def element_node_index(
-            cell_arg: Grid2D.CellArg,
+            cell_arg: self.geometry.CellArg,
             topo_arg: self.TopologyArg,
             element_index: ElementIndex,
             node_index_in_elt: int,
@@ -169,9 +157,61 @@ class GridBipolynomialSpaceTopology(SpaceTopology):
         return np.meshgrid(X, Y, indexing="ij")
 
 
+class GridBSplineSpaceTopology(SpaceTopology):
+    def __init__(self, grid: Grid2D, shape: SquareBSplineShapeFunctions):
+        super().__init__(grid, shape.NODES_PER_ELEMENT)
+        self._shape = shape
+
+        self._padding = self._shape.PADDING
+
+        self.element_node_index = self._make_element_node_index()
+
+    def node_count(self) -> int:
+        return (self.geometry.res[0] + 2 * self._padding + 1) * (self.geometry.res[1] + 2 * self._padding + 1)
+
+    def _make_element_node_index(self):
+        PADDING = self._padding
+
+        @cache.dynamic_func(suffix=self.name)
+        def element_node_index(
+            cell_arg: self.geometry.CellArg,
+            topo_arg: self.TopologyArg,
+            element_index: ElementIndex,
+            node_index_in_elt: int,
+        ):
+            res = cell_arg.res
+            cell = Grid2D.get_cell(res, element_index)
+
+            node_i, node_j = self._shape._node_ij(node_index_in_elt)
+
+            node_x = cell[0] + node_i + PADDING
+            node_y = cell[1] + node_j + PADDING
+
+            node_pitch_y = res[1] + 2 * PADDING + 1
+            node_index = node_pitch_y * node_x + node_y
+
+            return node_index
+
+        return element_node_index
+
+    def node_grid(self):
+        res = self.geometry.res + 2 * self._padding + 1
+
+        grid_coords_x = np.arange(0, res[0], dtype=float) - self._padding
+        X = grid_coords_x * self.geometry.cell_size[0] + self.geometry.origin[0]
+
+        grid_coords_y = np.arange(0, res[1], dtype=float) - self._padding
+        Y = grid_coords_y * self.geometry.cell_size[1] + self.geometry.origin[1]
+
+        return np.meshgrid(X, Y, indexing="ij")
+
+
 def make_grid_2d_space_topology(grid: Grid2D, shape: SquareShapeFunction):
     if isinstance(shape, SquareBipolynomialShapeFunctions) and is_closed(shape.family):
         return forward_base_topology(GridBipolynomialSpaceTopology, grid, shape)
+
+    if isinstance(shape, SquareBSplineShapeFunctions):
+        return forward_base_topology(GridBSplineSpaceTopology, grid, shape)
 
     if isinstance(shape, SquareShapeFunction):
         return forward_base_topology(Grid2DSpaceTopology, grid, shape)

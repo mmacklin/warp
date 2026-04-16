@@ -1,19 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import unittest
+from typing import Any
 
 import numpy as np
 
@@ -29,8 +18,11 @@ TILE_K = wp.constant(8)
 # num threads per-tile
 TILE_DIM = 32
 
+# Forward-only kernels skip adjoint codegen
+wp.get_module("test_cholesky_fwd").options["enable_backward"] = False
 
-@wp.kernel()
+
+@wp.kernel(module="test_cholesky_fwd")
 def tile_math_cholesky(
     gA: wp.array2d(dtype=wp.float64),
     gD: wp.array1d(dtype=wp.float64),
@@ -81,7 +73,7 @@ def test_tile_cholesky_cholesky(test, device):
     # TODO: implement and test backward pass
 
 
-@wp.kernel()
+@wp.kernel(module="test_cholesky_fwd")
 def tile_math_cholesky_inplace(
     gA: wp.array2d(dtype=wp.float64),
     gy: wp.array1d(dtype=wp.float64),
@@ -115,7 +107,7 @@ def test_tile_cholesky_cholesky_inplace(test, device):
     np.testing.assert_allclose(A_wp.numpy(), L_h)
 
 
-@wp.kernel()
+@wp.kernel(module="test_cholesky_fwd")
 def tile_math_cholesky_multiple_rhs(
     gA: wp.array2d(dtype=wp.float64),
     gD: wp.array1d(dtype=wp.float64),
@@ -179,7 +171,7 @@ def test_tile_cholesky_cholesky_multiple_rhs(test, device):
     # TODO: implement and test backward pass
 
 
-@wp.kernel()
+@wp.kernel(module="test_cholesky_fwd")
 def tile_math_cholesky_multiple_rhs_inplace(
     gA: wp.array2d(dtype=wp.float64),
     gy: wp.array2d(dtype=wp.float64),
@@ -229,7 +221,7 @@ def test_tile_cholesky_cholesky_multiple_rhs_inplace(test, device):
     np.testing.assert_allclose(Z_wp.numpy(), Z_np)
 
 
-@wp.kernel
+@wp.kernel(module="test_cholesky_fwd")
 def tile_math_forward_substitution(
     gL: wp.array2d(dtype=wp.float64), gx: wp.array1d(dtype=wp.float64), gz: wp.array1d(dtype=wp.float64)
 ):
@@ -243,7 +235,7 @@ def tile_math_forward_substitution(
     wp.tile_store(gz, z)
 
 
-@wp.kernel
+@wp.kernel(module="test_cholesky_fwd")
 def tile_math_forward_substitution_inplace(gL: wp.array2d(dtype=wp.float64), gx: wp.array1d(dtype=wp.float64)):
     # Load L & x
     L = wp.tile_load(gL, shape=(TILE_M, TILE_M), storage="shared")
@@ -289,7 +281,7 @@ def test_tile_cholesky_forward_substitution(test, device):
     np.testing.assert_allclose(x_wp.numpy(), z_np)
 
 
-@wp.kernel
+@wp.kernel(module="test_cholesky_fwd")
 def tile_math_back_substitution(
     gL: wp.array2d(dtype=wp.float64), gx: wp.array1d(dtype=wp.float64), gz: wp.array1d(dtype=wp.float64)
 ):
@@ -303,7 +295,7 @@ def tile_math_back_substitution(
     wp.tile_store(gz, z)
 
 
-@wp.kernel
+@wp.kernel(module="test_cholesky_fwd")
 def tile_math_back_substitution_inplace(gL: wp.array2d(dtype=wp.float64), gx: wp.array1d(dtype=wp.float64)):
     # Load L & x
     L = wp.tile_load(gL, shape=(TILE_M, TILE_M), storage="shared")
@@ -349,7 +341,7 @@ def test_tile_cholesky_back_substitution(test, device):
     np.testing.assert_allclose(x_wp.numpy(), z_np)
 
 
-@wp.kernel
+@wp.kernel(module="test_cholesky_fwd")
 def tile_math_forward_substitution_multiple_rhs(
     gL: wp.array2d(dtype=wp.float64),
     gx: wp.array2d(dtype=wp.float64),
@@ -369,7 +361,7 @@ def tile_math_forward_substitution_multiple_rhs(
     wp.tile_store(gc, c)
 
 
-@wp.kernel
+@wp.kernel(module="test_cholesky_fwd")
 def tile_math_forward_substitution_multiple_rhs_inplace(
     gL: wp.array2d(dtype=wp.float64),
     gx: wp.array2d(dtype=wp.float64),
@@ -416,8 +408,8 @@ def test_tile_cholesky_forward_substitution_multiple_rhs(test, device):
     )
 
     # Verify results
-    test.assertTrue(np.allclose(z_wp.numpy(), z_np))
-    test.assertTrue(np.allclose(c_wp.numpy(), c_np))
+    np.testing.assert_allclose(z_wp.numpy(), z_np)
+    np.testing.assert_allclose(c_wp.numpy(), c_np)
 
     # TODO: implement and test backward pass
 
@@ -431,11 +423,11 @@ def test_tile_cholesky_forward_substitution_multiple_rhs(test, device):
     )
 
     # Verify results
-    test.assertTrue(np.allclose(x_wp.numpy(), z_np))
-    test.assertTrue(np.allclose(c_wp.numpy(), c_np))
+    np.testing.assert_allclose(x_wp.numpy(), z_np)
+    np.testing.assert_allclose(c_wp.numpy(), c_np)
 
 
-@wp.kernel
+@wp.kernel(module="test_cholesky_fwd")
 def tile_math_back_substitution_multiple_rhs(
     gL: wp.array2d(dtype=wp.float64),
     gx: wp.array2d(dtype=wp.float64),
@@ -455,7 +447,7 @@ def tile_math_back_substitution_multiple_rhs(
     wp.tile_store(gc, c)
 
 
-@wp.kernel
+@wp.kernel(module="test_cholesky_fwd")
 def tile_math_back_substitution_multiple_rhs_inplace(
     gL: wp.array2d(dtype=wp.float64),
     gx: wp.array2d(dtype=wp.float64),
@@ -502,8 +494,8 @@ def test_tile_cholesky_back_substitution_multiple_rhs(test, device):
     )
 
     # Verify results
-    test.assertTrue(np.allclose(z_wp.numpy(), z_np))
-    test.assertTrue(np.allclose(c_wp.numpy(), c_np))
+    np.testing.assert_allclose(z_wp.numpy(), z_np)
+    np.testing.assert_allclose(c_wp.numpy(), c_np)
 
     # TODO: implement and test backward pass
 
@@ -517,15 +509,211 @@ def test_tile_cholesky_back_substitution_multiple_rhs(test, device):
     )
 
     # Verify results
-    test.assertTrue(np.allclose(x_wp.numpy(), z_np))
-    test.assertTrue(np.allclose(c_wp.numpy(), c_np))
+    np.testing.assert_allclose(x_wp.numpy(), z_np)
+    np.testing.assert_allclose(c_wp.numpy(), c_np)
+
+
+@wp.kernel()
+def tile_cholesky_lower_backward_kernel(
+    gA: wp.array2d(dtype=Any),
+    gL: wp.array2d(dtype=Any),
+):
+    a = wp.tile_load(gA, shape=(TILE_M, TILE_M), storage="shared")
+    l = wp.tile_cholesky(a)
+    wp.tile_store(gL, l)
+
+
+wp.overload(
+    tile_cholesky_lower_backward_kernel, {"gA": wp.array2d(dtype=wp.float32), "gL": wp.array2d(dtype=wp.float32)}
+)
+wp.overload(
+    tile_cholesky_lower_backward_kernel, {"gA": wp.array2d(dtype=wp.float64), "gL": wp.array2d(dtype=wp.float64)}
+)
+
+
+def cholesky_adjoint_numpy_lower(L, adj_L):
+    """Analytic adjoint of Cholesky factorization (lower-triangle parameterization)."""
+    P = L.T @ adj_L
+    P = np.tril(P)
+    P[np.diag_indices_from(P)] *= 0.5
+    S = P + P.T
+    X = np.linalg.solve(L.T, S)
+    B = np.linalg.solve(L.T, X.T)
+    grad_A = np.tril(B)
+    grad_A[np.diag_indices_from(grad_A)] *= 0.5
+    return grad_A
+
+
+def _cholesky_lower_backward(A_np, adj_L, device, wp_dtype=wp.float64):
+    """Run tile Cholesky forward+backward, return (L_wp, grad_A) as NumPy arrays."""
+    np_dtype = wp.dtype_to_numpy(wp_dtype)
+    A_wp = wp.array(A_np.astype(np_dtype), dtype=wp_dtype, requires_grad=True, device=device)
+    L_wp = wp.zeros((TILE_M, TILE_M), dtype=wp_dtype, requires_grad=True, device=device)
+
+    with wp.Tape() as tape:
+        wp.launch_tiled(
+            tile_cholesky_lower_backward_kernel,
+            dim=[1, 1],
+            inputs=[A_wp, L_wp],
+            block_dim=TILE_DIM,
+            device=device,
+        )
+
+    tape.backward(grads={L_wp: wp.array(adj_L.astype(np_dtype), dtype=wp_dtype, device=device)})
+    return L_wp.numpy(), A_wp.grad.numpy()
+
+
+def test_tile_cholesky_lower_backward(dtype):
+    def test(test, device):
+        np_dtype = wp.dtype_to_numpy(dtype)
+        fwd_atol = 1e-10 if dtype == wp.float64 else 1e-4
+        bwd_atol = 1e-8 if dtype == wp.float64 else 1e-3
+        zero_atol = 0.0 if dtype == wp.float64 else 1e-6
+
+        def check(A_np, adj_L):
+            L_np = np.linalg.cholesky(A_np)
+            L_wp, grad_A = _cholesky_lower_backward(A_np, adj_L, device, wp_dtype=dtype)
+            grad_A_ref = cholesky_adjoint_numpy_lower(L_np, adj_L)
+            np.testing.assert_allclose(L_wp, L_np.astype(np_dtype), atol=fwd_atol)
+            np.testing.assert_allclose(np.tril(grad_A), grad_A_ref.astype(np_dtype), atol=bwd_atol)
+            np.testing.assert_allclose(np.triu(grad_A, k=1), 0.0, atol=zero_atol)
+
+        # Random SPD
+        rng = np.random.default_rng(42)
+        M = rng.random((TILE_M, TILE_M))
+        check(M.T @ M + 8.0 * np.eye(TILE_M), rng.standard_normal((TILE_M, TILE_M)))
+
+        # Identity - closed-form adjoint (independent of Murray formula):
+        # Linearize A = LL^T at L = I: dA = dL + dL^T, so adj_A = tril(adj_L) with halved diagonal.
+        rng = np.random.default_rng(100)
+        adj_L = rng.standard_normal((TILE_M, TILE_M))
+        L_wp, grad_A = _cholesky_lower_backward(np.eye(TILE_M), adj_L, device, wp_dtype=dtype)
+        grad_A_ref = np.tril(adj_L)
+        grad_A_ref[np.diag_indices_from(grad_A_ref)] *= 0.5
+        np.testing.assert_allclose(L_wp, np.eye(TILE_M, dtype=np_dtype), atol=fwd_atol)
+        np.testing.assert_allclose(np.tril(grad_A), grad_A_ref.astype(np_dtype), atol=bwd_atol)
+        np.testing.assert_allclose(np.triu(grad_A, k=1), 0.0, atol=zero_atol)
+
+        # Diagonal - closed-form adjoint (independent of Murray formula):
+        # Linearize A = LL^T at L = diag(s): dA = diag(s) dL^T + dL diag(s),
+        # so adj_A = tril(adj_L) / s[newaxis,:] with halved diagonal.
+        rng = np.random.default_rng(200)
+        d = rng.uniform(1.0, 10.0, TILE_M)
+        adj_L = rng.standard_normal((TILE_M, TILE_M))
+        s = np.sqrt(d)
+        L_wp, grad_A = _cholesky_lower_backward(np.diag(d), adj_L, device, wp_dtype=dtype)
+        grad_A_ref = np.tril(adj_L) / s[np.newaxis, :]
+        grad_A_ref[np.diag_indices_from(grad_A_ref)] *= 0.5
+        np.testing.assert_allclose(L_wp, np.diag(s).astype(np_dtype), atol=fwd_atol)
+        np.testing.assert_allclose(np.tril(grad_A), grad_A_ref.astype(np_dtype), atol=bwd_atol)
+        np.testing.assert_allclose(np.triu(grad_A, k=1), 0.0, atol=zero_atol)
+
+    return test
+
+
+@wp.kernel()
+def tile_cholesky_upper_backward_kernel(
+    gA: wp.array2d(dtype=Any),
+    gU: wp.array2d(dtype=Any),
+):
+    a = wp.tile_load(gA, shape=(TILE_M, TILE_M), storage="shared")
+    u = wp.tile_cholesky(a, fill_mode="upper")
+    wp.tile_store(gU, u)
+
+
+wp.overload(
+    tile_cholesky_upper_backward_kernel, {"gA": wp.array2d(dtype=wp.float32), "gU": wp.array2d(dtype=wp.float32)}
+)
+wp.overload(
+    tile_cholesky_upper_backward_kernel, {"gA": wp.array2d(dtype=wp.float64), "gU": wp.array2d(dtype=wp.float64)}
+)
+
+
+def cholesky_adjoint_numpy_upper(U, adj_U):
+    """Analytic adjoint of Cholesky factorization (upper-triangle parameterization)."""
+    P = adj_U @ U.T
+    P = np.triu(P)
+    P[np.diag_indices_from(P)] *= 0.5
+    S = P + P.T
+    X = np.linalg.solve(U, S)
+    B = np.linalg.solve(U, X.T)
+    grad_A = np.triu(B)
+    grad_A[np.diag_indices_from(grad_A)] *= 0.5
+    return grad_A
+
+
+def _cholesky_upper_backward(A_np, adj_U, device, wp_dtype=wp.float64):
+    """Run tile Cholesky(upper) forward+backward, return (U_wp, grad_A) as NumPy arrays."""
+    np_dtype = wp.dtype_to_numpy(wp_dtype)
+    A_wp = wp.array(A_np.astype(np_dtype), dtype=wp_dtype, requires_grad=True, device=device)
+    U_wp = wp.zeros((TILE_M, TILE_M), dtype=wp_dtype, requires_grad=True, device=device)
+
+    with wp.Tape() as tape:
+        wp.launch_tiled(
+            tile_cholesky_upper_backward_kernel,
+            dim=[1, 1],
+            inputs=[A_wp, U_wp],
+            block_dim=TILE_DIM,
+            device=device,
+        )
+
+    tape.backward(grads={U_wp: wp.array(adj_U.astype(np_dtype), dtype=wp_dtype, device=device)})
+    return U_wp.numpy(), A_wp.grad.numpy()
+
+
+def test_tile_cholesky_upper_backward(dtype):
+    def test(test, device):
+        np_dtype = wp.dtype_to_numpy(dtype)
+        fwd_atol = 1e-10 if dtype == wp.float64 else 1e-4
+        bwd_atol = 1e-8 if dtype == wp.float64 else 1e-3
+        zero_atol = 0.0 if dtype == wp.float64 else 1e-6
+
+        def check(A_np, adj_U):
+            U_np = np.linalg.cholesky(A_np).T
+            U_wp, grad_A = _cholesky_upper_backward(A_np, adj_U, device, wp_dtype=dtype)
+            grad_A_ref = cholesky_adjoint_numpy_upper(U_np, adj_U)
+            np.testing.assert_allclose(U_wp, U_np.astype(np_dtype), atol=fwd_atol)
+            np.testing.assert_allclose(np.triu(grad_A), grad_A_ref.astype(np_dtype), atol=bwd_atol)
+            np.testing.assert_allclose(np.tril(grad_A, k=-1), 0.0, atol=zero_atol)
+
+        # Random SPD
+        rng = np.random.default_rng(42)
+        M = rng.random((TILE_M, TILE_M))
+        check(M.T @ M + 8.0 * np.eye(TILE_M), rng.standard_normal((TILE_M, TILE_M)))
+
+        # Identity - closed-form adjoint (independent of Murray formula):
+        # Linearize A = U^TU at U = I: dA = dU^T + dU, so adj_A = triu(adj_U) with halved diagonal.
+        rng = np.random.default_rng(100)
+        adj_U = rng.standard_normal((TILE_M, TILE_M))
+        U_wp, grad_A = _cholesky_upper_backward(np.eye(TILE_M), adj_U, device, wp_dtype=dtype)
+        grad_A_ref = np.triu(adj_U)
+        grad_A_ref[np.diag_indices_from(grad_A_ref)] *= 0.5
+        np.testing.assert_allclose(U_wp, np.eye(TILE_M, dtype=np_dtype), atol=fwd_atol)
+        np.testing.assert_allclose(np.triu(grad_A), grad_A_ref.astype(np_dtype), atol=bwd_atol)
+        np.testing.assert_allclose(np.tril(grad_A, k=-1), 0.0, atol=zero_atol)
+
+        # Diagonal - closed-form adjoint (independent of Murray formula):
+        # Linearize A = U^TU at U = diag(s): dA = dU^T diag(s) + diag(s) dU,
+        # so adj_A = triu(adj_U) / s[:,newaxis] with halved diagonal.
+        rng = np.random.default_rng(200)
+        d = rng.uniform(1.0, 10.0, TILE_M)
+        adj_U = rng.standard_normal((TILE_M, TILE_M))
+        s = np.sqrt(d)
+        U_wp, grad_A = _cholesky_upper_backward(np.diag(d), adj_U, device, wp_dtype=dtype)
+        grad_A_ref = np.triu(adj_U) / s[:, np.newaxis]
+        grad_A_ref[np.diag_indices_from(grad_A_ref)] *= 0.5
+        np.testing.assert_allclose(U_wp, np.diag(s).astype(np_dtype), atol=fwd_atol)
+        np.testing.assert_allclose(np.triu(grad_A), grad_A_ref.astype(np_dtype), atol=bwd_atol)
+        np.testing.assert_allclose(np.tril(grad_A, k=-1), 0.0, atol=zero_atol)
+
+    return test
 
 
 # tests a complex composition of most libmathdx calls
 def test_tile_cholesky_block_cholesky(test, device):
     BLOCK_SIZE = wp.constant(TILE_M // 2)
 
-    @wp.kernel(module="unique")
+    @wp.kernel(enable_backward=False, module="unique")
     def block_cholesky_kernel(
         A: wp.array2d(dtype=float),
         L: wp.array2d(dtype=float),
@@ -569,7 +757,7 @@ def test_tile_cholesky_block_cholesky(test, device):
 
                 wp.tile_store(L, sol_tile, offset=(i, k))
 
-    @wp.kernel(module="unique")
+    @wp.kernel(enable_backward=False, module="unique")
     def block_cholesky_solve_kernel(
         L: wp.array2d(dtype=float),
         b: wp.array2d(dtype=float),
@@ -642,7 +830,7 @@ def test_tile_cholesky_block_cholesky(test, device):
     assert_np_equal(x_wp.numpy(), x_np, tol=1e-6)
 
 
-@wp.kernel
+@wp.kernel(module="test_cholesky_fwd")
 def test_tile_lower_solve(L: wp.array2d(dtype=float), y: wp.array(dtype=float), x: wp.array(dtype=float)):
     L_tile = wp.tile_load(L, shape=(TILE_M, TILE_M))
     y_tile = wp.tile_load(x, shape=(TILE_M,))
@@ -650,7 +838,7 @@ def test_tile_lower_solve(L: wp.array2d(dtype=float), y: wp.array(dtype=float), 
     wp.tile_store(x, sol)
 
 
-@wp.kernel
+@wp.kernel(module="test_cholesky_fwd")
 def test_tile_upper_solve(L: wp.array2d(dtype=float), y: wp.array(dtype=float), x: wp.array(dtype=float)):
     L_tile = wp.tile_load(L, shape=(TILE_M, TILE_M))
     y_tile = wp.tile_load(x, shape=(TILE_M,))
@@ -689,6 +877,314 @@ def test_tile_cholesky_singular_matrices(test, device):
     )
 
     test.assertTrue(np.isnan(x_wp.numpy()).any())
+
+
+@wp.kernel(module="test_cholesky_fwd")
+def tile_math_cholesky_upper(
+    gA: wp.array2d(dtype=wp.float64),
+    gD: wp.array1d(dtype=wp.float64),
+    gU: wp.array2d(dtype=wp.float64),
+    gy: wp.array1d(dtype=wp.float64),
+    gx: wp.array1d(dtype=wp.float64),
+):
+    # Load A, D & y
+    a = wp.tile_load(gA, shape=(TILE_M, TILE_M), storage="shared")
+    d = wp.tile_load(gD, shape=TILE_M, storage="shared")
+    y = wp.tile_load(gy, shape=TILE_M, storage="shared")
+    # Ensure tile_diag_add() works with transposed matrices
+    a_t = wp.tile_transpose(a)
+    # Compute U st U^T U = A^T + diag(D)
+    b = wp.tile_diag_add(a_t, d)
+    u = wp.tile_cholesky(b, fill_mode="upper")
+    # Solve for x in U^T U x = y
+    x = wp.tile_cholesky_solve(u, y, fill_mode="upper")
+    # Store U & x
+    wp.tile_store(gU, u)
+    wp.tile_store(gx, x)
+
+
+def _test_tile_cholesky_upper_out_of_place(test, device, kernel, multiple_rhs):
+    """Shared test logic for tile_cholesky(fill_mode="upper") (out-of-place) with vector or matrix RHS."""
+    A_h = np.ones((TILE_M, TILE_M), dtype=np.float64)
+    D_h = 8.0 * np.ones(TILE_M, dtype=np.float64)
+
+    A_np = A_h.T + np.diag(D_h)
+    U_np = np.linalg.cholesky(A_np).T
+
+    if multiple_rhs:
+        Y_h = np.arange(TILE_M * TILE_M, dtype=np.float64).reshape((TILE_M, TILE_M))
+        X_np = np.linalg.solve(A_np, Y_h.T)
+        Z_np = X_np @ X_np
+
+        A_wp = wp.array(A_h, dtype=wp.float64, device=device)
+        D_wp = wp.array(D_h, dtype=wp.float64, device=device)
+        U_wp = wp.zeros((TILE_M, TILE_M), dtype=wp.float64, device=device)
+        Y_wp = wp.array(Y_h, dtype=wp.float64, device=device)
+        X_wp = wp.zeros_like(Y_wp)
+        Z_wp = wp.zeros_like(Y_wp)
+
+        wp.launch_tiled(
+            kernel, dim=[1, 1], inputs=[A_wp, D_wp, U_wp, Y_wp, X_wp, Z_wp], block_dim=TILE_DIM, device=device
+        )
+
+        np.testing.assert_allclose(U_wp.numpy(), U_np)
+        np.testing.assert_allclose(X_wp.numpy(), X_np)
+        np.testing.assert_allclose(Z_wp.numpy(), Z_np)
+    else:
+        Y_h = np.arange(TILE_M, dtype=np.float64)
+        X_np = np.linalg.solve(A_np, Y_h)
+
+        A_wp = wp.array(A_h, dtype=wp.float64, device=device)
+        D_wp = wp.array(D_h, dtype=wp.float64, device=device)
+        U_wp = wp.zeros((TILE_M, TILE_M), dtype=wp.float64, device=device)
+        Y_wp = wp.array(Y_h, dtype=wp.float64, device=device)
+        X_wp = wp.zeros_like(Y_wp)
+
+        wp.launch_tiled(kernel, dim=[1, 1], inputs=[A_wp, D_wp, U_wp, Y_wp, X_wp], block_dim=TILE_DIM, device=device)
+
+        np.testing.assert_allclose(U_wp.numpy(), U_np)
+        np.testing.assert_allclose(X_wp.numpy(), X_np)
+
+
+def test_tile_cholesky_upper(test, device):
+    _test_tile_cholesky_upper_out_of_place(test, device, tile_math_cholesky_upper, multiple_rhs=False)
+
+
+@wp.kernel(module="test_cholesky_fwd")
+def tile_math_cholesky_upper_inplace(
+    gA: wp.array2d(dtype=wp.float64),
+    gy: wp.array1d(dtype=wp.float64),
+):
+    # Load A & y
+    a = wp.tile_load(gA, shape=(TILE_M, TILE_M), storage="shared")
+    y = wp.tile_load(gy, shape=TILE_M, storage="shared")
+    # Compute U st U^T U = A inplace
+    wp.tile_cholesky_inplace(a, fill_mode="upper")
+    # Solve for x in U^T U x = y inplace
+    wp.tile_cholesky_solve_inplace(a, y, fill_mode="upper")
+    # Store U & y
+    wp.tile_store(gA, a)
+    wp.tile_store(gy, y)
+
+
+def _test_tile_cholesky_upper_inplace(test, device, kernel, multiple_rhs):
+    """Shared test logic for tile_cholesky_inplace(fill_mode="upper") with vector or matrix RHS."""
+    rng = np.random.default_rng(42)
+    L_h = np.tril(rng.random((TILE_M, TILE_M)))
+    U_h = L_h.T
+    A_h = U_h.T @ U_h
+
+    if multiple_rhs:
+        Y_h = np.arange(TILE_M * TILE_M, dtype=np.float64).reshape((TILE_M, TILE_M))
+        Y_sol_np = np.linalg.solve(A_h, Y_h.T)
+        Z_np = Y_sol_np @ Y_sol_np
+
+        A_wp = wp.array(A_h, dtype=wp.float64, device=device)
+        Y_wp = wp.array(Y_h, dtype=wp.float64, device=device)
+        Z_wp = wp.zeros_like(Y_wp)
+
+        wp.launch_tiled(kernel, dim=[1, 1], inputs=[A_wp, Y_wp, Z_wp], block_dim=TILE_DIM, device=device)
+
+        np.testing.assert_allclose(A_wp.numpy(), U_h)
+        np.testing.assert_allclose(Y_wp.numpy(), Y_sol_np)
+        np.testing.assert_allclose(Z_wp.numpy(), Z_np)
+    else:
+        Y_h = np.arange(TILE_M, dtype=np.float64)
+        Y_sol_np = np.linalg.solve(A_h, Y_h)
+
+        A_wp = wp.array(A_h, dtype=wp.float64, device=device)
+        Y_wp = wp.array(Y_h, dtype=wp.float64, device=device)
+
+        wp.launch_tiled(kernel, dim=[1, 1], inputs=[A_wp, Y_wp], block_dim=TILE_DIM, device=device)
+
+        np.testing.assert_allclose(Y_wp.numpy(), Y_sol_np)
+        np.testing.assert_allclose(A_wp.numpy(), U_h)
+
+
+def test_tile_cholesky_upper_inplace(test, device):
+    _test_tile_cholesky_upper_inplace(test, device, tile_math_cholesky_upper_inplace, multiple_rhs=False)
+
+
+@wp.kernel(module="test_cholesky_fwd")
+def tile_math_cholesky_upper_multiple_rhs(
+    gA: wp.array2d(dtype=wp.float64),
+    gD: wp.array1d(dtype=wp.float64),
+    gU: wp.array2d(dtype=wp.float64),
+    gy: wp.array2d(dtype=wp.float64),
+    gx: wp.array2d(dtype=wp.float64),
+    gz: wp.array2d(dtype=wp.float64),
+):
+    # Load A, D & y
+    a = wp.tile_load(gA, shape=(TILE_M, TILE_M), storage="shared")
+    d = wp.tile_load(gD, shape=TILE_M, storage="shared")
+    y = wp.tile_load(gy, shape=(TILE_M, TILE_M), storage="shared")
+    # Compute U st U^T U = A.T + diag(D)
+    a_t = wp.tile_transpose(a)
+    b = wp.tile_diag_add(a_t, d)
+    u = wp.tile_cholesky(b, fill_mode="upper")
+    # Solve for x in U^T U x = y.T
+    y_t = wp.tile_transpose(y)
+    x = wp.tile_cholesky_solve(u, y_t, fill_mode="upper")
+    # Ensure matmul receives correct layout information
+    z = wp.tile_matmul(x, x)
+    # Store U, x & z
+    wp.tile_store(gU, u)
+    wp.tile_store(gx, x)
+    wp.tile_store(gz, z)
+
+
+def test_tile_cholesky_upper_multiple_rhs(test, device):
+    _test_tile_cholesky_upper_out_of_place(test, device, tile_math_cholesky_upper_multiple_rhs, multiple_rhs=True)
+
+
+@wp.kernel(module="test_cholesky_fwd")
+def tile_math_cholesky_upper_multiple_rhs_inplace(
+    gA: wp.array2d(dtype=wp.float64),
+    gy: wp.array2d(dtype=wp.float64),
+    gz: wp.array2d(dtype=wp.float64),
+):
+    # Load A & y
+    a = wp.tile_load(gA, shape=(TILE_M, TILE_M), storage="shared")
+    y = wp.tile_load(gy, shape=(TILE_M, TILE_M), storage="shared")
+    # Compute U st U^T U = A inplace
+    wp.tile_cholesky_inplace(a, fill_mode="upper")
+    # Solve for x in U^T U x = y.T inplace
+    y_t = wp.tile_transpose(y)
+    wp.tile_cholesky_solve_inplace(a, y_t, fill_mode="upper")
+    # Ensure matmul receives correct layout information
+    z = wp.tile_matmul(y_t, y_t)
+    # Store U, y & z
+    wp.tile_store(gA, a)
+    wp.tile_store(gy, y_t)
+    wp.tile_store(gz, z)
+
+
+def test_tile_cholesky_upper_multiple_rhs_inplace(test, device):
+    _test_tile_cholesky_upper_inplace(test, device, tile_math_cholesky_upper_multiple_rhs_inplace, multiple_rhs=True)
+
+
+@wp.kernel(module="test_cholesky_fwd")
+def tile_math_cholesky_solve_upper(
+    gU: wp.array2d(dtype=wp.float64),
+    gy: wp.array1d(dtype=wp.float64),
+    gx: wp.array1d(dtype=wp.float64),
+):
+    U = wp.tile_load(gU, shape=(TILE_M, TILE_M), storage="shared")
+    y = wp.tile_load(gy, shape=TILE_M, storage="shared")
+    x = wp.tile_cholesky_solve(U, y, fill_mode="upper")
+    wp.tile_store(gx, x)
+
+
+def test_tile_cholesky_solve_upper(test, device):
+    A_h = np.ones((TILE_M, TILE_M), dtype=np.float64) + 8.0 * np.eye(TILE_M, dtype=np.float64)
+    U_np = np.linalg.cholesky(A_h).T  # Upper triangular
+
+    Y_h = np.arange(TILE_M, dtype=np.float64)
+    X_np = np.linalg.solve(A_h, Y_h)
+
+    U_wp = wp.array(U_np, dtype=wp.float64, device=device)
+    Y_wp = wp.array(Y_h, dtype=wp.float64, device=device)
+    X_wp = wp.zeros(TILE_M, dtype=wp.float64, device=device)
+
+    wp.launch_tiled(
+        tile_math_cholesky_solve_upper, dim=[1, 1], inputs=[U_wp, Y_wp, X_wp], block_dim=TILE_DIM, device=device
+    )
+
+    np.testing.assert_allclose(X_wp.numpy(), X_np)
+
+
+@wp.kernel(module="test_cholesky_fwd")
+def tile_math_cholesky_solve_upper_inplace(
+    gU: wp.array2d(dtype=wp.float64),
+    gy: wp.array1d(dtype=wp.float64),
+):
+    U = wp.tile_load(gU, shape=(TILE_M, TILE_M), storage="shared")
+    y = wp.tile_load(gy, shape=TILE_M, storage="shared")
+    wp.tile_cholesky_solve_inplace(U, y, fill_mode="upper")
+    wp.tile_store(gy, y)
+
+
+def test_tile_cholesky_solve_upper_inplace(test, device):
+    A_h = np.ones((TILE_M, TILE_M), dtype=np.float64) + 8.0 * np.eye(TILE_M, dtype=np.float64)
+    U_np = np.linalg.cholesky(A_h).T
+
+    Y_h = np.arange(TILE_M, dtype=np.float64)
+    X_np = np.linalg.solve(A_h, Y_h)
+
+    U_wp = wp.array(U_np, dtype=wp.float64, device=device)
+    Y_wp = wp.array(Y_h, dtype=wp.float64, device=device)
+
+    wp.launch_tiled(
+        tile_math_cholesky_solve_upper_inplace, dim=[1, 1], inputs=[U_wp, Y_wp], block_dim=TILE_DIM, device=device
+    )
+
+    np.testing.assert_allclose(Y_wp.numpy(), X_np)
+
+
+@wp.kernel(module="test_cholesky_fwd")
+def tile_math_cholesky_solve_upper_multiple_rhs(
+    gU: wp.array2d(dtype=wp.float64),
+    gY: wp.array2d(dtype=wp.float64),
+    gX: wp.array2d(dtype=wp.float64),
+):
+    U = wp.tile_load(gU, shape=(TILE_M, TILE_M), storage="shared")
+    Y = wp.tile_load(gY, shape=(TILE_M, TILE_M), storage="shared")
+    X = wp.tile_cholesky_solve(U, Y, fill_mode="upper")
+    wp.tile_store(gX, X)
+
+
+def test_tile_cholesky_solve_upper_multiple_rhs(test, device):
+    A_h = np.ones((TILE_M, TILE_M), dtype=np.float64) + 8.0 * np.eye(TILE_M, dtype=np.float64)
+    U_np = np.linalg.cholesky(A_h).T
+
+    Y_h = np.arange(TILE_M * TILE_M, dtype=np.float64).reshape((TILE_M, TILE_M))
+    X_np = np.linalg.solve(A_h, Y_h)
+
+    U_wp = wp.array(U_np, dtype=wp.float64, device=device)
+    Y_wp = wp.array(Y_h, dtype=wp.float64, device=device)
+    X_wp = wp.zeros((TILE_M, TILE_M), dtype=wp.float64, device=device)
+
+    wp.launch_tiled(
+        tile_math_cholesky_solve_upper_multiple_rhs,
+        dim=[1, 1],
+        inputs=[U_wp, Y_wp, X_wp],
+        block_dim=TILE_DIM,
+        device=device,
+    )
+
+    np.testing.assert_allclose(X_wp.numpy(), X_np)
+
+
+@wp.kernel(module="test_cholesky_fwd")
+def tile_math_cholesky_solve_upper_multiple_rhs_inplace(
+    gU: wp.array2d(dtype=wp.float64),
+    gY: wp.array2d(dtype=wp.float64),
+):
+    U = wp.tile_load(gU, shape=(TILE_M, TILE_M), storage="shared")
+    Y = wp.tile_load(gY, shape=(TILE_M, TILE_M), storage="shared")
+    wp.tile_cholesky_solve_inplace(U, Y, fill_mode="upper")
+    wp.tile_store(gY, Y)
+
+
+def test_tile_cholesky_solve_upper_multiple_rhs_inplace(test, device):
+    A_h = np.ones((TILE_M, TILE_M), dtype=np.float64) + 8.0 * np.eye(TILE_M, dtype=np.float64)
+    U_np = np.linalg.cholesky(A_h).T
+
+    Y_h = np.arange(TILE_M * TILE_M, dtype=np.float64).reshape((TILE_M, TILE_M))
+    X_np = np.linalg.solve(A_h, Y_h)
+
+    U_wp = wp.array(U_np, dtype=wp.float64, device=device)
+    Y_wp = wp.array(Y_h, dtype=wp.float64, device=device)
+
+    wp.launch_tiled(
+        tile_math_cholesky_solve_upper_multiple_rhs_inplace,
+        dim=[1, 1],
+        inputs=[U_wp, Y_wp],
+        block_dim=TILE_DIM,
+        device=device,
+    )
+
+    np.testing.assert_allclose(Y_wp.numpy(), X_np)
 
 
 all_devices = get_test_devices()
@@ -786,7 +1282,88 @@ add_function_test(
     check_output=False,
 )
 
+add_function_test(
+    TestTileCholesky,
+    "test_tile_cholesky_upper",
+    test_tile_cholesky_upper,
+    devices=all_devices,
+    check_output=False,
+)
+add_function_test(
+    TestTileCholesky,
+    "test_tile_cholesky_upper_inplace",
+    test_tile_cholesky_upper_inplace,
+    devices=all_devices,
+    check_output=False,
+)
+add_function_test(
+    TestTileCholesky,
+    "test_tile_cholesky_upper_multiple_rhs",
+    test_tile_cholesky_upper_multiple_rhs,
+    devices=all_devices,
+    check_output=False,
+)
+add_function_test(
+    TestTileCholesky,
+    "test_tile_cholesky_upper_multiple_rhs_inplace",
+    test_tile_cholesky_upper_multiple_rhs_inplace,
+    devices=all_devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestTileCholesky, "test_tile_cholesky_solve_upper", test_tile_cholesky_solve_upper, devices=all_devices
+)
+add_function_test(
+    TestTileCholesky,
+    "test_tile_cholesky_solve_upper_inplace",
+    test_tile_cholesky_solve_upper_inplace,
+    devices=all_devices,
+)
+add_function_test(
+    TestTileCholesky,
+    "test_tile_cholesky_solve_upper_multiple_rhs",
+    test_tile_cholesky_solve_upper_multiple_rhs,
+    devices=all_devices,
+)
+add_function_test(
+    TestTileCholesky,
+    "test_tile_cholesky_solve_upper_multiple_rhs_inplace",
+    test_tile_cholesky_solve_upper_multiple_rhs_inplace,
+    devices=all_devices,
+)
+
+
+add_function_test(
+    TestTileCholesky,
+    "test_tile_cholesky_lower_backward_fp32",
+    test_tile_cholesky_lower_backward(wp.float32),
+    devices=all_devices,
+    check_output=False,
+)
+add_function_test(
+    TestTileCholesky,
+    "test_tile_cholesky_lower_backward_fp64",
+    test_tile_cholesky_lower_backward(wp.float64),
+    devices=all_devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestTileCholesky,
+    "test_tile_cholesky_upper_backward_fp32",
+    test_tile_cholesky_upper_backward(wp.float32),
+    devices=all_devices,
+    check_output=False,
+)
+add_function_test(
+    TestTileCholesky,
+    "test_tile_cholesky_upper_backward_fp64",
+    test_tile_cholesky_upper_backward(wp.float64),
+    devices=all_devices,
+    check_output=False,
+)
+
 
 if __name__ == "__main__":
-    wp.clear_kernel_cache()
     unittest.main(verbosity=2, failfast=True)

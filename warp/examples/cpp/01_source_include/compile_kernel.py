@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 """
 Warp Kernel Compilation: Automatic Differentiation Example
@@ -31,10 +19,10 @@ import warp as wp
 
 @wp.kernel
 def compute_loss(
-    params: wp.array(dtype=wp.float32),  # Model parameters [a, b]
-    x: wp.array(dtype=wp.float32),  # Input data
-    y_true: wp.array(dtype=wp.float32),  # Ground truth
-    loss: wp.array(dtype=wp.float32),  # Output: scalar loss
+    params: wp.array[float],  # Model parameters [a, b]
+    x: wp.array[float],  # Input data
+    y_true: wp.array[float],  # Ground truth
+    loss: wp.array[float],  # Output: scalar loss
 ):
     """Compute MSE loss for linear model: y = a*x + b
 
@@ -64,7 +52,7 @@ def compute_loss(
 
 
 @wp.kernel
-def update_params(learning_rate: wp.float32, grads: wp.array(dtype=wp.float32), params: wp.array(dtype=wp.float32)):
+def update_params(learning_rate: float, grads: wp.array[float], params: wp.array[float]):
     """Update parameters using gradient descent: params -= learning_rate * grads
 
     This kernel updates parameters in-place on the GPU, avoiding CPU round-trips.

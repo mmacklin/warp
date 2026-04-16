@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 ###########################################################################
 # Example Smoothed Particle Hydrodynamics
@@ -91,8 +79,8 @@ def diff_viscous_kernel(xyz: wp.vec3, v: wp.vec3, neighbor_v: wp.vec3, neighbor_
 @wp.kernel
 def compute_density(
     grid: wp.uint64,
-    particle_x: wp.array(dtype=wp.vec3),
-    particle_rho: wp.array(dtype=float),
+    particle_x: wp.array[wp.vec3],
+    particle_rho: wp.array[float],
     density_normalization: float,
     smoothing_length: float,
 ):
@@ -125,10 +113,10 @@ def compute_density(
 @wp.kernel
 def get_acceleration(
     grid: wp.uint64,
-    particle_x: wp.array(dtype=wp.vec3),
-    particle_v: wp.array(dtype=wp.vec3),
-    particle_rho: wp.array(dtype=float),
-    particle_a: wp.array(dtype=wp.vec3),
+    particle_x: wp.array[wp.vec3],
+    particle_v: wp.array[wp.vec3],
+    particle_rho: wp.array[float],
+    particle_a: wp.array[wp.vec3],
     isotropic_exp: float,
     base_density: float,
     gravity: float,
@@ -184,8 +172,8 @@ def get_acceleration(
 
 @wp.kernel
 def apply_bounds(
-    particle_x: wp.array(dtype=wp.vec3),
-    particle_v: wp.array(dtype=wp.vec3),
+    particle_x: wp.array[wp.vec3],
+    particle_v: wp.array[wp.vec3],
     damping_coef: float,
     width: float,
     height: float,
@@ -228,14 +216,14 @@ def apply_bounds(
 
 
 @wp.kernel
-def kick(particle_v: wp.array(dtype=wp.vec3), particle_a: wp.array(dtype=wp.vec3), dt: float):
+def kick(particle_v: wp.array[wp.vec3], particle_a: wp.array[wp.vec3], dt: float):
     tid = wp.tid()
     v = particle_v[tid]
     particle_v[tid] = v + particle_a[tid] * dt
 
 
 @wp.kernel
-def drift(particle_x: wp.array(dtype=wp.vec3), particle_v: wp.array(dtype=wp.vec3), dt: float):
+def drift(particle_x: wp.array[wp.vec3], particle_v: wp.array[wp.vec3], dt: float):
     tid = wp.tid()
     x = particle_x[tid]
     particle_x[tid] = x + particle_v[tid] * dt
@@ -243,19 +231,19 @@ def drift(particle_x: wp.array(dtype=wp.vec3), particle_v: wp.array(dtype=wp.vec
 
 @wp.kernel
 def initialize_particles(
-    particle_x: wp.array(dtype=wp.vec3), smoothing_length: float, width: float, height: float, length: float
+    particle_x: wp.array[wp.vec3], smoothing_length: float, width: float, height: float, length: float
 ):
     tid = wp.tid()
 
     # grid size
-    nr_x = wp.int32(width / 4.0 / smoothing_length)
-    nr_y = wp.int32(height / smoothing_length)
-    nr_z = wp.int32(length / 4.0 / smoothing_length)
+    nr_x = int(width / 4.0 / smoothing_length)
+    nr_y = int(height / smoothing_length)
+    nr_z = int(length / 4.0 / smoothing_length)
 
     # calculate particle position
-    z = wp.float(tid % nr_z)
-    y = wp.float((tid // nr_z) % nr_y)
-    x = wp.float((tid // (nr_z * nr_y)) % nr_x)
+    z = float(tid % nr_z)
+    y = float((tid // nr_z) % nr_y)
+    x = float((tid // (nr_z * nr_y)) % nr_x)
     pos = smoothing_length * wp.vec3(x, y, z)
 
     # add small jitter
@@ -390,12 +378,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--device", type=str, default=None, help="Override the default Warp device.")
     parser.add_argument(
-        "--stage_path",
+        "--stage-path",
         type=lambda x: None if x == "None" else str(x),
         default="example_sph.usd",
         help="Path to the output USD file.",
     )
-    parser.add_argument("--num_frames", type=int, default=480, help="Total number of frames.")
+    parser.add_argument("--num-frames", type=int, default=480, help="Total number of frames.")
     parser.add_argument("--verbose", action="store_true", help="Print out additional status messages during execution.")
 
     args = parser.parse_known_args()[0]

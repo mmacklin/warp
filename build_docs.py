@@ -1,28 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import argparse
 import logging
 import os
 import shutil
 
-import docs.generate_reference
 import warp  # ensure all API functions are loaded  # noqa: F401
 from warp._src.context import export_stubs
-
-docs.generate_reference.install_mock_modules()
 
 parser = argparse.ArgumentParser(
     description="Warp Sphinx Documentation Builder",
@@ -133,9 +118,6 @@ with open(os.path.join(base_path, "warp", "__init__.pyi"), "w", encoding="utf-8"
 # code formatting of __init__.pyi
 logger.info("Formatting __init__.pyi (a 'Failed' message in the output below is expected)")
 format_file_with_ruff(os.path.join(base_path, "warp", "__init__.pyi"))
-
-logger.info("Generating function reference documentation")
-docs.generate_reference.run()
 
 source_dir = os.path.join(base_path, "docs")
 

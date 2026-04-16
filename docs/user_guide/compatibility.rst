@@ -43,7 +43,7 @@ Runtime requirements
 
 The following requirements apply when running Warp:
 
-**Python**: Version 3.9 or newer
+**Python**: Version 3.10 or newer
 
 **Dependencies**: `NumPy <https://numpy.org>`__ (required)
 
@@ -73,7 +73,7 @@ To determine your GPU's compute capability, see `NVIDIA CUDA GPUs <https://devel
 
   * Warp packages built with CUDA Toolkit 12.x require NVIDIA driver 525 or newer.
   * Warp packages built with CUDA Toolkit 13.x require NVIDIA driver 580 or newer.
-  * PyPI wheels for Windows/Linux are currently built with CUDA 12.8.
+  * PyPI wheels for Windows/Linux are currently built with CUDA 12.9.
 
 * **Advanced Features**: Half-precision (``float16``) atomic operations require compute capability 7.0+ (Volta). 
   On older GPUs, these operations return zero.
@@ -93,7 +93,7 @@ To build Warp from source, you need:
 
 **Core Tools:**
 
-* Python 3.9+
+* Python 3.10+
 * `Git LFS <https://git-lfs.com>`__ (for assets used in tests, examples, and documentation)
 * NumPy
 
@@ -103,7 +103,7 @@ To build Warp from source, you need:
 
   * Minimum: CUDA Toolkit 12.0
   * For full libmathdx support: CUDA Toolkit 12.6.3+
-  * For conditional graph node support: CUDA Toolkit 12.3+
+  * For conditional graph node support: CUDA Toolkit 12.4+
 
 * libmathdx (auto-fetched via Packman by default)
 * LLVM/Clang (auto-fetched via Packman by default)
@@ -271,7 +271,7 @@ minor Warp releases following our standard deprecation practices.
 **Optional dependencies**
 
 Warp includes optional features and examples that depend on additional packages (e.g., ``usd-core``, 
-``matplotlib``, ``warp-lang[extras]``). For these optional dependencies:
+``matplotlib``, ``warp-lang[examples]``). For these optional dependencies:
 
 * We aim to test against recent versions in our CI/CD pipeline.
 * Version support may be adjusted if specific package versions cause CI/CD issues or compatibility 

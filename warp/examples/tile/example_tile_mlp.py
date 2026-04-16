@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 ###########################################################################
 # Example Image Multilayer Perceptron (MLP)
@@ -87,18 +75,18 @@ def relu(x: dtype):
 
 @wp.kernel
 def compute(
-    indices: wp.array(dtype=int),
-    weights_0: wp.array2d(dtype=dtype),
-    bias_0: wp.array2d(dtype=dtype),
-    weights_1: wp.array2d(dtype=dtype),
-    bias_1: wp.array2d(dtype=dtype),
-    weights_2: wp.array2d(dtype=dtype),
-    bias_2: wp.array2d(dtype=dtype),
-    weights_3: wp.array2d(dtype=dtype),
-    bias_3: wp.array2d(dtype=dtype),
-    reference: wp.array2d(dtype=float),
-    loss: wp.array1d(dtype=float),
-    out: wp.array2d(dtype=float),
+    indices: wp.array[int],
+    weights_0: wp.array2d[dtype],
+    bias_0: wp.array2d[dtype],
+    weights_1: wp.array2d[dtype],
+    bias_1: wp.array2d[dtype],
+    weights_2: wp.array2d[dtype],
+    bias_2: wp.array2d[dtype],
+    weights_3: wp.array2d[dtype],
+    bias_3: wp.array2d[dtype],
+    reference: wp.array2d[float],
+    loss: wp.array1d[float],
+    out: wp.array2d[float],
 ):
     # batch indices
     linear = indices[wp.tid()]
@@ -377,7 +365,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--train_iters", type=int, default=20000, help="Total number of training iterations.")
+    parser.add_argument("--train-iters", type=int, default=20000, help="Total number of training iterations.")
     parser.add_argument(
         "--headless",
         action="store_true",

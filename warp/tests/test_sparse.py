@@ -1,24 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
+import sys
 import unittest
 
 import numpy as np
 
 import warp as wp
 from warp.sparse import (
+    BsrMatrix,
     bsr_assign,
     bsr_axpy,
     bsr_axpy_work_arrays,
@@ -53,7 +43,7 @@ def _triplets_to_dense(shape, rows, cols, values):
 
     block_shape = values.shape[1:] if values.ndim == 3 else (1, 1)
 
-    for row, col, val in zip(rows, cols, values):
+    for row, col, val in zip(rows, cols, values, strict=True):
         mat_block = _get_block(mat, row, col, block_shape)
         mat_block += val
 
@@ -436,7 +426,7 @@ def make_test_bsr_axpy(block_shape, scalar_type):
         bsr_set_from_triplets(y, y_rows, y_cols, y_vals)
 
         work_arrays = bsr_axpy_work_arrays()
-        for alpha, beta in zip(alphas, betas):
+        for alpha, beta in zip(alphas, betas, strict=True):
             ref = alpha * _bsr_to_dense(x) + beta * _bsr_to_dense(y)
             bsr_axpy(x, y, alpha, beta, work_arrays=work_arrays)
 
@@ -509,7 +499,7 @@ def make_test_bsr_mm(block_shape, scalar_type):
         bsr_set_from_triplets(z, z_rows, z_cols, z_vals)
 
         work_arrays = bsr_mm_work_arrays()
-        for alpha, beta in zip(alphas, betas):
+        for alpha, beta in zip(alphas, betas, strict=True):
             ref = alpha * (_bsr_to_dense(x) @ _bsr_to_dense(y)) + beta * _bsr_to_dense(z)
 
             bsr_mm(x, y, z, alpha, beta, work_arrays=work_arrays)
@@ -598,7 +588,7 @@ def make_test_bsr_mv(block_shape, scalar_type):
             )
 
         work_buffer = wp.empty_like(y)
-        for alpha, beta in zip(alphas, betas):
+        for alpha, beta in zip(alphas, betas, strict=True):
             ref = alpha * _bsr_to_dense(A) @ x.numpy().flatten() + beta * y.numpy().flatten()
 
             if beta == 0.0:
@@ -721,6 +711,10 @@ def test_bsr_mm_max_new_nnz(test, device):
     bsr_set_zero(C)
     test.assertEqual(C.nnz_sync(), 0)
 
+    # We skip the rest of the test on Windows due to unreliable stdout capture
+    if sys.platform == "win32":
+        return
+
     # max_new_nnz too small, check warning
     capture = StdOutCapture()
     capture.begin()
@@ -729,9 +723,7 @@ def test_bsr_mm_max_new_nnz(test, device):
     output = capture.end()
 
     # Check that the output contains warnings about "max_new_nnz" being exceeded.
-    # Older Windows C runtimes have a bug where stdout sometimes does not get properly flushed.
-    if output != "" or sys.platform != "win32":
-        test.assertRegex(output, r"exceeded")
+    test.assertRegex(output, r"exceeded")
 
 
 def test_capturability(test, device):
@@ -771,6 +763,35 @@ def test_capturability(test, device):
     wp.capture_launch(capture.graph)
     test.assertEqual(C.nnz_sync(), 9)
     assert_array_equal(bsr_get_diag(C), wp.full(N, value=wp.mat33(9.0), dtype=wp.mat33, device=device))
+
+
+def test_bsr_alloc(test, device):
+    rows_of_blocks, cols_of_blocks = 3, 4
+
+    bsr: BsrMatrix[float] = bsr_zeros(
+        rows_of_blocks,
+        cols_of_blocks,
+        block_type=float,
+        device=device,
+    )
+
+    # Notify of new nnz upper bound. Allocs buffers, but nnz_sync still 0
+    bsr.notify_nnz_changed(10)
+    assert bsr.columns.shape[0] >= 6
+    assert bsr.values.shape[0] >= 6
+
+    assert bsr.nnz == 10
+    assert bsr.nnz_sync() == 0
+
+    # Set offsets and sync. Should update actual nnz
+    offsets = wp.array([0, 2, 3, 6], dtype=int, device=device)
+    bsr.offsets.assign(offsets)
+    bsr.notify_nnz_changed()
+
+    assert bsr.nnz == 6
+    assert bsr.nnz_sync() == 6
+    assert bsr.columns.shape[0] >= 6
+    assert bsr.values.shape[0] >= 6
 
 
 devices = get_test_devices()
@@ -845,6 +866,7 @@ add_function_test(TestSparse, "test_bsr_mv_3_3", make_test_bsr_mv((3, 3), wp.flo
 add_function_test(TestSparse, "test_capturability", test_capturability, devices=cuda_test_devices)
 add_function_test(TestSparse, "test_bsr_mm_max_new_nnz", test_bsr_mm_max_new_nnz, devices=devices, check_output=False)
 
+add_function_test(TestSparse, "test_bsr_alloc", test_bsr_alloc, devices=devices)
+
 if __name__ == "__main__":
-    wp.clear_kernel_cache()
     unittest.main(verbosity=2)

@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import unittest
 
@@ -499,7 +487,7 @@ def test_normalize(test, device, dtype, register_kernels=False):
     assert_np_equal(n2.numpy()[0], n2_alt.numpy()[0], tol=tol)
     assert_np_equal(n3.numpy()[0], n3_alt.numpy()[0], tol=tol)
 
-    for ncmp, ncmpalt in zip(outputs0, outputs1):
+    for ncmp, ncmpalt in zip(outputs0, outputs1, strict=True):
         tape0.backward(loss=ncmp)
         tape1.backward(loss=ncmpalt)
         assert_np_equal(tape0.gradients[q].numpy()[0], tape1.gradients[q].numpy()[0], tol=tol)
@@ -1834,8 +1822,8 @@ def test_quat_euler_conversion(test, device, dtype, register_kernels=False):
 
     rpy_arr = rng.uniform(low=-np.pi, high=np.pi, size=(N, 3))
 
-    quats_from_euler = [list(quat_from_euler(wp.vec3(*rpy), 0, 1, 2)) for rpy in rpy_arr]
-    quats_from_rpy = [list(wp.quat_rpy(rpy[0], rpy[1], rpy[2])) for rpy in rpy_arr]
+    quats_from_euler = [[float(x) for x in quat_from_euler(wp.vec3(*rpy), 0, 1, 2)] for rpy in rpy_arr]
+    quats_from_rpy = [[float(x) for x in wp.quat_rpy(rpy[0], rpy[1], rpy[2])] for rpy in rpy_arr]
 
     assert_np_equal(np.array(quats_from_euler), np.array(quats_from_rpy), tol=1e-4)
 

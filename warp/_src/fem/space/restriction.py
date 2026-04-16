@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 from typing import Optional
 
@@ -44,7 +32,7 @@ class SpaceRestriction:
         space_partition: SpacePartition,
         domain: GeometryDomain,
         device=None,
-        temporary_store: Optional[cache.TemporaryStore] = None,
+        temporary_store: cache.TemporaryStore | None = None,
     ):
         space_topology = space_partition.space_topology
 
@@ -73,7 +61,7 @@ class SpaceRestriction:
 
         self.rebuild(device=device, temporary_store=temporary_store)
 
-    def rebuild(self, device: Optional["wp.DeviceLike"] = None, temporary_store: Optional[cache.TemporaryStore] = None):
+    def rebuild(self, device: Optional["wp.DeviceLike"] = None, temporary_store: cache.TemporaryStore | None = None):
         """Rebuild internal indices for the space restriction."""
         max_nodes_per_element = self.space_topology.MAX_NODES_PER_ELEMENT
 
@@ -95,9 +83,7 @@ class SpaceRestriction:
             if element_index == NULL_ELEMENT_INDEX:
                 element_node_count = 0
             else:
-                element_node_count = wp.min(
-                    max_nodes_per_element, self.space_topology.element_node_count(element_arg, topo_arg, element_index)
-                )
+                element_node_count = self.space_topology.element_node_count(element_arg, topo_arg, element_index)
 
             for n in range(element_node_count):
                 space_nidx = self.space_topology.element_node_index(element_arg, topo_arg, element_index, n)
@@ -126,6 +112,7 @@ class SpaceRestriction:
         )
 
         # Build compressed map from node to element indices
+        partition_node_count = self.space_partition.node_count()
         flattened_node_indices = element_node_indices.flatten()
         (
             self._dof_partition_element_offsets,
@@ -133,7 +120,7 @@ class SpaceRestriction:
             self._node_count_dev,
             self._dof_partition_indices,
         ) = compress_node_indices(
-            self.space_partition.node_count(),
+            partition_node_count,
             flattened_node_indices,
             node_offsets=self._dof_partition_element_offsets,
             unique_node_count=self._node_count_dev,
@@ -152,6 +139,8 @@ class SpaceRestriction:
             dim=flattened_node_indices.shape,
             inputs=[
                 max_nodes_per_element,
+                partition_node_count,
+                self._dof_partition_element_offsets,
                 node_array_indices,
                 self._dof_element_indices,
                 self._dof_indices_in_element,
@@ -160,6 +149,7 @@ class SpaceRestriction:
         )
 
         node_array_indices.release()
+        element_node_indices.release()
 
         # Upper bound on node count, use `node_count_sync` to get the actual value
         self._node_count = min(self.space_partition.node_count(), self._dof_partition_indices.shape[0])
@@ -234,12 +224,24 @@ class SpaceRestriction:
 
     @wp.kernel
     def _split_vertex_element_index(
-        vertex_per_element: int,
+        nodes_per_element: int,
+        partition_node_count: int,
+        dof_element_offsets: wp.array(dtype=int),
         sorted_indices: wp.array(dtype=int),
-        vertex_element_index: wp.array(dtype=int),
-        vertex_index_in_element: wp.array(dtype=int),
+        node_element_index: wp.array(dtype=int),
+        node_index_in_element: wp.array(dtype=int),
     ):
-        idx = sorted_indices[wp.tid()]
-        element_index = idx // vertex_per_element
-        vertex_element_index[wp.tid()] = element_index
-        vertex_index_in_element[wp.tid()] = idx - vertex_per_element * element_index
+        offset = wp.tid()
+
+        # If some elements have less than nodes_per_element real nodes, we will have
+        # invalid elements at the end of the sorted array. Make sure to mark them as such
+        last_offset = dof_element_offsets[partition_node_count]
+        if offset >= last_offset:
+            node_element_index[offset] = NULL_ELEMENT_INDEX
+            node_index_in_element[offset] = 0
+            return
+
+        flat_idx = sorted_indices[offset]
+        element_index = flat_idx // nodes_per_element
+        node_element_index[offset] = element_index
+        node_index_in_element[offset] = flat_idx - nodes_per_element * element_index

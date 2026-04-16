@@ -3,6 +3,17 @@ Debugging
 
 .. currentmodule:: warp
 
+Environment Diagnostics
+-----------------------
+
+:func:`wp.print_diagnostics() <warp.print_diagnostics>` prints a snapshot of the Warp build
+and runtime environment (e.g., software versions, CUDA info, build flags, and device details)::
+
+    python -c "import warp; warp.print_diagnostics()"
+
+When `filing a bug report <https://github.com/NVIDIA/warp/issues>`_, please include this output
+to help us reproduce your issue.
+
 Printing Values
 ---------------
 
@@ -93,7 +104,7 @@ is an array of ones, but we passed it a single-element array of zeros:
 
 
     @wp.kernel
-    def expect_ones(a: wp.array(dtype=int)):
+    def expect_ones(a: wp.array[int]):
         i = wp.tid()
 
         assert a[i] == 1, "Array element must be 1"

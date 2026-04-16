@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 ###########################################################################
 # Example Torch
@@ -39,7 +27,7 @@ def rosenbrock(x: float, y: float):
 
 
 @wp.kernel
-def eval_rosenbrock(xs: wp.array(dtype=wp.vec2), z: wp.array(dtype=float)):
+def eval_rosenbrock(xs: wp.array[wp.vec2], z: wp.array[float]):
     i = wp.tid()
     x = xs[i]
     z[i] = rosenbrock(x[0], x[1])
@@ -116,7 +104,7 @@ class Example:
         N = len(xy)
 
         xy = wp.array(xy, dtype=wp.vec2)
-        Z = wp.empty(N, dtype=wp.float32)
+        Z = wp.empty(N, dtype=float)
 
         wp.launch(eval_rosenbrock, dim=N, inputs=[xy], outputs=[Z])
         Z = Z.numpy().reshape(X.shape)
@@ -178,10 +166,10 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--device", type=str, default=None, help="Override the default Warp device.")
-    parser.add_argument("--num_frames", type=int, default=10000, help="Total number of frames.")
-    parser.add_argument("--train_iters", type=int, default=10, help="Total number of training iterations per frame.")
+    parser.add_argument("--num-frames", type=int, default=10000, help="Total number of frames.")
+    parser.add_argument("--train-iters", type=int, default=10, help="Total number of training iterations per frame.")
     parser.add_argument(
-        "--num_particles", type=int, default=1500, help="Total number of particles to use in optimization."
+        "--num-particles", type=int, default=1500, help="Total number of particles to use in optimization."
     )
     parser.add_argument(
         "--headless",

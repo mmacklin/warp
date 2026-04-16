@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 from __future__ import annotations
 
@@ -20,28 +8,32 @@ import ctypes
 import inspect
 import threading
 import traceback
+from collections.abc import Callable
 from enum import IntEnum
-from typing import Callable
 
 import jax
 
 import warp as wp
 from warp._src.codegen import get_full_arg_spec, make_full_qualified_name
-from warp._src.context import CudaMemcpyKind
+from warp._src.context import CudaMemcpyKind, _canonicalize_dim, _normalize_launch_dim
 from warp._src.jax import get_jax_device
-from warp._src.types import array_t, launch_bounds_t, strides_from_shape, type_size_in_bytes, type_to_warp
+from warp._src.types import (
+    array_t,
+    launch_bounds_t,
+    matches_array_class,
+    strides_from_shape,
+    type_size_in_bytes,
+    type_to_warp,
+)
 
 from .xla_ffi import *
 
 _wp_module_name_ = "warp.jax_experimental.ffi"
 
-# Type alias for differentiable kernel cache key
-DiffKernelCacheKey = tuple[Callable, tuple, int, str, tuple[str, ...]]
-
 # Holders for the custom callbacks to keep them alive.
-_FFI_KERNEL_REGISTRY: dict[str, FfiKernel] = {}
-_FFI_DIFF_KERNEL_REGISTRY: dict[DiffKernelCacheKey, Callable] = {}
-_FFI_CALLABLE_REGISTRY: dict[str, FfiCallable] = {}
+_FFI_KERNEL_REGISTRY: dict[tuple, FfiKernel] = {}
+_FFI_DIFF_KERNEL_REGISTRY: dict[tuple, Callable] = {}
+_FFI_CALLABLE_REGISTRY: dict[tuple, FfiCallable] = {}
 _FFI_CALLBACK_REGISTRY: dict[str, ctypes.CFUNCTYPE] = {}
 _FFI_REGISTRY_LOCK = threading.Lock()
 
@@ -59,6 +51,21 @@ def check_jax_version():
         if jax.__version_info__ >= (0, 4, 25):
             msg += " Please use warp.jax_experimental.custom_call.jax_kernel instead."
         raise RuntimeError(msg)
+
+
+def collapse_batch_dims(shape, desired_ndim):
+    # roll leading batch dims into one
+    while len(shape) > desired_ndim:
+        shape = (shape[0] * shape[1], *shape[2:])
+    return shape
+
+
+def compute_batch_size(shape, batch_ndim):
+    # compute product of batch dims at front
+    batch_size = 1
+    for i in range(batch_ndim):
+        batch_size *= shape[i]
+    return batch_size
 
 
 class GraphMode(IntEnum):
@@ -91,7 +98,7 @@ class FfiArg:
         self.name = name
         self.type = type
         self.in_out = in_out
-        self.is_array = isinstance(type, wp.array)
+        self.is_array = matches_array_class(type, wp.array)
 
         if self.is_array:
             if hasattr(type.dtype, "_wp_scalar_type_"):
@@ -125,7 +132,15 @@ class FfiLaunchDesc:
 
 class FfiKernel:
     def __init__(
-        self, kernel, num_outputs, vmap_method, launch_dims, output_dims, in_out_argnames, module_preload_mode
+        self,
+        kernel,
+        num_outputs,
+        vmap_method,
+        launch_dims,
+        output_dims,
+        in_out_argnames,
+        module_preload_mode,
+        has_side_effect=False,
     ):
         self.kernel = kernel
         self.name = generate_unique_name(kernel.func)
@@ -134,6 +149,7 @@ class FfiKernel:
         self.launch_dims = launch_dims
         self.output_dims = output_dims
         self.module_preload_mode = module_preload_mode
+        self.has_side_effect = has_side_effect
         self.first_array_arg = None
         self.launch_id = 0
         self.launch_descriptors = {}
@@ -195,7 +211,7 @@ class FfiKernel:
 
         # register the callback
         FFI_CCALLFUNC = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.POINTER(XLA_FFI_CallFrame))
-        self.callback_func = FFI_CCALLFUNC(lambda call_frame: self.ffi_callback(call_frame))
+        self.callback_func = FFI_CCALLFUNC(self.ffi_callback)
         ffi_ccall_address = ctypes.cast(self.callback_func, ctypes.c_void_p)
         ffi_capsule = jax.ffi.pycapsule(ffi_ccall_address.value)
         jax.ffi.register_ffi_target(self.name, ffi_capsule, platform="CUDA")
@@ -250,16 +266,15 @@ class FfiKernel:
                 out_types.append(get_jax_output_type(input_arg, input_value.shape))
 
         # launch dimensions
-        if launch_dims is None:
+        infer_launch_dims = launch_dims is None
+        if infer_launch_dims:
             # use the shape of the first input array
             if self.first_array_arg is not None:
                 launch_dims = get_warp_shape(self.input_args[self.first_array_arg], args[self.first_array_arg].shape)
             else:
                 raise RuntimeError("Failed to determine launch dimensions")
-        elif isinstance(launch_dims, int):
-            launch_dims = (launch_dims,)
         else:
-            launch_dims = tuple(launch_dims)
+            launch_dims = _canonicalize_dim(launch_dims)
 
         # output shapes
         if isinstance(output_dims, dict):
@@ -284,6 +299,7 @@ class FfiKernel:
             out_types,
             vmap_method=vmap_method,
             input_output_aliases=self.input_output_aliases,
+            has_side_effect=self.has_side_effect,
         )
 
         # preload on the specified devices
@@ -303,7 +319,9 @@ class FfiKernel:
 
         # save launch data to be retrieved by callback
         launch_id = self.launch_id
-        self.launch_descriptors[launch_id] = FfiLaunchDesc(static_inputs, launch_dims)
+        self.launch_descriptors[launch_id] = FfiLaunchDesc(
+            static_inputs, launch_dims if not infer_launch_dims else None
+        )
         self.launch_id += 1
 
         return call(*args, launch_id=launch_id)
@@ -343,19 +361,23 @@ class FfiKernel:
                 assert num_inputs == self.num_inputs
                 assert num_outputs == self.num_outputs
 
-                launch_bounds = launch_bounds_t(launch_desc.launch_dims)
-
                 # first kernel param is the launch bounds
                 kernel_params = (ctypes.c_void_p * (1 + self.num_kernel_args))()
-                kernel_params[0] = ctypes.addressof(launch_bounds)
-
                 arg_refs = []
+                batch_size = None
 
                 # input and in-out args
                 for i, input_arg in enumerate(self.input_args):
                     if input_arg.is_array:
                         buffer = inputs[i].contents
-                        shape = buffer.dims[: input_arg.type.ndim]
+                        shape = buffer.dims[: buffer.rank - input_arg.dtype_ndim]
+                        if buffer.rank > input_arg.jax_ndim:
+                            # handle batching
+                            shape = collapse_batch_dims(shape, input_arg.type.ndim)
+                            if batch_size is None:
+                                batch_size = compute_batch_size(
+                                    buffer.dims[: buffer.rank], buffer.rank - input_arg.jax_ndim
+                                )
                         strides = strides_from_shape(shape, input_arg.type.dtype)
                         arg = array_t(buffer.data, 0, input_arg.type.ndim, shape, strides)
                         kernel_params[i + 1] = ctypes.addressof(arg)
@@ -370,11 +392,34 @@ class FfiKernel:
                 # pure output args (skip in-out FFI buffers)
                 for i, output_arg in enumerate(self.output_args):
                     buffer = outputs[i + self.num_in_out].contents
-                    shape = buffer.dims[: output_arg.type.ndim]
+                    shape = buffer.dims[: buffer.rank - output_arg.dtype_ndim]
+                    if buffer.rank > output_arg.jax_ndim:
+                        # handle batching
+                        shape = collapse_batch_dims(shape, output_arg.type.ndim)
+                        if batch_size is None:
+                            batch_size = compute_batch_size(
+                                buffer.dims[: buffer.rank], buffer.rank - output_arg.jax_ndim
+                            )
                     strides = strides_from_shape(shape, output_arg.type.dtype)
                     arg = array_t(buffer.data, 0, output_arg.type.ndim, shape, strides)
                     kernel_params[num_inputs + i + 1] = ctypes.addressof(arg)
                     arg_refs.append(arg)  # keep a reference
+
+                # determine launch bounds
+                if launch_desc.launch_dims is None:
+                    # infer launch dims from argument shape, works with vmap
+                    arr = arg_refs[self.first_array_arg]
+                    launch_dims = arr.shape[: arr.ndim]
+                else:
+                    # use specified launch dims
+                    launch_dims = launch_desc.launch_dims
+                    if batch_size is not None:
+                        # roll batch size into the first launch dimension
+                        launch_dims = (batch_size * launch_dims[0], *launch_dims[1:])
+
+                normalized = _normalize_launch_dim(launch_dims, self.kernel.adj.kernel_dim)
+                launch_bounds = launch_bounds_t(normalized)
+                kernel_params[0] = ctypes.addressof(launch_bounds)
 
                 # get device and stream
                 device = wp.get_cuda_device(get_device_ordinal_from_callframe(call_frame.contents))
@@ -445,6 +490,7 @@ class FfiCallable:
         stage_out_argnames,
         graph_cache_max,
         module_preload_mode,
+        has_side_effect=False,
     ):
         self.func = func
         self.name = generate_unique_name(func)
@@ -453,6 +499,7 @@ class FfiCallable:
         self.graph_mode = graph_mode
         self.output_dims = output_dims
         self.module_preload_mode = module_preload_mode
+        self.has_side_effect = has_side_effect
         self.first_array_arg = None
         self.call_id = 0
         self.call_descriptors = {}
@@ -546,7 +593,7 @@ class FfiCallable:
 
         # register the callback
         FFI_CCALLFUNC = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.POINTER(XLA_FFI_CallFrame))
-        self.callback_func = FFI_CCALLFUNC(lambda call_frame: self.ffi_callback(call_frame))
+        self.callback_func = FFI_CCALLFUNC(self.ffi_callback)
         ffi_ccall_address = ctypes.cast(self.callback_func, ctypes.c_void_p)
         ffi_capsule = jax.ffi.pycapsule(ffi_ccall_address.value)
         jax.ffi.register_ffi_target(self.name, ffi_capsule, platform="CUDA")
@@ -624,7 +671,7 @@ class FfiCallable:
             out_types,
             vmap_method=vmap_method,
             input_output_aliases=self.input_output_aliases,
-            # has_side_effect=True,  # force this function to execute even if outputs aren't used
+            has_side_effect=self.has_side_effect,
         )
 
         # preload on the specified devices
@@ -806,7 +853,7 @@ class FfiCallable:
                 for i, arg in enumerate(self.input_args):
                     if arg.is_array:
                         buffer = inputs[i].contents
-                        shape = buffer.dims[: buffer.rank - arg.dtype_ndim]
+                        shape = collapse_batch_dims(buffer.dims[: buffer.rank - arg.dtype_ndim], arg.type.ndim)
                         arr = wp.array(ptr=buffer.data, dtype=arg.type.dtype, shape=shape, device=device)
                         arg_list.append(arr)
                     else:
@@ -817,7 +864,7 @@ class FfiCallable:
                 # pure output args (skip in-out FFI buffers)
                 for i, arg in enumerate(self.output_args):
                     buffer = outputs[i + self.num_in_out].contents
-                    shape = buffer.dims[: buffer.rank - arg.dtype_ndim]
+                    shape = collapse_batch_dims(buffer.dims[: buffer.rank - arg.dtype_ndim], arg.type.ndim)
                     arr = wp.array(ptr=buffer.data, dtype=arg.type.dtype, shape=shape, device=device)
                     arg_list.append(arr)
 
@@ -1093,6 +1140,7 @@ def jax_kernel(
     in_out_argnames=None,
     module_preload_mode=ModulePreloadMode.CURRENT_DEVICE,
     enable_backward: bool = False,
+    has_side_effect: bool = False,
 ):
     """Create a JAX callback from a Warp kernel.
 
@@ -1101,21 +1149,23 @@ def jax_kernel(
     Args:
         kernel: The Warp kernel to launch.
         num_outputs: Specify the number of output arguments if greater than 1.
-                     This must include the number of ``in_out_arguments``.
+            This must include the number of ``in_out_arguments``.
         vmap_method: String specifying how the callback transforms under ``vmap()``.
-                     This argument can also be specified for individual calls.
+            This argument can also be specified for individual calls.
         launch_dims: Specify the default kernel launch dimensions. If None, launch
-                     dimensions are inferred from the shape of the first array argument.
-                     This argument can also be specified for individual calls.
+            dimensions are inferred from the shape of the first array argument.
+            This argument can also be specified for individual calls.
         output_dims: Specify the default dimensions of output arrays.  If None, output
-                     dimensions are inferred from the launch dimensions.
-                     This argument can also be specified for individual calls.
+            dimensions are inferred from the launch dimensions.
+            This argument can also be specified for individual calls.
         in_out_argnames: Names of arguments that are both inputs and outputs (aliased buffers).
             These must be array arguments that appear before any pure output arguments in the
             kernel signature. The number of in-out arguments is included in ``num_outputs``.
             Not supported when ``enable_backward=True``.
         module_preload_mode: Specify the devices where the module should be preloaded.
         enable_backward: Enable automatic differentiation for this kernel.
+        has_side_effect: Whether the custom call has side effects. When True,
+            the FFI call will be executed even when the outputs are not used.
 
     Limitations:
         - All kernel arguments must be contiguous arrays or scalars.
@@ -1127,21 +1177,41 @@ def jax_kernel(
 
     check_jax_version()
 
+    if isinstance(output_dims, dict):
+        hashable_output_dims = tuple(sorted(output_dims.items()))
+    elif hasattr(output_dims, "__len__"):
+        hashable_output_dims = tuple(output_dims)
+    else:
+        hashable_output_dims = output_dims
+
+    if hasattr(launch_dims, "__len__"):
+        hashable_launch_dims = tuple(launch_dims)
+    else:
+        hashable_launch_dims = launch_dims
+
     if not enable_backward:
         key = (
             kernel.func,
             kernel.sig,
             num_outputs,
             vmap_method,
-            tuple(launch_dims) if launch_dims else launch_dims,
-            tuple(sorted(output_dims.items())) if output_dims else output_dims,
+            hashable_launch_dims,
+            hashable_output_dims,
             module_preload_mode,
+            has_side_effect,
         )
 
         with _FFI_REGISTRY_LOCK:
             if key not in _FFI_KERNEL_REGISTRY:
                 new_kernel = FfiKernel(
-                    kernel, num_outputs, vmap_method, launch_dims, output_dims, in_out_argnames, module_preload_mode
+                    kernel,
+                    num_outputs,
+                    vmap_method,
+                    launch_dims,
+                    output_dims,
+                    in_out_argnames,
+                    module_preload_mode,
+                    has_side_effect=has_side_effect,
                 )
                 _FFI_KERNEL_REGISTRY[key] = new_kernel
 
@@ -1171,7 +1241,7 @@ def jax_kernel(
     static_args = []
     for i, p in enumerate(parameters[:num_inputs]):
         param_type = p.annotation
-        if not isinstance(param_type, wp.array):
+        if not matches_array_class(param_type, wp.array):
             if param_type in wp._src.types.value_types:
                 static_args.append(i)
             else:
@@ -1181,7 +1251,7 @@ def jax_kernel(
         # determine launch dimensions from the shape of the first input array
         for i, p in enumerate(parameters[:num_inputs]):
             param_type = p.annotation
-            if isinstance(param_type, wp.array):
+            if matches_array_class(param_type, wp.array):
                 arg = call_args[i]
                 arg_shape = tuple(arg.shape)
                 if hasattr(param_type.dtype, "_wp_scalar_type_"):
@@ -1201,7 +1271,13 @@ def jax_kernel(
     fwd_kernel_wrapper.__annotations__ = {p.name: p.annotation for p in parameters}
     fwd_kernel_wrapper.__annotations__["return"] = None
 
-    jax_fwd_kernel = jax_callable(fwd_kernel_wrapper, num_outputs=num_outputs, vmap_method=vmap_method)
+    jax_fwd_kernel = jax_callable(
+        fwd_kernel_wrapper,
+        num_outputs=num_outputs,
+        vmap_method=vmap_method,
+        module_preload_mode=module_preload_mode,
+        has_side_effect=has_side_effect,
+    )
 
     # backward arguments only include static args once
     bwd_arg_count = 2 * parameter_count - len(static_args)
@@ -1283,6 +1359,8 @@ def jax_kernel(
         bwd_kernel_wrapper,
         num_outputs=len(bwd_input_params) - len(static_args),
         vmap_method=vmap_method,
+        module_preload_mode=module_preload_mode,
+        has_side_effect=has_side_effect,
     )
 
     differentiable_input_indices = [i for i in range(num_inputs) if i not in static_args]
@@ -1308,7 +1386,7 @@ def jax_kernel(
         non_static_inputs, output_vals_tuple = residuals
 
         input_vals = list(non_static_inputs)
-        for i, v in zip(static_args, nondiff_vals):
+        for i, v in zip(static_args, nondiff_vals, strict=True):
             input_vals.insert(i, v)
 
         # Normalize grad outputs and handle nested containers (e.g., single tuple for multi-output)
@@ -1324,12 +1402,12 @@ def jax_kernel(
 
         out_dims_map = {}
         param_ann = {p.name: p.annotation for p in parameters[:num_inputs]}
-        for name, val in zip(differentiable_input_names, non_static_inputs):
+        for name, val in zip(differentiable_input_names, non_static_inputs, strict=True):
             ann = param_ann.get(name)
             if ann is None:
                 continue
             # Check if annotation is a warp array type (annotation is an instance of wp.array)
-            is_array_ann = isinstance(ann, wp.array)
+            is_array_ann = matches_array_class(ann, wp.array)
             if not is_array_ann:
                 continue
             dtype_ndim = 0
@@ -1353,6 +1431,15 @@ def jax_kernel(
     jax_func = jax.custom_vjp(jax_fwd_kernel, nondiff_argnums=tuple(static_args))
     jax_func.defvjp(fwd_function, bwd_function)
 
+    key = (
+        kernel.func,
+        kernel.sig,
+        num_outputs,
+        vmap_method,
+        module_preload_mode,
+        has_side_effect,
+    )
+
     if static_args:
         static_names = [parameters[i].name for i in static_args]
 
@@ -1362,7 +1449,7 @@ def jax_kernel(
         _user_callable.__signature__ = signature
 
         # Cache differentiable wrapper
-        key = (kernel.func, kernel.sig, num_outputs, vmap_method, tuple(sorted(static_names)))
+        key = (*key, tuple(sorted(static_names)))
         with _FFI_REGISTRY_LOCK:
             cached = _FFI_DIFF_KERNEL_REGISTRY.get(key)
             if cached is None:
@@ -1371,7 +1458,7 @@ def jax_kernel(
         return _FFI_DIFF_KERNEL_REGISTRY[key]
 
     # Cache differentiable wrapper (no static args)
-    key = (kernel.func, kernel.sig, num_outputs, vmap_method, ())
+    key = (*key, ())
     with _FFI_REGISTRY_LOCK:
         cached = _FFI_DIFF_KERNEL_REGISTRY.get(key)
         if cached is None:
@@ -1391,6 +1478,7 @@ def jax_callable(
     stage_out_argnames=None,
     graph_cache_max: int | None = None,
     module_preload_mode: ModulePreloadMode = ModulePreloadMode.CURRENT_DEVICE,
+    has_side_effect: bool = False,
 ):
     """Create a JAX callback from an annotated Python function.
 
@@ -1423,6 +1511,8 @@ def jax_callable(
         graph_cache_max: Maximum number of cached graphs captured using ``GraphMode.WARP``.
             If ``None``, use ``warp.jax_experimental.get_jax_callable_default_graph_cache_max()``.
         module_preload_mode: Specify the devices where the module should be preloaded.
+        has_side_effect: Whether the custom call has side effects. When True,
+            the FFI call will be executed even when the outputs are not used.
 
     Limitations:
         - All kernel arguments must be contiguous arrays or scalars.
@@ -1437,14 +1527,22 @@ def jax_callable(
     if graph_cache_max is None:
         graph_cache_max = FfiCallable.default_graph_cache_max
 
+    if isinstance(output_dims, dict):
+        hashable_output_dims = tuple(sorted(output_dims.items()))
+    elif hasattr(output_dims, "__len__"):
+        hashable_output_dims = tuple(output_dims)
+    else:
+        hashable_output_dims = output_dims
+
     # Note: we don't include graph_cache_max in the key, it is applied below.
     key = (
         func,
         num_outputs,
         graph_mode,
         vmap_method,
-        tuple(sorted(output_dims.items())) if output_dims else output_dims,
+        hashable_output_dims,
         module_preload_mode,
+        has_side_effect,
     )
 
     with _FFI_REGISTRY_LOCK:
@@ -1461,6 +1559,7 @@ def jax_callable(
                 stage_out_argnames,
                 graph_cache_max,
                 module_preload_mode,
+                has_side_effect,
             )
             _FFI_CALLABLE_REGISTRY[key] = callable
         else:

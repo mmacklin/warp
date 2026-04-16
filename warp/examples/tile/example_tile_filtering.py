@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 ###########################################################################
 # Example Tile Filtering
@@ -44,7 +32,7 @@ def cplx_prod(x: wp.vec2d, y: wp.vec2d):
 
 
 @wp.kernel
-def conv_tiled(x: wp.array2d(dtype=wp.vec2d), y: wp.array2d(dtype=wp.vec2d), z: wp.array2d(dtype=wp.vec2d)):
+def conv_tiled(x: wp.array2d[wp.vec2d], y: wp.array2d[wp.vec2d], z: wp.array2d[wp.vec2d]):
     a = wp.tile_load(x, shape=(TILE_M, TILE_N))
     b = wp.tile_load(y, shape=(TILE_M, TILE_N))
     wp.tile_fft(a)

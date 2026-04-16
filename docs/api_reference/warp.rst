@@ -178,12 +178,12 @@ Arrays
    :toctree: _generated
 
    array
-   fixedarray
-   tile
    array1d
    array2d
    array3d
    array4d
+   fixedarray
+   tile
    clone
    copy
    empty
@@ -221,17 +221,30 @@ Spatial Acceleration
    BvhQueryTiled
    HashGrid
    HashGridQuery
+   HashGridQueryD
+   HashGridQueryH
    Mesh
    MeshQueryAABB
    MeshQueryAABBTiled
    MeshQueryPoint
    MeshQueryRay
+   Volume
+
+Textures
+--------
+
+.. autosummary::
+   :nosignatures:
+   :toctree: _generated
+
+   GLTextureResource
    Texture
+   Texture1D
    Texture2D
    Texture3D
    TextureAddressMode
    TextureFilterMode
-   Volume
+   TextureResourceFlags
 
 Runtime
 -------
@@ -244,7 +257,9 @@ Runtime
    clear_lto_cache
    init
    is_cpu_available
+   is_cubql_available
    is_cuda_available
+   print_diagnostics
 
 Kernel Programming
 ------------------
@@ -281,6 +296,7 @@ Kernel Execution
    Kernel
    Launch
    Module
+   get_suggested_block_size
    launch
    launch_tiled
    synchronize
@@ -306,7 +322,9 @@ Device Management
    get_cuda_device
    get_cuda_device_count
    get_cuda_devices
+   get_cuda_driver_version
    get_cuda_supported_archs
+   get_cuda_toolkit_version
    get_device
    get_devices
    get_preferred_device

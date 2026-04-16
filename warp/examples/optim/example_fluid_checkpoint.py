@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 ###########################################################################
 # Example Fluid Checkpoint
@@ -56,7 +44,7 @@ FLUID_COLUMN_WIDTH = N_GRID / 10.0
 
 
 @wp.func
-def cyclic_index(idx: wp.int32):
+def cyclic_index(idx: int):
     """Helper function to index with periodic boundary conditions."""
     ret_idx = idx % N_GRID
     if ret_idx < 0:
@@ -65,11 +53,11 @@ def cyclic_index(idx: wp.int32):
 
 
 @wp.kernel
-def fill_initial_density(density: wp.array2d(dtype=wp.float32)):
+def fill_initial_density(density: wp.array2d[float]):
     """Initialize the density array with three bands of fluid."""
     i, j = wp.tid()
 
-    y_pos = wp.float32(i)
+    y_pos = float(i)
 
     if FLUID_COLUMN_WIDTH <= y_pos < 2.0 * FLUID_COLUMN_WIDTH:
         density[i, j] = 1.0
@@ -84,25 +72,25 @@ def fill_initial_density(density: wp.array2d(dtype=wp.float32)):
 @wp.kernel
 def advect(
     dt: float,
-    vx: wp.array2d(dtype=float),
-    vy: wp.array2d(dtype=float),
-    f0: wp.array2d(dtype=float),
-    f1: wp.array2d(dtype=float),
+    vx: wp.array2d[float],
+    vy: wp.array2d[float],
+    f0: wp.array2d[float],
+    f1: wp.array2d[float],
 ):
     """Move field f0 according to vx and vy velocities using an implicit Euler integrator."""
 
     i, j = wp.tid()
 
-    center_xs = wp.float32(i) - vx[i, j] * dt
-    center_ys = wp.float32(j) - vy[i, j] * dt
+    center_xs = float(i) - vx[i, j] * dt
+    center_ys = float(j) - vy[i, j] * dt
 
     # Compute indices of source cells.
-    left_idx = wp.int32(wp.floor(center_xs))
-    bot_idx = wp.int32(wp.floor(center_ys))
+    left_idx = int(wp.floor(center_xs))
+    bot_idx = int(wp.floor(center_ys))
 
-    s1 = center_xs - wp.float32(left_idx)  # Relative weight of right cell
+    s1 = center_xs - float(left_idx)  # Relative weight of right cell
     s0 = 1.0 - s1
-    t1 = center_ys - wp.float32(bot_idx)  # Relative weight of top cell
+    t1 = center_ys - float(bot_idx)  # Relative weight of top cell
     t0 = 1.0 - t1
 
     i0 = cyclic_index(left_idx)
@@ -115,7 +103,7 @@ def advect(
 
 
 @wp.kernel
-def divergence(wx: wp.array2d(dtype=float), wy: wp.array2d(dtype=float), div: wp.array2d(dtype=float)):
+def divergence(wx: wp.array2d[float], wy: wp.array2d[float], div: wp.array2d[float]):
     """Compute div(w)."""
 
     i, j = wp.tid()
@@ -133,7 +121,7 @@ def divergence(wx: wp.array2d(dtype=float), wy: wp.array2d(dtype=float), div: wp
 
 
 @wp.kernel
-def jacobi_iter(div: wp.array2d(dtype=float), p0: wp.array2d(dtype=float), p1: wp.array2d(dtype=float)):
+def jacobi_iter(div: wp.array2d[float], p0: wp.array2d[float], p1: wp.array2d[float]):
     """Calculate a single Jacobi iteration for solving the pressure Poisson equation."""
 
     i, j = wp.tid()
@@ -149,11 +137,11 @@ def jacobi_iter(div: wp.array2d(dtype=float), p0: wp.array2d(dtype=float), p1: w
 
 @wp.kernel
 def update_velocities(
-    p: wp.array2d(dtype=float),
-    wx: wp.array2d(dtype=float),
-    wy: wp.array2d(dtype=float),
-    vx: wp.array2d(dtype=float),
-    vy: wp.array2d(dtype=float),
+    p: wp.array2d[float],
+    wx: wp.array2d[float],
+    wy: wp.array2d[float],
+    vx: wp.array2d[float],
+    vy: wp.array2d[float],
 ):
     """Given p and (wx, wy), compute an 'incompressible' velocity field (vx, vy)."""
 
@@ -164,15 +152,11 @@ def update_velocities(
 
 
 @wp.kernel
-def compute_loss(
-    actual_state: wp.array2d(dtype=float), target_state: wp.array2d(dtype=float), loss: wp.array(dtype=float)
-):
+def compute_loss(actual_state: wp.array2d[float], target_state: wp.array2d[float], loss: wp.array[float]):
     i, j = wp.tid()
 
     loss_value = (
-        (actual_state[i, j] - target_state[i, j])
-        * (actual_state[i, j] - target_state[i, j])
-        / wp.float32(N_GRID * N_GRID)
+        (actual_state[i, j] - target_state[i, j]) * (actual_state[i, j] - target_state[i, j]) / float(N_GRID * N_GRID)
     )
 
     wp.atomic_add(loss, 0, loss_value)
@@ -431,9 +415,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--device", type=str, default=None, help="Override the default Warp device.")
     parser.add_argument(
-        "--num_frames", type=int, default=1000, help="Number of frames to simulate before computing loss."
+        "--num-frames", type=int, default=1000, help="Number of frames to simulate before computing loss."
     )
-    parser.add_argument("--train_iters", type=int, default=50, help="Total number of training iterations.")
+    parser.add_argument("--train-iters", type=int, default=50, help="Total number of training iterations.")
     parser.add_argument(
         "--headless",
         action="store_true",

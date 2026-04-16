@@ -1,19 +1,5 @@
-/*
- * SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: Apache-2.0
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 #include "warp.h"
 
@@ -1905,6 +1891,24 @@ int wp_cuda_driver_version()
 
 int wp_cuda_toolkit_version() { return CUDA_VERSION; }
 
+int wp_nvrtc_version()
+{
+    int major = 0, minor = 0;
+    nvrtcVersion(&major, &minor);
+    return major * 1000 + minor * 10;
+}
+
+const char* wp_libmathdx_version()
+{
+#if WP_ENABLE_MATHDX
+    static char version[64];
+    snprintf(version, sizeof(version), "%d.%d.%d", LIBMATHDX_VER_MAJOR, LIBMATHDX_VER_MINOR, LIBMATHDX_VER_PATCH);
+    return version;
+#else
+    return "";
+#endif
+}
+
 bool wp_cuda_driver_is_initialized() { return is_cuda_driver_initialized(); }
 
 int wp_nvrtc_supported_arch_count()
@@ -1963,6 +1967,13 @@ int wp_cuda_device_get_sm_count(int ordinal)
 {
     if (ordinal >= 0 && ordinal < int(g_devices.size()))
         return g_devices[ordinal].sm_count;
+    return 0;
+}
+
+int wp_cuda_device_get_max_shared_memory(int ordinal)
+{
+    if (ordinal >= 0 && ordinal < int(g_devices.size()))
+        return g_devices[ordinal].max_smem_bytes;
     return 0;
 }
 
@@ -3753,6 +3764,7 @@ size_t wp_cuda_compile_program(
     const char* cuda_src,
     const char* program_name,
     int arch,
+    const char* arch_suffix,
     const char* include_dir,
     int num_cuda_include_dirs,
     const char** cuda_include_dirs,
@@ -3766,7 +3778,7 @@ size_t wp_cuda_compile_program(
     bool compile_time_trace,
     bool precompiled_headers,
     const char* output_path,
-    const char* kernel_cache_dir,
+    const char* pch_dir,
     size_t num_ltoirs,
     char** ltoirs,
     size_t* ltoir_sizes,
@@ -3795,7 +3807,6 @@ size_t wp_cuda_compile_program(
         int minor = 0;
         nvrtcVersion(&major, &minor);
         printf("NVRTC version %d.%d\n", major, minor);
-        printf("Kernel cache directory: %s\n", kernel_cache_dir);
     }
 
     char include_opt[max_path];
@@ -3806,12 +3817,15 @@ size_t wp_cuda_compile_program(
     char arch_opt[max_arch];
     char arch_opt_lto[max_arch];
 
+    // arch_suffix is "" (no suffix), "a" (arch-specific), or "f" (family-specific)
+    const char* suffix = (arch_suffix != nullptr) ? arch_suffix : "";
+
     if (use_ptx) {
-        snprintf(arch_opt, max_arch, "--gpu-architecture=compute_%d", arch);
-        snprintf(arch_opt_lto, max_arch, "-arch=compute_%d", arch);
+        snprintf(arch_opt, max_arch, "--gpu-architecture=compute_%d%s", arch, suffix);
+        snprintf(arch_opt_lto, max_arch, "-arch=compute_%d%s", arch, suffix);
     } else {
-        snprintf(arch_opt, max_arch, "--gpu-architecture=sm_%d", arch);
-        snprintf(arch_opt_lto, max_arch, "-arch=sm_%d", arch);
+        snprintf(arch_opt, max_arch, "--gpu-architecture=sm_%d%s", arch, suffix);
+        snprintf(arch_opt_lto, max_arch, "-arch=sm_%d%s", arch, suffix);
     }
 
     std::vector<const char*> opts;
@@ -3847,8 +3861,11 @@ size_t wp_cuda_compile_program(
         opts.push_back("-pch");
 #if CUDA_VERSION < 13000
         // CUDA 12.x series puts .pch files in the current working directory unless explicitly set
-        if (kernel_cache_dir != nullptr) {
-            std::string pch_dir_opt = std::string("--pch-dir=") + kernel_cache_dir;
+        if (pch_dir != nullptr) {
+            if (print_debug) {
+                printf("PCH directory: %s\n", pch_dir);
+            }
+            std::string pch_dir_opt = std::string("--pch-dir=") + pch_dir;
             stored_options.push_back(pch_dir_opt);
             opts.push_back(stored_options.back().c_str());
         }
@@ -4596,11 +4613,31 @@ size_t wp_cuda_launch_kernel(
     return res;
 }
 
-void wp_cuda_graphics_map(void* context, void* resource)
+bool wp_cuda_get_suggested_block_size(
+    void* context, void* kernel, int shared_memory_bytes, int* block_size_out, int* min_grid_size_out
+)
 {
     ContextGuard guard(context);
 
-    check_cu(cuGraphicsMapResources_f(1, (CUgraphicsResource*)resource, get_current_stream()));
+    int min_grid_size = 0;
+    int block_size = 0;
+    CUresult res = cuOccupancyMaxPotentialBlockSize_f(
+        &min_grid_size, &block_size, (CUfunction)kernel, NULL, shared_memory_bytes, 0
+    );
+
+    if (!check_cu(res))
+        return false;
+
+    *block_size_out = block_size;
+    *min_grid_size_out = min_grid_size;
+    return true;
+}
+
+bool wp_cuda_graphics_map(void* context, void* resource)
+{
+    ContextGuard guard(context);
+
+    return check_cu(cuGraphicsMapResources_f(1, (CUgraphicsResource*)resource, get_current_stream()));
 }
 
 void wp_cuda_graphics_unmap(void* context, void* resource)
@@ -4634,6 +4671,33 @@ void* wp_cuda_graphics_register_gl_buffer(void* context, uint32_t gl_buffer, uns
     }
 
     return resource;
+}
+
+void* wp_cuda_graphics_register_gl_image(void* context, uint32_t image, uint32_t target, unsigned int flags)
+{
+    ContextGuard guard(context);
+
+    CUgraphicsResource* resource = new CUgraphicsResource;
+    bool success = check_cu(cuGraphicsGLRegisterImage_f(resource, image, target, flags));
+    if (!success) {
+        delete resource;
+        return NULL;
+    }
+
+    return resource;
+}
+
+uint64_t wp_cuda_graphics_sub_resource_get_mapped_array(
+    void* context, void* resource, unsigned int array_index, unsigned int mip_level
+)
+{
+    ContextGuard guard(context);
+
+    CUarray cuda_array = NULL;
+    check_cu(
+        cuGraphicsSubResourceGetMappedArray_f(&cuda_array, *(CUgraphicsResource*)resource, array_index, mip_level)
+    );
+    return reinterpret_cast<uint64_t>(cuda_array);
 }
 
 void wp_cuda_graphics_unregister_resource(void* context, void* resource)

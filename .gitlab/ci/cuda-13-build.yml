@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 # ==============================================================================
 # Warp+CUDA 13 Build and Testing Child Pipeline
@@ -105,7 +93,7 @@ check un-namespaced symbols linux-x86_64:
           found_symbols="true"
           continue
         fi
-        output=$(readelf -Ws "$lib" | awk '$7 ~ /^[0-9]+$/ && $8 !~ /^_?wp_/ {print $8}' | grep -Ev '^(_Z|__|\.)' || true)
+        output=$(readelf -Ws "$lib" | awk '$7 ~ /^[0-9]+$/ && $8 !~ /^(_?wp_|PyInit__warp_)/ {print $8}' | grep -Ev '^(_Z|__|\.)' || true)
         
         if [ -n "$output" ]; then
           echo "ERROR: Found un-namespaced symbols in $lib:"
@@ -128,7 +116,7 @@ check un-namespaced symbols linux-x86_64:
 # Creates wheel files for PyPI
 create pypi wheels:
   stage: package
-  image: $UV_BOOKWORM_SLIM_IMAGE
+  image: $UV_TRIXIE_SLIM_IMAGE
   needs:
     - linux-aarch64 build
     - windows-x86_64 build
@@ -164,7 +152,7 @@ create pypi wheels:
 
 publish wheels to gitlab pypi registry:
   stage: deploy
-  image: $UV_BOOKWORM_IMAGE
+  image: $UV_TRIXIE_IMAGE
   needs: ["create pypi wheels"]
   extends:
     - .ipp_lnx_x86_64_cpu_micro
@@ -179,7 +167,7 @@ publish wheels to gitlab pypi registry:
 # Generated files will be in a branch/tag-specific folder
 publish wheels to gitlab package registry:
   stage: deploy
-  image: $UV_BOOKWORM_IMAGE
+  image: $UV_TRIXIE_IMAGE
   needs: ["create pypi wheels"]
   extends:
     - .ipp_lnx_x86_64_cpu_micro

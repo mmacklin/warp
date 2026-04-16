@@ -1,25 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import ctypes
 from functools import reduce
 
 import warp as wp
-from warp._src.context import type_str
+from warp._src.context import _normalize_launch_dim, type_str
 from warp._src.jax import get_jax_device
-from warp._src.types import array_t, launch_bounds_t, strides_from_shape
+from warp._src.types import array_t, launch_bounds_t, matches_array_class, strides_from_shape
 from warp._src.utils import warn
 
 _wp_module_name_ = "warp.jax_experimental.custom_call"
@@ -109,7 +97,8 @@ def _warp_custom_callback(stream, buffers, opaque, opaque_len):
 
     # Parse launch dimensions.
     dims = [int(d) for d in dim_str.split(",")]
-    bounds = launch_bounds_t(dims)
+    normalized = _normalize_launch_dim(dims, kernel.adj.kernel_dim)
+    bounds = launch_bounds_t(normalized)
 
     # Parse arguments.
     arg_strings = args_str.split(";")
@@ -182,9 +171,9 @@ def _create_jax_warp_primitive():
         # Figure out the number of outputs.
         wp_kernel = _registered_kernels[params["kernel"]]
         output_count = len(wp_kernel.adj.args) - len(args)
-        shape, dim = next((a.shape, d) for a, d in zip(args, dims) if d is not None)
+        shape, dim = next((a.shape, d) for a, d in zip(args, dims, strict=True) if d is not None)
         size = shape[dim]
-        args = [batching.bdim_at_front(a, d, size) if len(a.shape) else a for a, d in zip(args, dims)]
+        args = [batching.bdim_at_front(a, d, size) if len(a.shape) else a for a, d in zip(args, dims, strict=True)]
         # Create the batched primitive.
         return _jax_warp_p.bind(*args, **params), [dims[0]] * output_count
 
@@ -336,11 +325,11 @@ def _create_jax_warp_primitive():
         # Figure out the types and shapes of the input arrays.
         arg_strings = []
         operand_layouts = []
-        for actual, warg in zip(args, wp_kernel.adj.args):
+        for actual, warg in zip(args, wp_kernel.adj.args, strict=False):
             wtype = warg.type
             rtt = ir.RankedTensorType(actual.type)
 
-            if not isinstance(wtype, wp.array):
+            if not matches_array_class(wtype, wp.array):
                 raise Exception("Only contiguous arrays are supported for Jax kernel arguments")
 
             if not base_type_is_compatible(wtype.dtype, rtt.element_type):
@@ -364,7 +353,7 @@ def _create_jax_warp_primitive():
         for warg in wp_kernel.adj.args[len(args) :]:
             wtype = warg.type
 
-            if not isinstance(wtype, wp.array):
+            if not matches_array_class(wtype, wp.array):
                 raise Exception("Only contiguous arrays are supported for Jax kernel arguments")
 
             # Infer dimensions from the first input.

@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 ###########################################################################
 # Example CuPy
@@ -27,7 +15,7 @@ import warp as wp
 
 
 @wp.kernel
-def saxpy(x: wp.array(dtype=float), y: wp.array(dtype=float), a: float):
+def saxpy(x: wp.array[float], y: wp.array[float], a: float):
     i = wp.tid()
     y[i] = a * x[i] + y[i]
 
@@ -73,7 +61,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--device", type=str, default=None, help="Override the default Warp device.")
-    parser.add_argument("--num_frames", type=int, default=10, help="Total number of frames.")
+    parser.add_argument("--num-frames", type=int, default=10, help="Total number of frames.")
 
     args = parser.parse_known_args()[0]
 

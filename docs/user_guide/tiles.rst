@@ -3,8 +3,6 @@ Tiles
 
 .. currentmodule:: warp
 
-.. warning:: Tile-based operations in Warp are under preview, APIs are subject to change.
-
 Block-based programming models such as those in OpenAI Triton have proved to be effective ways of expressing high-performance kernels that can leverage cooperative operations on modern GPUs.
 With Warp 1.5.0 [1]_, developers now have access to new tile-based programming primitives in Warp kernels.
 Leveraging cuBLASDx and cuFFTDx, these new tools provide developers with efficient matrix multiplication and Fourier transforms for accelerated simulation and scientific computing. 
@@ -37,7 +35,7 @@ In the following example, we launch a grid of threads where each block is respon
     TILE_THREADS = 64
 
     @wp.kernel
-    def compute(a: wp.array2d(dtype=float), b: wp.array2d(dtype=float)):
+    def compute(a: wp.array2d[float], b: wp.array2d[float]):
 
         # obtain our block index
         i = wp.tid()
@@ -143,7 +141,7 @@ Example: General Matrix Multiply (GEMM)
     TILE_THREADS = 64
 
     @wp.kernel
-    def tile_gemm(A: wp.array2d(dtype=float), B: wp.array2d(dtype=float), C: wp.array2d(dtype=float)):
+    def tile_gemm(A: wp.array2d[float], B: wp.array2d[float], C: wp.array2d[float]):
         
         # output tile index
         i, j = wp.tid()
@@ -190,7 +188,7 @@ Example: General Matrix Multiply (GEMM)
                 inputs=[A_wp, B_wp, C_wp],
                 block_dim=TILE_THREADS)
 
-        assert(np.allclose(C_wp.numpy(), A@B))
+        np.testing.assert_allclose(C_wp.numpy(), A @ B, rtol=1e-3)
 
         print("Example matrix multiplication passed")
 
@@ -205,6 +203,7 @@ Construction
 * :func:`tile_zeros <warp._src.lang.tile_zeros>`
 * :func:`tile_ones <warp._src.lang.tile_ones>`
 * :func:`tile_full <warp._src.lang.tile_full>`
+* :func:`tile_from_thread <warp._src.lang.tile_from_thread>`
 * :func:`tile_randi <warp._src.lang.tile_randi>`
 * :func:`tile_randf <warp._src.lang.tile_randf>`
 * :func:`tile_arange <warp._src.lang.tile_arange>`
@@ -220,8 +219,13 @@ Load/Store
 ^^^^^^^^^^
 
 * :func:`tile_load <warp._src.lang.tile_load>`
+* :func:`tile_load_indexed <warp._src.lang.tile_load_indexed>`
 * :func:`tile_store <warp._src.lang.tile_store>`
+* :func:`tile_store_indexed <warp._src.lang.tile_store_indexed>`
 * :func:`tile_atomic_add <warp._src.lang.tile_atomic_add>`
+* :func:`tile_atomic_add_indexed <warp._src.lang.tile_atomic_add_indexed>`
+* :func:`tile_assign <warp._src.lang.tile_assign>`
+* :func:`tile_extract <warp._src.lang.tile_extract>`
 
 Maps/Reductions
 ^^^^^^^^^^^^^^^
@@ -231,6 +235,167 @@ Maps/Reductions
 * :func:`tile_sum <warp._src.lang.tile_sum>`
 * :func:`tile_min <warp._src.lang.tile_min>`
 * :func:`tile_max <warp._src.lang.tile_max>`
+* :func:`tile_argmin <warp._src.lang.tile_argmin>`
+* :func:`tile_argmax <warp._src.lang.tile_argmax>`
+* :func:`tile_sort <warp._src.lang.tile_sort>`
+* :func:`tile_scan_inclusive <warp._src.lang.tile_scan_inclusive>`
+* :func:`tile_scan_exclusive <warp._src.lang.tile_scan_exclusive>`
+* :func:`tile_scan_max_inclusive <warp._src.lang.tile_scan_max_inclusive>`
+* :func:`tile_scan_min_inclusive <warp._src.lang.tile_scan_min_inclusive>`
+
+Arithmetic
+^^^^^^^^^^
+
+Tiles support standard Python arithmetic operators for element-wise operations.
+These operations are cooperative and execute across all threads in the block.
+
+**Addition and Subtraction**
+
+The ``+`` and ``-`` operators perform element-wise addition and subtraction between two tiles
+of the same shape and dtype:
+
+.. code:: python
+
+    @wp.kernel
+    def add_sub_example(arr_a: wp.array[float], arr_b: wp.array[float]):
+        a = wp.tile_load(arr_a, shape=TILE_SIZE)
+        b = wp.tile_load(arr_b, shape=TILE_SIZE)
+
+        c = a + b    # element-wise addition
+        d = a - b    # element-wise subtraction
+        e = -a       # element-wise negation
+
+Tiles also support the ``+=`` and ``-=`` in-place operators.
+
+**Multiplication** (``*``)
+
+The ``*`` operator supports three forms:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 30 40
+
+   * - Expression
+     - Operand Types
+     - Result
+   * - ``tile * tile``
+     - Both tiles have matching shape; at least one must have scalar dtype
+     - Element-wise multiplication
+   * - ``tile * constant``
+     - Tile and a scalar, vector, or matrix constant
+     - Multiply each tile element by the constant
+   * - ``constant * tile``
+     - A scalar, vector, or matrix constant and a tile
+     - Multiply each tile element by the constant
+
+When one operand is a tile and the other is a constant, the constant is broadcast to all elements.
+At least one of the tile's element type or the constant type must be a scalar. The underlying
+scalar types must match. For example:
+
+.. code:: python
+
+    @wp.kernel
+    def mul_example(arr: wp.array[float]):
+        a = wp.tile_load(arr, shape=TILE_SIZE)     # a tile of floats
+
+        # tile * tile (element-wise)
+        b = a * a
+
+        # tile * scalar
+        c = a * 2.0
+
+        # scalar * tile
+        d = 2.0 * a
+
+        # float tile * vec3f constant -> vec3f tile
+        e = a * wp.vec3(1.0, 2.0, 3.0)
+
+        # vec3f constant * float tile -> vec3f tile
+        f = wp.vec3(1.0, 2.0, 3.0) * a
+
+**Division** (``/``)
+
+The ``/`` operator supports three forms with the same type rules as multiplication:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 30 40
+
+   * - Expression
+     - Operand Types
+     - Result
+   * - ``tile / tile``
+     - Both tiles have matching shape; at least one must have scalar dtype
+     - Element-wise division
+   * - ``tile / constant``
+     - Tile and a scalar, vector, or matrix constant
+     - Divide each tile element by the constant
+   * - ``constant / tile``
+     - A scalar, vector, or matrix constant and a tile
+     - Divide the constant by each tile element
+
+As with multiplication, at least one of the tile's element type or the constant type must be
+a scalar, and the underlying scalar types must match. For example:
+
+.. code:: python
+
+    @wp.kernel
+    def div_example(arr: wp.array[float], vec_arr: wp.array[wp.vec3]):
+        a = wp.tile_load(arr, shape=TILE_SIZE)     # a tile of floats
+
+        # tile / tile (element-wise)
+        b = a / a
+
+        # tile / scalar
+        c = a / 2.0
+
+        # scalar / tile (divides constant by each element)
+        d = 1.0 / a
+
+        # vec3f tile / scalar
+        v = wp.tile_load(vec_arr, shape=TILE_SIZE)  # a tile of vec3f
+        e = v / 2.0
+
+        # float tile / vec3f constant -> vec3f tile
+        f = a / wp.vec3(1.0, 2.0, 4.0)
+
+        # vec3f constant / float tile -> vec3f tile
+        g = wp.vec3(1.0, 2.0, 4.0) / a
+
+**Type Promotion Rules**
+
+The following table summarizes the result type for ``*`` and ``/`` operations between
+tiles and constants:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 35 35 30
+
+   * - Tile Element Type
+     - Constant Type
+     - Result Type
+   * - ``float``
+     - ``float``
+     - ``float``
+   * - ``float``
+     - ``vec3f``
+     - ``vec3f``
+   * - ``float``
+     - ``mat33f``
+     - ``mat33f``
+   * - ``vec3f``
+     - ``float``
+     - ``vec3f``
+   * - ``mat33f``
+     - ``float``
+     - ``mat33f``
+
+Combinations where both the tile element type and the constant type are non-scalar
+(e.g., ``tile<vec3f> * vec3f``) are not supported. Use :func:`tile_map <warp._src.lang.tile_map>`
+with :func:`wp.cw_mul <warp._src.lang.cw_mul>` or :func:`wp.cw_div <warp._src.lang.cw_div>` for
+component-wise vector/matrix operations.
+
+All arithmetic operators support automatic differentiation.
 
 Linear Algebra
 ^^^^^^^^^^^^^^
@@ -240,8 +405,23 @@ Linear Algebra
 * :func:`tile_fft <warp._src.lang.tile_fft>`
 * :func:`tile_ifft <warp._src.lang.tile_ifft>`
 * :func:`tile_cholesky <warp._src.lang.tile_cholesky>`
+* :func:`tile_cholesky_inplace <warp._src.lang.tile_cholesky_inplace>`
 * :func:`tile_cholesky_solve <warp._src.lang.tile_cholesky_solve>`
+* :func:`tile_cholesky_solve_inplace <warp._src.lang.tile_cholesky_solve_inplace>`
+* :func:`tile_lower_solve <warp._src.lang.tile_lower_solve>`
+* :func:`tile_lower_solve_inplace <warp._src.lang.tile_lower_solve_inplace>`
+* :func:`tile_upper_solve <warp._src.lang.tile_upper_solve>`
+* :func:`tile_upper_solve_inplace <warp._src.lang.tile_upper_solve_inplace>`
 * :func:`tile_diag_add <warp._src.lang.tile_diag_add>`
+
+Spatial Queries
+^^^^^^^^^^^^^^^
+
+* :func:`tile_bvh_query_aabb <warp._src.lang.tile_bvh_query_aabb>`
+* :func:`tile_bvh_query_ray <warp._src.lang.tile_bvh_query_ray>`
+* :func:`tile_bvh_query_next <warp._src.lang.tile_bvh_query_next>`
+* :func:`tile_mesh_query_aabb <warp._src.lang.tile_mesh_query_aabb>`
+* :func:`tile_mesh_query_aabb_next <warp._src.lang.tile_mesh_query_aabb_next>`
 
 Tiles and SIMT Code
 -------------------
@@ -291,7 +471,7 @@ On the CPU, ``block_dim`` is set to 1, which can change the behavior of kernels 
     TILE_DIM = 4
 
     @wp.kernel
-    def tile_reduce_blockwise_simt_kernel(output: wp.array(dtype=int)):
+    def tile_reduce_blockwise_simt_kernel(output: wp.array[int]):
         i = wp.tid()
 
         t = wp.tile(i)
@@ -330,7 +510,7 @@ For instance, if we want a full array reduction that works consistently across d
     TILE_DIM = 4
 
     @wp.kernel
-    def tile_reduce_simt_kernel(output: wp.array(dtype=int)):
+    def tile_reduce_simt_kernel(output: wp.array[int]):
         i = wp.tid()
 
         t = wp.tile(i)
@@ -374,7 +554,7 @@ a matrix tile reduction:
     TILE_DIM = 32
 
     @wp.kernel
-    def matrix_reduction_kernel(y: wp.array(dtype=wp.mat33)):
+    def matrix_reduction_kernel(y: wp.array[wp.mat33]):
         i = wp.tid()
         I = wp.identity(3, dtype=wp.float32)
         m = wp.float32(i) * I
@@ -413,8 +593,8 @@ Consider the following sum-of-squares reduction on an array:
 
     @wp.kernel
     def reduce_array_simt(
-        a: wp.array2d(dtype=wp.float64),
-        result: wp.array(dtype=wp.float64),
+        a: wp.array2d[wp.float64],
+        result: wp.array[wp.float64],
     ):
         i, j = wp.tid()
 
@@ -443,8 +623,8 @@ tile into global memory using :func:`wp.tile_atomic_add() <warp._src.lang.tile_a
 
     @wp.kernel
     def reduce_array_tile(
-        a: wp.array2d(dtype=wp.float64),
-        result: wp.array(dtype=wp.float64),
+        a: wp.array2d[wp.float64],
+        result: wp.array[wp.float64],
     ):
         i, j = wp.tid()
 
@@ -474,8 +654,46 @@ Automatic Differentiation
 -------------------------
 
 Warp can automatically generate the backward version of tile-based programs.
-In general, tile programs must obey the same rules for auto-diff as regular Warp programs, e.g. avoiding in-place operations, etc.
+In general, tile programs must obey the same rules for auto-diff as regular Warp programs.
+In-place addition and subtraction (``+=``, ``-=``) on tiles are differentiable;
+in-place multiplication and division are not supported for tiles.
 Please see the :ref:`differentiability` section for more details.
+
+Tiles in ``@wp.func`` Functions
+-------------------------------
+
+Tile parameters in :func:`@wp.func <warp.func>` functions are **passed by reference**. This is
+a departure from other Warp types (scalars, vectors, matrices, etc.), which are passed by value.
+The difference is observable when a function modifies a tile in place:
+
+.. code:: python
+
+    @wp.func
+    def add_bias(t: wp.tile[float, TILE_M, TILE_N]):
+        t += wp.tile_ones(dtype=float, shape=(TILE_M, TILE_N), storage="register") * 5.0
+
+    @wp.kernel(enable_backward=False)
+    def compute(input: wp.array2d[float], out: wp.array2d[float]):
+        i = wp.tid()
+        t = wp.tile_load(input, shape=(TILE_M, TILE_N), offset=(0, 0), storage="shared")
+        add_bias(t)          # modifies t in place — caller sees the change
+        wp.tile_store(out, t) # t now contains input + 5.0
+
+This behavior applies to **both** shared-memory and register tiles, and matches Python's
+semantics for mutable objects. The reasons for pass-by-reference are:
+
+- Shared-memory tiles are handles to a fixed region of shared memory and cannot be copied.
+  Passing by reference lets functions operate on shared tiles directly.
+- Register tiles use the same calling convention for consistency, so that
+  ``@wp.func`` code works identically regardless of the caller's storage choice.
+
+.. note::
+
+   Simple rebinding (``alias = t``) inside a ``@wp.func`` creates a new C++ variable.
+   For register tiles this is a full value copy; for shared tiles the new variable is a
+   non-owning handle to the same shared memory, so element-level writes through either
+   variable affect the same data. In-place assignments (``+=``, ``-=``, etc.) on the
+   original parameter mutate the tile through the reference regardless of storage type.
 
 .. _mathdx:
 

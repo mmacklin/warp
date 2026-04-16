@@ -1,19 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
-from typing import Optional
 
 import numpy as np
 
@@ -30,7 +17,7 @@ _wp_module_name_ = "warp.fem.adaptivity"
 
 
 def adaptive_nanogrid_from_hierarchy(
-    grids: list[wp.Volume], grading: Optional[str] = None, temporary_store: Optional[cache.TemporaryStore] = None
+    grids: list[wp.Volume], grading: str | None = None, temporary_store: cache.TemporaryStore | None = None
 ) -> AdaptiveNanogrid:
     """
     Constructs a :class:`warp.fem.AdaptiveNanogrid` from a non-overlapping grid hierarchy.
@@ -39,7 +26,7 @@ def adaptive_nanogrid_from_hierarchy(
 
     Args:
         grids: List of sparse Volumes, from finest to coarsest
-        grading: Supplementary grading condition, may be ``None``, "face" or "vertex"; see :func:`enforce_nanogrid_grading`
+        grading: Supplementary grading condition, may be ``None``, "face" or "vertex"; ``"face"`` ensures cells sharing a face differ by at most one level, ``"vertex"`` extends this to vertex neighbors
         temporary_store: Storage for temporary allocations
     """
     if not grids:
@@ -65,6 +52,7 @@ def adaptive_nanogrid_from_hierarchy(
             device=device,
             inputs=[l, voxel_offsets[l], grid_voxels, merged_ijks],
         )
+        grid_voxels.release()
 
     # Allocate merged grid
     grid_info = grids[0].get_grid_info()
@@ -74,6 +62,7 @@ def adaptive_nanogrid_from_hierarchy(
         translation=grid_info.translation,
         device=device,
     )
+    merged_ijks.release()
 
     # Get unique voxel and corresponding level
     cell_count = cell_grid.get_voxel_count()
@@ -89,6 +78,7 @@ def adaptive_nanogrid_from_hierarchy(
         dim=cell_count,
         inputs=[level_count, cell_grid_ids, cell_ijk, cell_level],
     )
+    cell_ijk.release()
 
     cell_grid, cell_level = enforce_nanogrid_grading(
         cell_grid, cell_level, level_count=level_count, grading=grading, temporary_store=temporary_store
@@ -102,8 +92,8 @@ def adaptive_nanogrid_from_field(
     level_count: int,
     refinement_field: GeometryField,
     samples_per_voxel: int = 64,
-    grading: Optional[str] = None,
-    temporary_store: Optional[cache.TemporaryStore] = None,
+    grading: str | None = None,
+    temporary_store: cache.TemporaryStore | None = None,
 ) -> AdaptiveNanogrid:
     """
     Constructs a :class:`warp.fem.AdaptiveNanogrid` from a coarse grid and a refinement field.
@@ -114,7 +104,7 @@ def adaptive_nanogrid_from_field(
         refinement_field: Scalar field used as a refinement oracle. If the returned value is negative, the corresponding voxel will be carved out.
             Positive values indicate the desired refinement with 0.0 corresponding to the finest level and 1.0 to the coarsest level.
         samples_per_voxel: How many samples to use for evaluating the refinement field within each voxel
-        grading: Supplementary grading condition, may be ``None``, "face" or "vertex"; see :func:`enforce_nanogrid_grading`
+        grading: Supplementary grading condition, may be ``None``, "face" or "vertex"; ``"face"`` ensures cells sharing a face differ by at most one level, ``"vertex"`` extends this to vertex neighbors
         temporary_store: Storage for temporary allocations
     """
 
@@ -139,7 +129,7 @@ def adaptive_nanogrid_from_field(
         with wp.ScopedDevice(device):
             interpolate(
                 _count_refined_voxels,
-                domain=domain,
+                at=domain,
                 dim=cell_count,
                 fields={"field": refinement_field},
                 values={
@@ -170,10 +160,17 @@ def adaptive_nanogrid_from_field(
                 fine_level,
             ],
         )
+        cell_refinement.release()
+
+        prev_cell_ijk = cell_ijk
+        prev_cell_level = cell_level
 
         # Fine is the new coarse
         cell_ijk = fine_ijk
         cell_level = fine_level
+        prev_cell_ijk.release()
+        prev_cell_level.release()
+    fine_count.release()
 
     wp.launch(_adjust_refined_ijk, dim=fine_shape, device=device, inputs=[cell_ijk, cell_level])
 
@@ -195,6 +192,8 @@ def adaptive_nanogrid_from_field(
         device=device,
         inputs=[fine_grid.id, cell_ijk, cell_level, fine_level],
     )
+    cell_ijk.release()
+    cell_level.release()
 
     fine_grid, fine_level = enforce_nanogrid_grading(
         fine_grid, fine_level, level_count=level_count, grading=grading, temporary_store=temporary_store
@@ -207,8 +206,8 @@ def enforce_nanogrid_grading(
     cell_grid: wp.Volume,
     cell_level: wp.array,
     level_count: int,
-    grading: Optional[str] = None,
-    temporary_store: Optional[cache.TemporaryStore] = None,
+    grading: str | None = None,
+    temporary_store: cache.TemporaryStore | None = None,
 ) -> tuple[wp.Volume, wp.array]:
     """
     Refines an adaptive grid such that if satisfies a grading condition.
@@ -262,6 +261,8 @@ def enforce_nanogrid_grading(
         # Add new coordinates
         fine_shape = int(fine_count.numpy()[0])
         if fine_shape == cell_count:
+            cell_ijk.release()
+            refinement.release()
             break
 
         fine_ijk = cache.borrow_temporary(temporary_store, shape=fine_shape, dtype=wp.vec3i, device=device)
@@ -280,6 +281,8 @@ def enforce_nanogrid_grading(
                 fine_level,
             ],
         )
+        cell_ijk.release()
+        refinement.release()
 
         # Rebuild grid and levels
         cell_grid = wp.Volume.allocate_by_voxels(
@@ -292,7 +295,10 @@ def enforce_nanogrid_grading(
             device=device,
             inputs=[cell_grid.id, fine_ijk, fine_level, cell_level],
         )
+        fine_ijk.release()
+        fine_level.release()
 
+    fine_count.release()
     return cell_grid, cell_level
 
 

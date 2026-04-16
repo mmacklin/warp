@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import contextlib
 import importlib
@@ -33,7 +21,9 @@ import warp.tests.aot.aux_test_mixed_generic_kernels
 import warp.tests.aot.aux_test_mixed_regular_and_generic
 from warp.tests.unittest_utils import *
 
-ADD_KERNEL_START = """import warp as wp
+ADD_KERNEL_START = """# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+import warp as wp
 
 
 @wp.kernel
@@ -41,7 +31,9 @@ def add_kernel(a: wp.array(dtype=wp.int32), b: wp.array(dtype=wp.int32), res: wp
     pass
 """
 
-ADD_KERNEL_FINAL = """import warp as wp
+ADD_KERNEL_FINAL = """# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+import warp as wp
 
 
 @wp.kernel
@@ -229,6 +221,33 @@ def test_module_load_resolution(test, device):
 
 
 class TestModuleAOT(unittest.TestCase):
+    def test_module_compile_deviceless_ptx(self):
+        """Test that a module can be compiled to PTX with an explicit arch and no device.
+
+        This exercises the code path used for ahead-of-time compilation
+        without a CUDA device, e.g. inside a Docker build step.
+        """
+
+        supported_archs = wp.get_cuda_supported_archs()
+        if not supported_archs:
+            self.skipTest("NVRTC not available")
+
+        arch = supported_archs[0]
+
+        try:
+            shutil.rmtree(TEST_CACHE_DIR, ignore_errors=True)
+            TEST_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+            wp.compile_aot_module(
+                warp.tests.aot.aux_test_hash_reload, arch=arch, module_dir=TEST_CACHE_DIR, use_ptx=True
+            )
+
+            module_identifier = wp.get_module("warp.tests.aot.aux_test_hash_reload").get_module_identifier()
+            expected_path = TEST_CACHE_DIR / f"{module_identifier}.sm{arch}.ptx"
+            self.assertTrue(expected_path.exists(), f"Expected compiled PTX file not found: {expected_path}")
+        finally:
+            shutil.rmtree(TEST_CACHE_DIR, ignore_errors=True)
+
     def test_module_compile_specified_arch_ptx(self):
         """Test that a module can be compiled for a specific architecture or architectures (PTX)."""
 
@@ -437,7 +456,54 @@ def test_mixed_generic_kernels_some_without_overloads(test, device):
     assert_np_equal(a.numpy(), np.array([2.0, 4.0, 6.0], dtype=np.float32))
 
 
+def test_aot_cache_skip(test, device):
+    """Test that compile_aot_module skips compilation when binary exists."""
+    try:
+        shutil.rmtree(TEST_CACHE_DIR, ignore_errors=True)
+        TEST_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        module = warp.tests.aot.aux_test_hash_reload
+        wp.set_module_options({"block_dim": 1 if device.is_cpu else 256}, module)
+
+        # First compile — produces binaries
+        wp.compile_aot_module(module, device, module_dir=TEST_CACHE_DIR, strip_hash=True)
+        binaries = [f for f in TEST_CACHE_DIR.iterdir() if f.suffix in (".o", ".cubin", ".ptx")]
+        test.assertGreater(len(binaries), 0)
+
+        # Set mtime to a known past time
+        past_time = 1_000_000_000
+        for f in binaries:
+            os.utime(f, ns=(past_time, past_time))
+
+        # Second compile (cache_kernels=True) — should skip
+        wp.compile_aot_module(module, device, module_dir=TEST_CACHE_DIR, strip_hash=True)
+        for f in binaries:
+            test.assertEqual(
+                f.stat().st_mtime_ns,
+                past_time,
+                f"Binary {f.name} was recompiled when it should have been cached",
+            )
+
+        # Third compile (cache_kernels=False) — should recompile
+        old_val = wp.config.cache_kernels
+        try:
+            wp.config.cache_kernels = False
+            wp.compile_aot_module(module, device, module_dir=TEST_CACHE_DIR, strip_hash=True)
+        finally:
+            wp.config.cache_kernels = old_val
+
+        for f in binaries:
+            test.assertNotEqual(
+                f.stat().st_mtime_ns,
+                past_time,
+                f"Binary {f.name} was NOT recompiled when cache_kernels=False",
+            )
+    finally:
+        shutil.rmtree(TEST_CACHE_DIR, ignore_errors=True)
+        wp.set_module_options({"cuda_output": None, "strip_hash": False}, warp.tests.aot.aux_test_hash_reload)
+
+
 devices = get_test_devices()
+add_function_test(TestModuleAOT, "test_aot_cache_skip", test_aot_cache_skip, devices=devices)
 add_function_test(TestModuleAOT, "test_disable_hashing", test_disable_hashing, devices=devices)
 add_function_test(TestModuleAOT, "test_enable_hashing", test_enable_hashing, devices=devices)
 add_function_test(TestModuleAOT, "test_module_load_resolution", test_module_load_resolution, devices=devices)
@@ -474,5 +540,4 @@ add_function_test(
 )
 
 if __name__ == "__main__":
-    wp.clear_kernel_cache()
     unittest.main(verbosity=2)

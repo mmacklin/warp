@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import unittest
 
@@ -77,6 +65,13 @@ def test_devices_sm_count(test, device):
         test.assertEqual(device.sm_count, 0)
 
 
+def test_devices_max_shared_memory_per_block(test, device):
+    if device.is_cuda:
+        test.assertTrue(device.max_shared_memory_per_block > 0)
+    else:
+        test.assertEqual(device.max_shared_memory_per_block, 0)
+
+
 devices = get_test_devices()
 
 
@@ -86,26 +81,23 @@ class TestDevices(unittest.TestCase):
             wp.unmap_cuda_device("imaginary_device:0")
 
     def test_devices_get_cuda_supported_archs(self):
-        if not wp.is_cuda_available():
-            self.assertEqual(wp.get_cuda_supported_archs(), [], "Should return empty list when CUDA is not available")
-        else:
-            archs = wp.get_cuda_supported_archs()
+        archs = wp.get_cuda_supported_archs()
+        self.assertIsInstance(archs, list)
+
+        if wp.is_cuda_available():
+            # With CUDA devices present, NVRTC must report architectures
             self.assertTrue(len(archs) > 0, "No CUDA supported architectures found")
 
-            # Check all elements are integers
-            for arch in archs:
-                self.assertIsInstance(arch, int, f"Architecture value {arch} should be an integer")
+        # Validate the list contents (may be non-empty even without
+        # CUDA devices when NVRTC is available without a driver)
+        for arch in archs:
+            self.assertIsInstance(arch, int, f"Architecture value {arch} should be an integer")
+            self.assertGreaterEqual(arch, 50, f"Architecture {arch} should be >= 50 (e.g., sm_50)")
+            self.assertLessEqual(arch, 150, f"Architecture {arch} seems unreasonably high")
 
-            # Check the list is sorted
-            self.assertEqual(archs, sorted(archs), "Architecture list should be sorted")
-
-            # Check for no duplicates
-            self.assertEqual(len(archs), len(set(archs)), "Architecture list should not contain duplicates")
-
-            # Check values are reasonable (modern CUDA architectures are >= 50)
-            for arch in archs:
-                self.assertGreaterEqual(arch, 50, f"Architecture {arch} should be >= 50 (e.g., sm_50)")
-                self.assertLessEqual(arch, 150, f"Architecture {arch} seems unreasonably high")
+        # Check the list is sorted with no duplicates
+        self.assertEqual(archs, sorted(archs), "Architecture list should be sorted")
+        self.assertEqual(len(archs), len(set(archs)), "Architecture list should not contain duplicates")
 
 
 add_function_test(
@@ -120,8 +112,13 @@ add_function_test(
 add_function_test(TestDevices, "test_devices_verify_cuda_device", test_devices_verify_cuda_device, devices=devices)
 add_function_test(TestDevices, "test_devices_can_access_self", test_devices_can_access_self, devices=devices)
 add_function_test(TestDevices, "test_devices_sm_count", test_devices_sm_count, devices=devices)
+add_function_test(
+    TestDevices,
+    "test_devices_max_shared_memory_per_block",
+    test_devices_max_shared_memory_per_block,
+    devices=devices,
+)
 
 
 if __name__ == "__main__":
-    wp.clear_kernel_cache()
     unittest.main(verbosity=2)

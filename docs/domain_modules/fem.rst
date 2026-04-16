@@ -68,7 +68,7 @@ Basic Workflow
 The typical steps for solving a linearized PDE with :mod:`warp.fem` are as follow:
 
  - Define a :class:`.Geometry` (grid, mesh, etc). At the moment, 2D and 3D regular grids, NanoVDB volumes, and triangle, quadrilateral, tetrahedron and hexahedron unstructured meshes are supported.
- - Define one or more :class:`.FunctionSpace`, by equipping the geometry elements with shape functions. See :func:`.make_polynomial_space`. At the moment, continuous/discontinuous Lagrange (:math:`P_{k[d]}, Q_{k[d]}`) and Serendipity (:math:`S_k`) shape functions of order :math:`k \leq 3` are supported, as well as linear Nédélec (first kind) and Raviart-Thomas vector-valued shape functions.
+ - Define one or more :class:`.FunctionSpace`, by equipping the geometry elements with shape functions. See :func:`.make_polynomial_space`. At the moment, continuous/discontinuous Lagrange (:math:`P_{k[d]}, Q_{k[d]}`) and Serendipity (:math:`S_k`) shape functions of order :math:`k \leq 3` are supported, as well as linear Nédélec (first kind) and Raviart-Thomas vector-valued shape functions. B-spline shape functions (:math:`B_k`, :math:`k \leq 3`) are also available for grid-based geometries.
  - Define an integration domain, for instance the geometry's cells (:class:`.Cells`) or boundary sides (:class:`.BoundarySides`).
  - Integrate linear forms to build the system's right-hand-side. Define a test function over the function space using :func:`.make_test`,
    a :class:`.Quadrature` formula (or let the module choose one based on the function space degree), and call :func:`.integrate` with the linear form integrand.
@@ -80,28 +80,32 @@ The typical steps for solving a linearized PDE with :mod:`warp.fem` are as follo
  - Solve the resulting linear system using the solver of your choice, for instance one of the built-in :ref:`iterative-linear-solvers`.
 
 
-The following excerpt from the introductory example ``warp/examples/fem/example_diffusion.py`` outlines this procedure: ::
+The following excerpt from the introductory example ``warp/examples/fem/example_diffusion.py`` outlines this procedure:
+
+.. code-block:: python
 
     # Grid geometry
-    geo = Grid2D(n=50, cell_size=2)
+    geo = Grid2D(res=wp.vec2i(resolution))
 
-    # Domain and function spaces
-    domain = Cells(geometry=geo)
-    scalar_space = make_polynomial_space(geo, degree=3)
+    # Scalar function space
+    scalar_space = make_polynomial_space(geo, degree=degree)
 
     # Right-hand-side (forcing term)
+    domain = Cells(geometry=geo)
     test = make_test(space=scalar_space, domain=domain)
     rhs = integrate(linear_form, fields={"v": test})
-
-    # Weakly-imposed boundary conditions on Y sides
-    boundary = BoundarySides(geo)
-    bd_test = make_test(space=scalar_space, domain=boundary)
-    bd_trial = make_trial(space=scalar_space, domain=boundary)
-    bd_matrix = integrate(y_mass_form, fields={"u": bd_trial, "v": bd_test})
 
     # Diffusion form
     trial = make_trial(space=scalar_space, domain=domain)
     matrix = integrate(diffusion_form, fields={"u": trial, "v": test}, values={"nu": viscosity})
+
+    # Boundary conditions on Y sides
+    boundary = BoundarySides(geo)
+    bd_test = make_test(space=scalar_space, domain=boundary)
+    bd_trial = make_trial(space=scalar_space, domain=boundary)
+    bd_matrix = integrate(
+        y_boundary_projector_form, fields={"u": bd_trial, "v": bd_test}, assembly="nodal"
+    )
 
     # Assemble linear system (add diffusion and boundary condition matrices)
     matrix += bd_matrix * boundary_strength
@@ -134,6 +138,9 @@ Introductory Examples
  - ``example_magnetostatics.py``: 2D magnetostatics using a curl-curl formulation
  - ``example_elastic_shape_optimization.py``: Shape optimization of a 2D elastic cantilever beam 
  - ``example_darcy_ls_optimization.py``: Level-set-based optimization of a 2D Darcy flow
+ - ``example_taylor_green.py``: 2D Taylor-Green vortex using mixed Taylor-Hood elements with semi-Lagrangian advection and BDF2 time integration
+ - ``example_kelvin_helmholtz.py``: 2D Kelvin-Helmholtz instability using Discontinuous Galerkin for compressible Euler equations with Rusanov flux and positivity limiter
+ - ``example_shallow_water.py``: 2D shallow water equations using Discontinuous Galerkin with Rusanov flux and positivity limiter
 
 Advanced Usages
 ---------------
@@ -180,6 +187,8 @@ the ``example_streamlines.py`` example for generating 3D streamlines by tracing 
 This operator is also leveraged by the :class:`.PicQuadrature` to provide a way to define Particle-In-Cell quadratures from a set of arbitrary particles,
 making it possible to implement MPM-type methods.
 The particles are automatically bucketed to the geometry cells when the quadrature is initialized.
+For GIMP (Generalized Interpolation Material Point) methods where particles can span multiple cells, 
+:class:`.PicQuadrature` also accepts pre-computed cell indices, coordinates, and particle fractions as a tuple of 2D arrays.
 This is illustrated by the ``example_stokes_transfer.py`` and ``example_apic_fluid.py`` examples.
 
 Nonconforming fields
@@ -235,6 +244,45 @@ though this is a lot less significant when :ref:`mempool_allocators` are in use.
 To overcome this issue, a :class:`.TemporaryStore` object may be created to persist and reuse temporary allocations across calls,
 either globally using :func:`set_default_temporary_store` or at a per-function granularity using the corresponding argument.
 
+Double-precision (fp64) mode
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+By default, :mod:`warp.fem` operates in single precision (``wp.float32``).
+To use double precision, set the scalar type on the geometry:
+
+- For grids, pass ``scalar_type=wp.float64`` to the constructor::
+
+     geo = fem.Grid2D(res=wp.vec2i(10, 10), scalar_type=wp.float64)
+
+- For meshes (``Tetmesh``, ``Trimesh2D``, etc.), precision is inferred from the
+  position array dtype::
+
+     positions = wp.array(pos_np, dtype=wp.vec3d)  # fp64 positions
+     geo = fem.Tetmesh(indices, positions)          # automatically fp64
+
+All downstream objects (function spaces, quadratures, fields, integration
+kernels) automatically inherit the geometry's precision.
+The :func:`.integrate` function defaults ``output_dtype`` to the geometry's
+scalar type, so results are returned at the same precision as the geometry.
+
+Within integrands, the :obj:`.scalar_type` operator returns the geometry's
+scalar type as a constructor, making it possible to write precision-generic
+integrands::
+
+    @fem.integrand
+    def diffusion_form(s: fem.Sample, u: fem.Field, v: fem.Field, nu: float):
+        return fem.scalar_type(u)(nu) * wp.dot(fem.grad(u, s), fem.grad(v, s))
+
+``fem.scalar_type`` accepts both :class:`.Domain` and :class:`.Field` arguments.
+
+See ``example_diffusion.py`` and ``example_magnetostatics.py`` for complete
+examples with ``--fp64`` flags.
+
+.. note::
+   Warp's BVH API operates in fp32. For fp64 geometries, positions are
+   truncated to fp32 for spatial queries (e.g., :obj:`.lookup`); the
+   subsequent Newton iteration refines coordinates at full fp64 precision.
+
 .. _Fields:
 
 Fields
@@ -274,6 +322,7 @@ The following operators are available for use within integrands:
 - :obj:`.measure`: Integration measure (area or volume element).
 - :obj:`.measure_ratio`: Ratio of measures between a domain and its reference element.
 - :obj:`.deformation_gradient`: Deformation gradient of the domain.
+- :obj:`.scalar_type`: Scalar type constructor (``wp.float32`` or ``wp.float64``) for the geometry's precision.
 
 **Discontinuous Galerkin operators** (for use on interior sides):
 

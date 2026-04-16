@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 ###########################################################################
 # Example Sample Mesh
@@ -111,10 +99,10 @@ FACE_VERTEX_INDICES = np.array(
 
 @wp.kernel(enable_backward=False)
 def compute_tri_areas(
-    points: wp.array(dtype=wp.vec3),
-    face_vertex_indices: wp.array(dtype=wp.int32),
-    out_tri_areas: wp.array(dtype=wp.float32),
-    out_total_area: wp.array(dtype=wp.float32),
+    points: wp.array[wp.vec3],
+    face_vertex_indices: wp.array[int],
+    out_tri_areas: wp.array[float],
+    out_total_area: wp.array[float],
 ):
     tri = wp.tid()
 
@@ -140,9 +128,9 @@ def compute_tri_areas(
 
 @wp.kernel(enable_backward=False)
 def compute_probability_distribution(
-    tri_areas: wp.array(dtype=wp.float32),
-    total_area: wp.array(dtype=wp.float32),
-    out_probabilities: wp.array(dtype=wp.float32),
+    tri_areas: wp.array[float],
+    total_area: wp.array[float],
+    out_probabilities: wp.array[float],
 ):
     tri = wp.tid()
 
@@ -153,8 +141,8 @@ def compute_probability_distribution(
 
 @wp.kernel(enable_backward=False)
 def accumulate_cdf(
-    tri_count: wp.int32,
-    out_cdf: wp.array(dtype=wp.float32),
+    tri_count: int,
+    out_cdf: wp.array[float],
 ):
     # Transform probability values into a Cumulative Distribution Function (CDF).
     for tri in range(1, tri_count):
@@ -164,9 +152,9 @@ def accumulate_cdf(
 @wp.kernel(enable_backward=False)
 def sample_mesh(
     mesh: wp.uint64,
-    cdf: wp.array(dtype=wp.float32),
-    seed: wp.int32,
-    out_points: wp.array(dtype=wp.vec3),
+    cdf: wp.array[float],
+    seed: int,
+    out_points: wp.array[wp.vec3],
 ):
     tid = wp.tid()
 
@@ -191,13 +179,13 @@ class Example:
     def __init__(self, stage_path="example_sample_mesh.usd"):
         self.mesh = wp.Mesh(
             points=wp.array(POINTS, dtype=wp.vec3),
-            indices=wp.array(FACE_VERTEX_INDICES, dtype=wp.int32),
+            indices=wp.array(FACE_VERTEX_INDICES, dtype=int),
         )
         self.tri_count = len(FACE_VERTEX_INDICES) // 3
 
         # Compute the area of each triangle and the total area of the mesh.
-        tri_areas = wp.empty(shape=(self.tri_count,), dtype=wp.float32)
-        total_area = wp.zeros(shape=(1,), dtype=wp.float32)
+        tri_areas = wp.empty(shape=(self.tri_count,), dtype=float)
+        total_area = wp.zeros(shape=(1,), dtype=float)
         wp.launch(
             compute_tri_areas,
             dim=tri_areas.shape,
@@ -213,7 +201,7 @@ class Example:
 
         # Build a Cumulative Distribution Function (CDF) where the probability
         # of sampling a given triangle is proportional to its area.
-        self.cdf = wp.empty(shape=(self.tri_count,), dtype=wp.float32)
+        self.cdf = wp.empty(shape=(self.tri_count,), dtype=float)
         wp.launch(
             compute_probability_distribution,
             dim=self.cdf.shape,
@@ -280,12 +268,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--device", type=str, default=None, help="Override the default Warp device.")
     parser.add_argument(
-        "--stage_path",
+        "--stage-path",
         type=lambda x: None if x == "None" else str(x),
         default="example_sample_mesh.usd",
         help="Path to the output USD file.",
     )
-    parser.add_argument("--num_frames", type=int, default=16, help="Total number of frames.")
+    parser.add_argument("--num-frames", type=int, default=16, help="Total number of frames.")
 
     args = parser.parse_known_args()[0]
 

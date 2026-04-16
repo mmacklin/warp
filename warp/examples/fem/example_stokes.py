@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 ###########################################################################
 # Example Stokes
@@ -125,17 +113,18 @@ class Example:
             viscosity_form,
             fields={"u": u_trial, "v": u_test},
             values={"nu": self.viscosity},
+            output_dtype=wp.float64,
         )
 
         # Weak velocity boundary conditions
         u_bd_test = fem.make_test(space=u_space, domain=boundary)
         u_bd_trial = fem.make_trial(space=u_space, domain=boundary)
         u_rhs = fem.integrate(top_mass_form, fields={"u": self._bd_field, "v": u_bd_test}, output_dtype=wp.vec2d)
-        u_bd_matrix = fem.integrate(mass_form, fields={"u": u_bd_trial, "v": u_bd_test})
+        u_bd_matrix = fem.integrate(mass_form, fields={"u": u_bd_trial, "v": u_bd_test}, output_dtype=wp.float64)
 
         # Pressure-velocity coupling
         p_test = fem.make_test(space=p_space, domain=domain)
-        div_matrix = fem.integrate(div_form, fields={"u": u_trial, "q": p_test})
+        div_matrix = fem.integrate(div_form, fields={"u": u_trial, "q": p_test}, output_dtype=wp.float64)
 
         # Define and solve the saddle-point system
         u_matrix = u_visc_matrix
@@ -173,16 +162,16 @@ if __name__ == "__main__":
     parser.add_argument("--resolution", type=int, default=50, help="Grid resolution.")
     parser.add_argument("--degree", type=int, default=2, help="Polynomial degree of shape functions.")
     parser.add_argument(
-        "--top_velocity",
+        "--top-velocity",
         type=float,
         default=1.0,
         help="Horizontal velocity initial condition at the top of the domain.",
     )
     parser.add_argument("--viscosity", type=float, default=1.0, help="Fluid viscosity parameter.")
-    parser.add_argument("--boundary_strength", type=float, default=100.0, help="Soft boundary condition strength.")
+    parser.add_argument("--boundary-strength", type=float, default=100.0, help="Soft boundary condition strength.")
     parser.add_argument("--mesh", choices=("grid", "tri", "quad"), default="grid", help="Mesh type.")
     parser.add_argument(
-        "--nonconforming_pressures", action="store_true", help="For grid, use non-conforming pressure (Q_d/P_{d-1})."
+        "--nonconforming-pressures", action="store_true", help="For grid, use non-conforming pressure (Q_d/P_{d-1})."
     )
     parser.add_argument(
         "--headless",
@@ -208,6 +197,4 @@ if __name__ == "__main__":
         example.render()
 
         if not args.headless:
-            example.renderer.plot(
-                options={"velocity": {"streamlines": {}}, "pressure": {"contours": {}}}, backend="matplotlib"
-            )
+            example.renderer.plot(options={"velocity": {"streamlines": {}}})

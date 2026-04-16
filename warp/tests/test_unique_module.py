@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 """
 Tests for unique module kernel behavior.
@@ -22,11 +10,50 @@ modules. These tests verify correct behavior of kernel and module object reuse w
 same unique kernel is defined multiple times.
 """
 
+import contextlib
+import io
 import unittest
 from typing import Any
 
+import numpy as np
+
 import warp as wp
 from warp.tests.unittest_utils import *
+
+
+@wp.struct
+class _UniqueWriterAData:
+    out: wp.array(dtype=int)
+
+
+@wp.struct
+class _UniqueWriterBData:
+    out: wp.array(dtype=int)
+
+
+@wp.func
+def _unique_writer_a(value: int, writer_data: _UniqueWriterAData, output_index: int):
+    writer_data.out[output_index] = value + 1
+
+
+@wp.func
+def _unique_writer_b(value: int, writer_data: _UniqueWriterBData, output_index: int):
+    writer_data.out[output_index] = value + 2
+
+
+@wp.kernel(module_options={"fast_math": True}, module="unique")
+def _kernel_fast_math(a: wp.array(dtype=float), b: wp.array(dtype=float)):
+    tid = wp.tid()
+    b[tid] = a[tid] + 1.0
+
+
+def _make_unique_writer_kernel(writer_func: Any):
+    @wp.kernel(module="unique")
+    def _unique_writer_kernel(values: wp.array(dtype=int), writer_data: Any):
+        tid = wp.tid()
+        writer_func(values[tid], writer_data, tid)
+
+    return _unique_writer_kernel
 
 
 def test_unique_module_kernel_object_reuse(test, device):
@@ -71,8 +98,8 @@ class TestUniqueModule(unittest.TestCase):
         """Test that generic unique kernels reuse the same kernel object across redefinitions.
 
         When a generic kernel with module="unique" is defined multiple times in a loop,
-        each redefinition should return the same kernel object (the registry containing
-        all overloads), ensuring consistent behavior.
+        each redefinition should return the same Kernel object (which holds all
+        type-specialized overloads), ensuring consistent behavior.
         """
         kernel_objects = []
         module_objects = []
@@ -114,6 +141,114 @@ class TestUniqueModule(unittest.TestCase):
 
         # Verify overloads were added to the same kernel object
         self.assertEqual(len(generic_unique_kernel.overloads), 2, "Should have 2 overloads (float32 and float64)")
+
+    def test_module_options_routing(self):
+        """Verify that module_options are applied and affect module identity."""
+        self.assertTrue(_kernel_fast_math.module.options["fast_math"])
+
+        # Define an identical kernel without fast_math to prove the option
+        # changes the module hash (not just the dict value).
+        @wp.kernel(module_options={"fast_math": False}, module="unique")
+        def _kernel_no_fast_math(a: wp.array(dtype=float), b: wp.array(dtype=float)):
+            tid = wp.tid()
+            b[tid] = a[tid] + 1.0
+
+        self.assertFalse(_kernel_no_fast_math.module.options["fast_math"])
+        self.assertNotEqual(
+            _kernel_fast_math.module.name,
+            _kernel_no_fast_math.module.name,
+            "Different module_options must produce different module names",
+        )
+
+        # Launch to verify the kernel compiles and runs end-to-end.
+        a = wp.array([1.0, 2.0, 3.0], dtype=float, device="cpu")
+        b = wp.zeros(3, dtype=float, device="cpu")
+        wp.launch(_kernel_fast_math, dim=3, inputs=[a, b], device="cpu")
+        np.testing.assert_allclose(b.numpy(), [2.0, 3.0, 4.0])
+
+    def test_module_options_error_without_unique(self):
+        """ValueError raised when module_options are used without ``module="unique"``."""
+        with self.assertRaises(ValueError) as cm:
+
+            @wp.kernel(module_options={"fast_math": True})
+            def _bad_kernel(a: wp.array(dtype=float)):
+                pass
+
+        self.assertIn("module_options", str(cm.exception))
+        self.assertIn('module="unique"', str(cm.exception))
+
+    def test_module_options_empty_dict(self):
+        """``module_options={}`` with ``module="unique"`` behaves the same as ``module_options=None``."""
+        with contextlib.redirect_stdout(io.StringIO()) as f:
+
+            @wp.kernel(module="unique", module_options={})
+            def _empty_opts_kernel(a: wp.array(dtype=float)):
+                pass
+
+        self.assertEqual(f.getvalue(), "")
+
+    def test_module_options_empty_dict_non_unique_raises(self):
+        """``module_options={}`` without ``module="unique"`` raises ``ValueError``."""
+        with self.assertRaises(ValueError) as cm:
+
+            @wp.kernel(module_options={})
+            def _bad_kernel(a: wp.array(dtype=float)):
+                pass
+
+        self.assertIn('module="unique"', str(cm.exception))
+
+    def test_module_options_no_warning_unique(self):
+        """No warning when module_options are used with ``module="unique"``."""
+        with contextlib.redirect_stdout(io.StringIO()) as f:
+
+            @wp.kernel(module_options={"fast_math": True}, module="unique")
+            def _no_warn_kernel(a: wp.array(dtype=float)):
+                pass
+
+        self.assertEqual(f.getvalue(), "")
+
+    def test_module_options_multiple_keys(self):
+        """Multiple module_options are applied to unique modules."""
+
+        @wp.kernel(module_options={"fast_math": True, "mode": "release"}, module="unique")
+        def _multi_opts_kernel(a: wp.array(dtype=float)):
+            pass
+
+        self.assertTrue(_multi_opts_kernel.module.options["fast_math"])
+        self.assertEqual(_multi_opts_kernel.module.options["mode"], "release")
+
+    def test_module_options_unknown_key(self):
+        """ValueError raised for unrecognized module_options keys."""
+        with self.assertRaises(ValueError) as cm:
+
+            @wp.kernel(module_options={"fast_mth": True}, module="unique")
+            def _typo_kernel(a: wp.array(dtype=float)):
+                pass
+
+        self.assertIn("fast_mth", str(cm.exception))
+        self.assertIn("Valid options", str(cm.exception))
+
+    def test_module_options_invalid_type(self):
+        """TypeError raised when module_options is not a dict."""
+        with self.assertRaises(TypeError) as cm:
+
+            @wp.kernel(module_options="fast_math", module="unique")
+            def _bad_kernel(a: wp.array(dtype=float)):
+                pass
+
+        self.assertIn("must be a dict", str(cm.exception))
+        self.assertIn("str", str(cm.exception))
+
+    def test_module_options_error_with_named_module(self):
+        """ValueError raised when module_options are used with a named (non-unique) module."""
+        with self.assertRaises(ValueError) as cm:
+
+            @wp.kernel(module_options={"fast_math": True}, module="some_shared_module")
+            def _named_mod_kernel(a: wp.array(dtype=float)):
+                pass
+
+        self.assertIn("module_options", str(cm.exception))
+        self.assertIn('module="unique"', str(cm.exception))
 
     def test_unique_module_generic_multiple_overloads(self):
         """Test that multiple overloads of a generic unique kernel work correctly.
@@ -184,13 +319,201 @@ class TestUniqueModule(unittest.TestCase):
             assert_np_equal(y_i32_2.numpy(), [10, 12, 14])
 
 
+def test_unique_module_deferred_static_expressions(test, device):
+    """Test that unique modules correctly hash deferred wp.static() expressions.
+
+    Some wp.static() expressions cannot be evaluated at kernel declaration time
+    and must be deferred until codegen (e.g., when they reference a loop variable).
+    This test verifies that unique modules properly resolve and include these
+    deferred expressions in the hash, ensuring kernels with different static
+    values get different hashes.
+    """
+
+    def make_kernel(values):
+        @wp.kernel(module="unique", enable_backward=False)
+        def kernel_with_deferred_static(result: wp.array(dtype=int)):
+            tid = wp.tid()
+            if tid == 0:
+                for i in range(wp.static(len(values))):
+                    # wp.static(values[i]) references loop var 'i', so it's deferred
+                    result[i] = wp.static(values[i])
+
+        return kernel_with_deferred_static
+
+    # Create two kernels with different values but same length
+    kernel1 = make_kernel([100, 200])
+    kernel2 = make_kernel([999, 888])
+
+    # They should be different kernel objects (different hashes)
+    test.assertIsNot(kernel1, kernel2, "Kernels with different static values should be different objects")
+    test.assertNotEqual(
+        kernel1.module.name,
+        kernel2.module.name,
+        "Kernels with different static values should have different module names",
+    )
+
+    # Verify they produce correct results
+    result1 = wp.zeros(2, dtype=int, device=device)
+    wp.launch(kernel1, dim=1, inputs=[], outputs=[result1], device=device)
+    assert_np_equal(result1.numpy(), np.array([100, 200]))
+
+    result2 = wp.zeros(2, dtype=int, device=device)
+    wp.launch(kernel2, dim=1, inputs=[], outputs=[result2], device=device)
+    assert_np_equal(result2.numpy(), np.array([999, 888]))
+
+    # Test with same last element but different first element — the hash must
+    # capture ALL loop iterations, not just the last one (GH-1211)
+    kernel3 = make_kernel([100, 999])
+    kernel4 = make_kernel([200, 999])
+    test.assertIsNot(kernel3, kernel4, "Kernels differing only in non-last elements should be different")
+    test.assertNotEqual(kernel3.module.name, kernel4.module.name)
+
+    result3 = wp.zeros(2, dtype=int, device=device)
+    wp.launch(kernel3, dim=1, inputs=[], outputs=[result3], device=device)
+    assert_np_equal(result3.numpy(), np.array([100, 999]))
+
+    result4 = wp.zeros(2, dtype=int, device=device)
+    wp.launch(kernel4, dim=1, inputs=[], outputs=[result4], device=device)
+    assert_np_equal(result4.numpy(), np.array([200, 999]))
+
+    # Test with different length to ensure distinct hash from 2-element kernels
+    kernel5 = make_kernel([1, 2, 3])
+    test.assertIsNot(kernel5, kernel1, "Kernels with different lengths should be different objects")
+    test.assertNotEqual(kernel5.module.name, kernel1.module.name)
+
+    result5 = wp.zeros(3, dtype=int, device=device)
+    wp.launch(kernel5, dim=1, inputs=[], outputs=[result5], device=device)
+    assert_np_equal(result5.numpy(), np.array([1, 2, 3]))
+
+    # Test that identical values reuse the same kernel (hash stability)
+    kernel1_dup = make_kernel([100, 200])
+    test.assertIs(kernel1_dup, kernel1, "Identical values should reuse the same kernel object")
+
+
+def test_unique_module_generic_closure_disambiguation(test, device):
+    """Different closure-bound funcs should not collide for generic unique kernels.
+
+    This covers the generic/no-overload declaration-time path where module naming
+    must incorporate closure-bound function identity.
+    """
+    kernel_a = _make_unique_writer_kernel(_unique_writer_a)
+    kernel_b = _make_unique_writer_kernel(_unique_writer_b)
+
+    test.assertIsNot(kernel_a, kernel_b, "Different closure-bound writer funcs must create different kernels")
+    test.assertNotEqual(
+        kernel_a.module.name,
+        kernel_b.module.name,
+        "Different closure-bound writer funcs must create different unique module names",
+    )
+
+    with wp.ScopedDevice(device):
+        values = wp.array([1, 2, 3], dtype=int)
+
+        writer_a_data = _UniqueWriterAData()
+        writer_a_data.out = wp.zeros(3, dtype=int)
+        wp.launch(kernel_a, dim=3, inputs=[values, writer_a_data])
+        assert_np_equal(writer_a_data.out.numpy(), np.array([2, 3, 4]))
+
+        writer_b_data = _UniqueWriterBData()
+        writer_b_data.out = wp.zeros(3, dtype=int)
+        wp.launch(kernel_b, dim=3, inputs=[values, writer_b_data])
+        assert_np_equal(writer_b_data.out.numpy(), np.array([3, 4, 5]))
+
+
+def test_unique_module_generic_closure_reuse(test, device):
+    """The same closure-bound func should still be stable and reusable."""
+    first_kernel = _make_unique_writer_kernel(_unique_writer_a)
+    second_kernel = _make_unique_writer_kernel(_unique_writer_a)
+
+    test.assertIs(first_kernel, second_kernel, "Same closure-bound writer func should reuse kernel object")
+    test.assertIs(first_kernel.module, second_kernel.module, "Same closure-bound writer func should reuse module")
+
+    with wp.ScopedDevice(device):
+        values = wp.array([4, 5, 6], dtype=int)
+        writer_data = _UniqueWriterAData()
+        writer_data.out = wp.zeros(3, dtype=int)
+        wp.launch(second_kernel, dim=3, inputs=[values, writer_data])
+        assert_np_equal(writer_data.out.numpy(), np.array([5, 6, 7]))
+
+
+def test_unique_module_nongeneric_closure_disambiguation(test, device):
+    """Non-generic closure kernels with different captured functions must get different modules.
+
+    This tests the ModuleHasher path for closure disambiguation independently
+    of the generic-kernel salt path (which only applies to generic kernels that
+    have no instantiated overloads at declaration time).
+    """
+
+    @wp.func
+    def _add_ten(x: int) -> int:
+        return x + 10
+
+    @wp.func
+    def _add_twenty(x: int) -> int:
+        return x + 20
+
+    def _make_nongeneric_closure_kernel(helper_func):
+        @wp.kernel(module="unique")
+        def _nongeneric_closure_kernel(inp: wp.array(dtype=int), out: wp.array(dtype=int)):
+            tid = wp.tid()
+            out[tid] = helper_func(inp[tid])
+
+        return _nongeneric_closure_kernel
+
+    kernel_ten = _make_nongeneric_closure_kernel(_add_ten)
+    kernel_twenty = _make_nongeneric_closure_kernel(_add_twenty)
+
+    # Different closure bindings must produce different modules
+    test.assertIsNot(kernel_ten, kernel_twenty, "Different closure funcs must create different kernels")
+    test.assertNotEqual(
+        kernel_ten.module.name,
+        kernel_twenty.module.name,
+        "Different closure funcs must create different module names",
+    )
+
+    # Verify correct results
+    with wp.ScopedDevice(device):
+        inp = wp.array([1, 2, 3], dtype=int)
+
+        out_ten = wp.zeros(3, dtype=int)
+        wp.launch(kernel_ten, dim=3, inputs=[inp, out_ten])
+        assert_np_equal(out_ten.numpy(), np.array([11, 12, 13]))
+
+        out_twenty = wp.zeros(3, dtype=int)
+        wp.launch(kernel_twenty, dim=3, inputs=[inp, out_twenty])
+        assert_np_equal(out_twenty.numpy(), np.array([21, 22, 23]))
+
+
 devices = get_test_devices()
 
 add_function_test(
     TestUniqueModule, "test_unique_module_kernel_object_reuse", test_unique_module_kernel_object_reuse, devices=devices
 )
+add_function_test(
+    TestUniqueModule,
+    "test_unique_module_deferred_static_expressions",
+    test_unique_module_deferred_static_expressions,
+    devices=devices,
+)
+add_function_test(
+    TestUniqueModule,
+    "test_unique_module_generic_closure_disambiguation",
+    test_unique_module_generic_closure_disambiguation,
+    devices=devices,
+)
+add_function_test(
+    TestUniqueModule,
+    "test_unique_module_generic_closure_reuse",
+    test_unique_module_generic_closure_reuse,
+    devices=devices,
+)
+add_function_test(
+    TestUniqueModule,
+    "test_unique_module_nongeneric_closure_disambiguation",
+    test_unique_module_nongeneric_closure_disambiguation,
+    devices=devices,
+)
 
 
 if __name__ == "__main__":
-    wp.clear_kernel_cache()
     unittest.main(verbosity=2)

@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 #############################################################################
 # Example Differentiable Ray Caster
@@ -52,13 +40,13 @@ class RenderMesh:
     """
 
     id: wp.uint64
-    vertices: wp.array(dtype=wp.vec3)
-    indices: wp.array(dtype=int)
-    tex_coords: wp.array(dtype=wp.vec2)
-    tex_indices: wp.array(dtype=int)
-    vertex_normals: wp.array(dtype=wp.vec3)
-    pos: wp.array(dtype=wp.vec3)
-    rot: wp.array(dtype=wp.quat)
+    vertices: wp.array[wp.vec3]
+    indices: wp.array[int]
+    tex_coords: wp.array[wp.vec2]
+    tex_indices: wp.array[int]
+    vertex_normals: wp.array[wp.vec3]
+    pos: wp.array[wp.vec3]
+    rot: wp.array[wp.quat]
 
 
 @wp.struct
@@ -78,15 +66,13 @@ class Camera:
 class DirectionalLights:
     """Stores arrays of directional light directions and intensities."""
 
-    dirs: wp.array(dtype=wp.vec3)
-    intensities: wp.array(dtype=float)
+    dirs: wp.array[wp.vec3]
+    intensities: wp.array[float]
     num_lights: int
 
 
 @wp.kernel
-def vertex_normal_sum_kernel(
-    verts: wp.array(dtype=wp.vec3), indices: wp.array(dtype=int), normal_sums: wp.array(dtype=wp.vec3)
-):
+def vertex_normal_sum_kernel(verts: wp.array[wp.vec3], indices: wp.array[int], normal_sums: wp.array[wp.vec3]):
     tid = wp.tid()
 
     i = indices[tid * 3]
@@ -108,15 +94,15 @@ def vertex_normal_sum_kernel(
 
 @wp.kernel
 def normalize_kernel(
-    normal_sums: wp.array(dtype=wp.vec3),
-    vertex_normals: wp.array(dtype=wp.vec3),
+    normal_sums: wp.array[wp.vec3],
+    vertex_normals: wp.array[wp.vec3],
 ):
     tid = wp.tid()
     vertex_normals[tid] = wp.normalize(normal_sums[tid])
 
 
 @wp.func
-def texture_interpolation(tex_interp: wp.vec2, texture: wp.array2d(dtype=wp.vec3)):
+def texture_interpolation(tex_interp: wp.vec2, texture: wp.array2d[wp.vec3]):
     tex_width = texture.shape[1]
     tex_height = texture.shape[0]
     tex = wp.vec2(tex_interp[0] * float(tex_width - 1), (1.0 - tex_interp[1]) * float(tex_height - 1))
@@ -142,10 +128,10 @@ def texture_interpolation(tex_interp: wp.vec2, texture: wp.array2d(dtype=wp.vec3
 def draw_kernel(
     mesh: RenderMesh,
     camera: Camera,
-    texture: wp.array2d(dtype=wp.vec3),
+    texture: wp.array2d[wp.vec3],
     rays_width: int,
     rays_height: int,
-    rays: wp.array(dtype=wp.vec3),
+    rays: wp.array[wp.vec3],
     lights: DirectionalLights,
     mode: int,
 ):
@@ -219,9 +205,7 @@ def draw_kernel(
 
 
 @wp.kernel
-def downsample_kernel(
-    rays: wp.array(dtype=wp.vec3), pixels: wp.array(dtype=wp.vec3), rays_width: int, num_samples: int
-):
+def downsample_kernel(rays: wp.array[wp.vec3], pixels: wp.array[wp.vec3], rays_width: int, num_samples: int):
     tid = wp.tid()
 
     pixels_width = rays_width / num_samples
@@ -242,7 +226,7 @@ def downsample_kernel(
 
 
 @wp.kernel
-def loss_kernel(pixels: wp.array(dtype=wp.vec3), target_pixels: wp.array(dtype=wp.vec3), loss: wp.array(dtype=float)):
+def loss_kernel(pixels: wp.array[wp.vec3], target_pixels: wp.array[wp.vec3], loss: wp.array[float]):
     tid = wp.tid()
 
     pixel = pixels[tid]
@@ -261,7 +245,7 @@ def loss_kernel(pixels: wp.array(dtype=wp.vec3), target_pixels: wp.array(dtype=w
 
 
 @wp.kernel
-def normalize(x: wp.array(dtype=wp.quat)):
+def normalize(x: wp.array[wp.quat]):
     tid = wp.tid()
 
     x[tid] = wp.normalize(x[tid])
@@ -503,7 +487,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--device", type=str, default=None, help="Override the default Warp device.")
-    parser.add_argument("--train_iters", type=int, default=150, help="Total number of training iterations.")
+    parser.add_argument("--train-iters", type=int, default=150, help="Total number of training iterations.")
     parser.add_argument("--height", type=int, default=1024, help="Height of rendered image in pixels.")
     parser.add_argument(
         "--headless",

@@ -5,10 +5,30 @@ If your work utilizes Warp, we encourage you to share it with us. To add your pu
 pull request on GitHub or email a link to your arXiv preprint (preferred) or DOI to
 [warp-python@nvidia.com](mailto:warp-python@nvidia.com).
 
+## 2026
+
+- **Discovering neural cohesive zone laws from displacement fields**. *G. Barkoulis Gavris, W. Sun*. April 2026. [DOI:10.1016/j.cma.2026.118733](https://doi.org/10.1016/j.cma.2026.118733)
+- **CReF: Cross-modal and Recurrent Fusion for Depth-conditioned Humanoid Locomotion**. *Y. Hao, R. Yu, S. Luo, G. Zhang, J. Wu, Q. Zhu*. March 2026. [arXiv:2603.29452](https://arxiv.org/abs/2603.29452)
+- **PhySkin: Physics-based Bone-driven Neural Garment Simulation**. *A. Srivastava, H. Chen, R. Goldade, P. Herholz, Z. Jiang, G. W. Lin, L. Yang, N. Sarafianos, T. Stuyck, E. Larionov*. March 2026. [arXiv:2603.27013](https://arxiv.org/abs/2603.27013)
+- **Kamino: GPU-based Massively Parallel Simulation of Multi-Body Systems with Challenging Topologies**. *V. Tsounis, G. Maloisel, C. Schumacher, R. Grandia, A. Serifi, D. Müller, C. Amevor, T. Widmer, M. Bächer*. March 2026. [arXiv:2603.16536](https://arxiv.org/abs/2603.16536)
+- **Physically Accurate Rigid-Body Dynamics in Particle-Based Simulation**. *A. Abderezaei, N. Nechyporenko, J. Miceli, G. Briscoe-Martinez, A. Roncone*. March 2026. [arXiv:2603.14634](https://arxiv.org/abs/2603.14634)
+- **ComFree-Sim: A GPU-Parallelized Analytical Contact Physics Engine for Scalable Contact-Rich Robotics Simulation and Control**. *C. Borse, Z. Xie, W. Huang, W. Jin*. March 2026. [arXiv:2603.12185](https://arxiv.org/abs/2603.12185)
+- **cuRoboV2: Dynamics-Aware Motion Generation with Depth-Fused Distance Fields for High-DoF Robots**. *B. Sundaralingam, A. Murali, S. Birchfield*. March 2026. [arXiv:2603.05493](https://arxiv.org/abs/2603.05493)
+- **GaussTwin: Unified Simulation and Correction with Gaussian Splatting for Robotic Digital Twins**. *Y. Cai, P. Jansonnie, C. de Farias, O. Arenz, J. Peters*. March 2026. [arXiv:2603.05108](https://arxiv.org/abs/2603.05108)
+- **X-Loco: Towards Generalist Humanoid Locomotion Control via Synergetic Policy Distillation**. *D. Wang, X. Wang, C. Zhang, J. Shi, Y. Zhao, C. Bai, X. Li*. March 2026. [arXiv:2603.03733](https://arxiv.org/abs/2603.03733)
+- **RPL: Learning Robust Humanoid Perceptive Locomotion on Challenging Terrains**. *Y. Zhang, Y. Seo, J. Chen, Y. Yuan, K. Sreenath, P. Abbeel, C. Sferrazza, K. Liu, R. Duan, G. Shi*. February 2026. [arXiv:2602.03002](https://arxiv.org/abs/2602.03002)
+- **TTT-Parkour: Rapid Test-Time Training for Perceptive Robot Parkour**. *S. Zhu, B. Ye, J. Wang, J. Chen, Z. Zhuang, L. Mou, R. Huang, H. Zhao*. February 2026. [arXiv:2602.02331](https://arxiv.org/abs/2602.02331)
+- **mjlab: A Lightweight Framework for GPU-Accelerated Robot Learning**. *K. Zakka, Q. Liao, B. Yi, L. L. Lay, K. Sreenath, P. Abbeel*. January 2026. [arXiv:2601.22074](https://arxiv.org/abs/2601.22074)
+- **EMPM: Embodied MPM for Modeling and Simulation of Deformable Objects**. *Y. Chen, Y. Hu, L. Sun, T. Kusnur, L. Herlant, C. Jiang*. January 2026. [arXiv:2601.17251](https://arxiv.org/abs/2601.17251)
+- **FocusNav: Spatial Selective Attention with Waypoint Guidance for Humanoid Local Navigation**. *Y. Zhang, J. Ma, L. Yan, Z. Cao, Y. Zhang, H. Li, Y. Gao*. January 2026. [arXiv:2601.12790](https://arxiv.org/abs/2601.12790)
+- **Hiking in the Wild: A Scalable Perceptive Parkour Framework for Humanoids**. *S. Zhu, Z. Zhuang, M. Zhao, K. Lee, H. Zhao*. January 2026. [arXiv:2601.07718](https://arxiv.org/abs/2601.07718)
+- **GPU-Accelerated Cholesky Factorization of Block Tridiagonal Matrices**. *R. Schwan, D. Kuhn, C. N. Jones*. January 2026. [arXiv:2601.03754](https://arxiv.org/abs/2601.03754)
+
 ## 2025
 
 - **AnimaMimic: Imitating 3D Animation from Video Priors**. *T. Xie, Y. Chen, Y. Guo, Y. Yang, B. Zhou, D. Terzopoulos, Y. Jiang, C. Jiang*. December 2025. [arXiv:2512.14133](https://arxiv.org/abs/2512.14133)
 - **START: Traversing Sparse Footholds with Terrain Reconstruction**. *R. Yu, Q. Wang, H. Li, Z. Jun, Z. Wang, J. Wu, Q. Zhu*. December 2025. [arXiv:2512.13153](https://arxiv.org/abs/2512.13153)
+- **Stable autonomous visual navigation: an expert prediction approach**. *E. Wendel, J. Baillieul, J. Hollmann*. December 2025. [DOI:10.1109/cdc57313.2025.11312820](https://doi.org/10.1109/cdc57313.2025.11312820)
 - **Gallant: Voxel Grid-based Humanoid Locomotion and Local-navigation across 3D Constrained Terrains**. *Q. Ben, B. Xu, K. Li, F. Jia, W. Zhang, J. Wang, J. Wang, D. Lin, J. Pang*. November 2025. [arXiv:2511.14625](https://arxiv.org/abs/2511.14625)
 - **NeuSpring: Neural Spring Fields for Reconstruction and Simulation of Deformable Objects from Videos**. *Q. Xu, J. Liu, S. Yu, Y. Wang, Y. Zhou, J. Zhou, J. Cui, Y. Ong, H. Zhang*. November 2025. [arXiv:2511.08310](https://arxiv.org/abs/2511.08310)
 - **Improving Long-Range Interactions in Graph Neural Simulators via Hamiltonian Dynamics**. *T. Hoang, A. Trenta, A. Gravina, N. Freymuth, P. Becker, D. Bacciu, G. Neumann*. November 2025. [arXiv:2511.08185](https://arxiv.org/abs/2511.08185)
@@ -102,3 +122,9 @@ pull request on GitHub or email a link to your arXiv preprint (preferred) or DOI
 - **NODE IK: Solving Inverse Kinematics with Neural Ordinary Differential Equations for Path Planning**. *S. Park, M. Schwartz, J. Park*. September 2022. [arXiv:2209.00498](https://arxiv.org/abs/2209.00498)
 - **Differentiable Physics Simulations with Contacts: Do They Have Correct Gradients w.r.t. Position, Velocity and Control?**. *Y. D. Zhong, J. Han, G. O. Brikis*. July 2022. [arXiv:2207.05060](https://arxiv.org/abs/2207.05060)
 - **Rethinking Optimization with Differentiable Simulation from a Global Perspective**. *R. Antonova, J. Yang, K. M. Jatavallabhula, J. Bohg*. June 2022. [arXiv:2207.00167](https://arxiv.org/abs/2207.00167)
+- **Accelerated Policy Learning with Parallel Differentiable Simulation**. *J. Xu, V. Makoviychuk, Y. Narang, F. Ramos, W. Matusik, A. Garg, M. Macklin*. April 2022. [arXiv:2204.07137](https://arxiv.org/abs/2204.07137)
+
+## 2021
+
+- **DiSECt: A Differentiable Simulation Engine for Autonomous Robotic Cutting**. *E. Heiden, M. Macklin, Y. Narang, D. Fox, A. Garg, F. Ramos*. May 2021. [arXiv:2105.12244](https://arxiv.org/abs/2105.12244)
+- **gradSim: Differentiable simulation for system identification and visuomotor control**. *K. M. Jatavallabhula, M. Macklin, F. Golemo, V. Voleti, L. Petrini, M. Weiss, B. Considine, J. Parent-Levesque, K. Xie, K. Erleben, L. Paull, F. Shkurti, D. Nowrouzezahrai, S. Fidler*. April 2021. [arXiv:2104.02646](https://arxiv.org/abs/2104.02646)

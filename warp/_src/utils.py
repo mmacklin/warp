@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 from __future__ import annotations
 
@@ -24,8 +12,9 @@ import sys
 import threading
 import time
 import warnings
+from collections.abc import Callable
 from types import ModuleType
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
 
@@ -203,8 +192,8 @@ def segmented_sort_pairs(
     keys,
     values,
     count: int,
-    segment_start_indices: wp.array(dtype=wp.int32),
-    segment_end_indices: wp.array(dtype=wp.int32) = None,
+    segment_start_indices: wp.array[wp.int32],
+    segment_end_indices: wp.array[wp.int32] = None,
 ):
     """Sort key-value pairs within segments.
 
@@ -471,8 +460,8 @@ def array_sum(
 
     stride = values.strides[axis]
     for idx in np.ndindex(output_shape):
-        out_offset = sum(i * s for i, s in zip(idx, out.strides))
-        val_offset = sum(i * s for i, s in zip(idx, values.strides))
+        out_offset = sum(i * s for i, s in zip(idx, out.strides, strict=True))
+        val_offset = sum(i * s for i, s in zip(idx, values.strides, strict=True))
 
         native_func(
             values.ptr + val_offset,
@@ -584,9 +573,9 @@ def array_inner(
     stride_b = b.strides[axis]
 
     for idx in np.ndindex(output_shape):
-        out_offset = sum(i * s for i, s in zip(idx, out.strides))
-        a_offset = sum(i * s for i, s in zip(idx, a.strides))
-        b_offset = sum(i * s for i, s in zip(idx, b.strides))
+        out_offset = sum(i * s for i, s in zip(idx, out.strides, strict=True))
+        a_offset = sum(i * s for i, s in zip(idx, a.strides, strict=True))
+        b_offset = sum(i * s for i, s in zip(idx, b.strides, strict=True))
 
         native_func(
             a.ptr + a_offset,
@@ -1070,7 +1059,7 @@ def map(
 
         load_args = []
         kernel_args = []
-        for arg_name, inp in zip(arg_names, inputs):
+        for arg_name, inp in zip(arg_names, inputs, strict=True):
             if is_array(inp):
                 arr_name = f"{arg_name}_array"
                 array_type_name = type(inp).__name__
@@ -1845,7 +1834,12 @@ def timing_print(results: list[TimingResult], indent: str = "") -> None:
         print(f"{indent}{agg.elapsed:12.6f} ms | {agg.count:7d} | {device}")
 
 
+_importing_deprecated_namespace = False
+
+
 def warn_deprecated_namespace(module_name):
+    if _importing_deprecated_namespace:
+        return
     warn(
         f"The namespace `warp.{'.'.join(module_name.split('.')[1:])}` will soon be removed from the public API. "
         f"It can still be accessed from `warp._src.{'.'.join(module_name.split('.')[1:])}` but might be changed or removed without notice.",
@@ -1878,13 +1872,26 @@ def get_deprecated_api(module, namespace, attr_name, old_attr_path=None):
     """
     import sys  # noqa: PLC0415
 
+    # Resolve the attribute first. If it doesn't exist in the underlying module,
+    # raise AttributeError immediately without warning. This prevents spurious
+    # deprecation warnings from introspection tools (pickle, hasattr, etc.) that
+    # probe for attributes that were never part of the API. For example, pickle's
+    # whichmodule() iterates sys.modules calling getattr(module, name) on each one,
+    # and its C implementation only catches AttributeError -- any other exception
+    # (e.g., from a warning handler) crashes the caller.
+    try:
+        value = getattr(module, attr_name)
+    except AttributeError:
+        module_name = module.__name__.split(".")[-1]
+        raise AttributeError(f"module '{namespace}.{module_name}' has no attribute '{attr_name}'") from None
+
     # Suppress warnings for internal Warp introspection (e.g., codegen's hasattr/getattr checks).
     # Check if caller (frame 2) is from warp/_src/ and return silently if so.
     # Only catch ValueError (frame unavailable), not AttributeError (missing attribute must propagate).
     try:
         frame = sys._getframe(2)  # Get __getattr__'s immediate caller
         if "/warp/_src/" in frame.f_code.co_filename or "\\warp\\_src\\" in frame.f_code.co_filename:
-            return getattr(module, attr_name)  # Skip warning, propagate AttributeError if attribute missing
+            return value
     except ValueError:
         pass  # Frame unavailable, proceed with normal warning
 
@@ -1914,4 +1921,4 @@ def get_deprecated_api(module, namespace, attr_name, old_attr_path=None):
                 DeprecationWarning,
             )
 
-    return getattr(module, attr_name)
+    return value

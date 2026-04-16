@@ -1,19 +1,5 @@
-/*
- * SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: Apache-2.0
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 #pragma once
 
@@ -46,6 +32,8 @@ WP_API int wp_is_cuda_enabled();
 WP_API int wp_is_cuda_compatibility_enabled();
 // whether Warp was compiled with MathDx support
 WP_API int wp_is_mathdx_enabled();
+// whether Warp was compiled with cuBQL support
+WP_API int wp_is_cubql_enabled();
 // whether Warp was compiled with debug support
 WP_API int wp_is_debug_enabled();
 
@@ -94,6 +82,17 @@ WP_API void wp_bvh_destroy_device(uint64_t id);
 WP_API void wp_bvh_refit_device(uint64_t id);
 WP_API void wp_bvh_rebuild_device(uint64_t id);
 
+WP_API uint64_t wp_cubql_bvh_create_host(wp::vec3* lowers, wp::vec3* uppers, int num_items, int leaf_size);
+WP_API void wp_cubql_bvh_destroy_host(uint64_t id);
+WP_API void wp_cubql_bvh_refit_host(uint64_t id);
+WP_API void wp_cubql_bvh_rebuild_host(uint64_t id);
+
+WP_API uint64_t
+wp_cubql_bvh_create_device(void* context, wp::vec3* lowers, wp::vec3* uppers, int num_items, int leaf_size);
+WP_API void wp_cubql_bvh_destroy_device(uint64_t id);
+WP_API void wp_cubql_bvh_refit_device(uint64_t id);
+WP_API void wp_cubql_bvh_rebuild_device(uint64_t id);
+
 // create a user-accessible copy of the mesh, it is the
 // users responsibility to keep-alive the points/tris data for the duration of the mesh lifetime
 WP_API uint64_t wp_mesh_create_host(
@@ -131,15 +130,16 @@ WP_API void wp_mesh_set_points_device(uint64_t id, wp::array_t<wp::vec3> points)
 WP_API void wp_mesh_set_velocities_host(uint64_t id, wp::array_t<wp::vec3> velocities);
 WP_API void wp_mesh_set_velocities_device(uint64_t id, wp::array_t<wp::vec3> velocities);
 
-WP_API uint64_t wp_hash_grid_create_host(int dim_x, int dim_y, int dim_z);
-WP_API void wp_hash_grid_reserve_host(uint64_t id, int num_points);
-WP_API void wp_hash_grid_destroy_host(uint64_t id);
-WP_API void wp_hash_grid_update_host(uint64_t id, float cell_width, const wp::array_t<wp::vec3>* points);
+// Hash grid (type: 0=float16, 1=float32, 2=float64)
+WP_API uint64_t wp_hash_grid_create_host(int type, int dim_x, int dim_y, int dim_z);
+WP_API void wp_hash_grid_destroy_host(uint64_t id, int type);
+WP_API void wp_hash_grid_update_host(uint64_t id, int type, double cell_width, const void* points);
+WP_API void wp_hash_grid_reserve_host(uint64_t id, int type, int num_points);
 
-WP_API uint64_t wp_hash_grid_create_device(void* context, int dim_x, int dim_y, int dim_z);
-WP_API void wp_hash_grid_reserve_device(uint64_t id, int num_points);
-WP_API void wp_hash_grid_destroy_device(uint64_t id);
-WP_API void wp_hash_grid_update_device(uint64_t id, float cell_width, const wp::array_t<wp::vec3>* points);
+WP_API uint64_t wp_hash_grid_create_device(void* context, int type, int dim_x, int dim_y, int dim_z);
+WP_API void wp_hash_grid_destroy_device(uint64_t id, int type);
+WP_API void wp_hash_grid_update_device(uint64_t id, int type, double cell_width, const void* points);
+WP_API void wp_hash_grid_reserve_device(uint64_t id, int type, int num_points);
 
 WP_API uint64_t wp_volume_create_host(void* buf, uint64_t size, bool copy, bool owner);
 WP_API void wp_volume_get_tiles_host(uint64_t id, void* buf);
@@ -186,105 +186,49 @@ WP_API const char* wp_volume_get_blind_data_info(
     uint64_t id, uint32_t data_index, void** buf, uint64_t* value_count, uint32_t* value_size, char type_str[16]
 );
 
-// Texture2D functions (CUDA device)
-// Creates a 2D texture using the given CUDA context. Returns texture handle (combines tex object + array handle).
-// data: pointer to HOST data (will be copied into a CUDA array)
-// width, height: texture dimensions
-// num_channels: 1, 2, or 4
-// dtype: 0=uint8, 1=uint16, 2=float32
-// filter_mode: 0=nearest, 1=linear
-// address_mode_u, address_mode_v: 0=wrap, 1=clamp, 2=mirror, 3=border (per-axis)
-// use_normalized_coords: if true, texture coordinates are in [0,1]; if false, in texel space [0,width/height]
-WP_API bool wp_texture2d_create_device(
+// Textures
+WP_API uint64_t
+wp_texture_create_device(void* context, int ndim, int* shape, int num_channels, int dtype, bool surface_access);
+WP_API void wp_texture_destroy_device(void* context, uint64_t array_handle);
+
+WP_API uint64_t wp_texture_create_host(
+    int ndim,
+    int* shape,
+    int num_channels,
+    int dtype,
+    int filter_mode,
+    int* address_modes,
+    bool use_normalized_coords,
+    void** data_ptr_out
+);
+WP_API void wp_texture_destroy_host(uint64_t tex_handle);
+
+WP_API bool
+wp_texture_descriptor_from_cuda_array(void* context, uint64_t array_handle, wp::cuda_array_desc_t* desc_out);
+
+WP_API uint64_t wp_texture_object_create_device(
+    void* context, uint64_t array_handle, int ndim, int filter_mode, int* address_modes, bool use_normalized_coords
+);
+WP_API void wp_texture_object_destroy_device(void* context, uint64_t tex_handle);
+
+WP_API uint64_t wp_surface_object_create_device(void* context, uint64_t array_handle);
+WP_API void wp_surface_object_destroy_device(void* context, uint64_t surface_handle);
+
+WP_API bool wp_texture_copy_device(
     void* context,
-    int width,
-    int height,
-    int num_channels,
-    int dtype,
-    int filter_mode,
-    int address_mode_u,
-    int address_mode_v,
-    bool use_normalized_coords,
-    const void* data,
-    uint64_t* tex_handle_out,
-    uint64_t* array_handle_out
+    unsigned width_bytes,
+    unsigned height,
+    unsigned depth,
+    int dst_memory_type,
+    uint64_t dst_handle,
+    unsigned dst_pitch,
+    unsigned dst_height,
+    int src_memory_type,
+    uint64_t src_handle,
+    unsigned src_pitch,
+    unsigned src_height,
+    void* stream
 );
-WP_API void wp_texture2d_destroy_device(void* context, uint64_t tex_handle, uint64_t array_handle);
-
-// Texture2D functions (CPU host)
-// Creates a 2D texture from data on the host. Returns texture handle (pointer to internal data).
-// data: pointer to host data (will be copied internally)
-// width, height: texture dimensions
-// num_channels: 1, 2, or 4
-// dtype: 0=uint8, 1=uint16, 2=float32
-// filter_mode: 0=nearest, 1=linear
-// address_mode_u, address_mode_v: 0=wrap, 1=clamp, 2=mirror, 3=border (per-axis)
-// use_normalized_coords: if true, texture coordinates are in [0,1]; if false, in texel space [0,width/height]
-WP_API bool wp_texture2d_create_host(
-    int width,
-    int height,
-    int num_channels,
-    int dtype,
-    int filter_mode,
-    int address_mode_u,
-    int address_mode_v,
-    bool use_normalized_coords,
-    const void* data,
-    uint64_t* tex_handle_out
-);
-WP_API void wp_texture2d_destroy_host(uint64_t tex_handle);
-
-// Texture3D functions (CUDA device)
-// Creates a 3D texture using the given CUDA context. Returns texture handle (combines tex object + array handle).
-// data: pointer to HOST data (will be copied into a CUDA array)
-// width, height, depth: texture dimensions
-// num_channels: 1, 2, or 4
-// dtype: 0=uint8, 1=uint16, 2=float32
-// filter_mode: 0=nearest, 1=linear
-// address_mode_u, address_mode_v, address_mode_w: 0=wrap, 1=clamp, 2=mirror, 3=border (per-axis)
-// use_normalized_coords: if true, texture coordinates are in [0,1]; if false, in texel space [0,width/height/depth]
-WP_API bool wp_texture3d_create_device(
-    void* context,
-    int width,
-    int height,
-    int depth,
-    int num_channels,
-    int dtype,
-    int filter_mode,
-    int address_mode_u,
-    int address_mode_v,
-    int address_mode_w,
-    bool use_normalized_coords,
-    const void* data,
-    uint64_t* tex_handle_out,
-    uint64_t* array_handle_out
-);
-WP_API void wp_texture3d_destroy_device(void* context, uint64_t tex_handle, uint64_t array_handle);
-
-// Texture3D functions (CPU host)
-// Creates a 3D texture from data on the host. Returns texture handle (pointer to internal data).
-// data: pointer to host data (will be copied internally)
-// width, height, depth: texture dimensions
-// num_channels: 1, 2, or 4
-// dtype: 0=uint8, 1=uint16, 2=float32
-// filter_mode: 0=nearest, 1=linear
-// address_mode_u, address_mode_v, address_mode_w: 0=wrap, 1=clamp, 2=mirror, 3=border (per-axis)
-// use_normalized_coords: if true, texture coordinates are in [0,1]; if false, in texel space [0,width/height/depth]
-WP_API bool wp_texture3d_create_host(
-    int width,
-    int height,
-    int depth,
-    int num_channels,
-    int dtype,
-    int filter_mode,
-    int address_mode_u,
-    int address_mode_v,
-    int address_mode_w,
-    bool use_normalized_coords,
-    const void* data,
-    uint64_t* tex_handle_out
-);
-WP_API void wp_texture3d_destroy_host(uint64_t tex_handle);
 
 WP_API uint64_t wp_marching_cubes_create_device(void* context);
 WP_API void wp_marching_cubes_destroy_device(uint64_t id);
@@ -448,6 +392,13 @@ WP_API int wp_cuda_toolkit_version();  // CUDA Toolkit version used to build War
 WP_API const char* wp_version();  // Warp native library version string
 WP_API bool wp_cuda_driver_is_initialized();
 
+WP_API const char* wp_nanovdb_version();  // NanoVDB version string
+WP_API const char* wp_host_compiler_version();  // Host C++ compiler version
+WP_API const char* wp_libmathdx_version();  // libmathdx version (empty if not built with MathDx)
+WP_API int wp_nvrtc_version();  // NVRTC version (encoded as major*1000 + minor*10)
+WP_API int wp_is_verify_fp_enabled();  // Whether native lib was built with WP_VERIFY_FP
+WP_API int wp_is_fast_math_enabled();  // Whether native lib was built with fast math
+
 WP_API int wp_nvrtc_supported_arch_count();
 WP_API void wp_nvrtc_supported_archs(int* archs);
 
@@ -456,6 +407,7 @@ WP_API void* wp_cuda_device_get_primary_context(int ordinal);
 WP_API const char* wp_cuda_device_get_name(int ordinal);
 WP_API int wp_cuda_device_get_arch(int ordinal);
 WP_API int wp_cuda_device_get_sm_count(int ordinal);
+WP_API int wp_cuda_device_get_max_shared_memory(int ordinal);
 WP_API void wp_cuda_device_get_uuid(int ordinal, char uuid[16]);
 WP_API int wp_cuda_device_get_pci_domain_id(int ordinal);
 WP_API int wp_cuda_device_get_pci_bus_id(int ordinal);
@@ -554,6 +506,7 @@ WP_API size_t wp_cuda_compile_program(
     const char* cuda_src,
     const char* program_name,
     int arch,
+    const char* arch_suffix,
     const char* include_dir,
     int num_cuda_include_dirs,
     const char** cuda_include_dirs,
@@ -567,7 +520,7 @@ WP_API size_t wp_cuda_compile_program(
     bool compile_time_trace,
     bool precompiled_headers,
     const char* output_path,
-    const char* kernel_cache_dir,
+    const char* pch_dir,
     size_t num_ltoirs,
     char** ltoirs,
     size_t* ltoir_sizes,
@@ -642,14 +595,21 @@ WP_API size_t wp_cuda_launch_kernel(
 );
 WP_API int wp_cuda_get_max_shared_memory(void* context);
 WP_API bool wp_cuda_configure_kernel_shared_memory(void* kernel, int size);
+WP_API bool wp_cuda_get_suggested_block_size(
+    void* context, void* kernel, int shared_memory_bytes, int* block_size_out, int* min_grid_size_out
+);
 
 WP_API void wp_cuda_set_context_restore_policy(bool always_restore);
 WP_API int wp_cuda_get_context_restore_policy();
 
-WP_API void wp_cuda_graphics_map(void* context, void* resource);
+WP_API bool wp_cuda_graphics_map(void* context, void* resource);
 WP_API void wp_cuda_graphics_unmap(void* context, void* resource);
 WP_API void wp_cuda_graphics_device_ptr_and_size(void* context, void* resource, uint64_t* ptr, size_t* size);
 WP_API void* wp_cuda_graphics_register_gl_buffer(void* context, uint32_t gl_buffer, unsigned int flags);
+WP_API void* wp_cuda_graphics_register_gl_image(void* context, uint32_t image, uint32_t target, unsigned int flags);
+WP_API uint64_t wp_cuda_graphics_sub_resource_get_mapped_array(
+    void* context, void* resource, unsigned int array_index, unsigned int mip_level
+);
 WP_API void wp_cuda_graphics_unregister_resource(void* context, void* resource);
 
 // CUDA timing

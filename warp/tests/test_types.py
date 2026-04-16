@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import sys
 import types
@@ -376,6 +364,28 @@ class TestTypes(unittest.TestCase):
         v[2] = np.float16(3.0)
         self.assertEqual(v, (1.0, 2.0, 3.0))
 
+    def test_legacy_scalar_return_types(self):
+        old_setting = wp.config.legacy_scalar_return_types
+
+        try:
+            wp.config.legacy_scalar_return_types = True
+
+            vec3h = wp.types.vector(3, wp.float16)
+            vec3d = wp.types.vector(3, wp.float64)
+            vec3s = wp.types.vector(3, wp.int16)
+            self.assertIsInstance(vec3h(1.0, 2.0, 3.0)[0], float)
+            self.assertIsInstance(vec3d(1.0, 2.0, 3.0)[0], float)
+            self.assertIsInstance(vec3s(1, 2, 3)[0], int)
+
+            mat22h = wp.types.matrix((2, 2), wp.float16)
+            mat22d = wp.types.matrix((2, 2), wp.float64)
+            mat22s = wp.types.matrix((2, 2), wp.int16)
+            self.assertIsInstance(mat22h(1, 2, 3, 4)[0, 0], float)
+            self.assertIsInstance(mat22d(1, 2, 3, 4)[0, 0], float)
+            self.assertIsInstance(mat22s(1, 2, 3, 4)[0, 0], int)
+        finally:
+            wp.config.legacy_scalar_return_types = old_setting
+
     def test_vector_error_invalid_arg_count(self):
         with self.assertRaisesRegex(
             ValueError, r"Invalid number of arguments in vector constructor, expected 3 elements, got 2$"
@@ -693,11 +703,11 @@ class TestTypes(unittest.TestCase):
         result = wp._src.types.get_type_code(tuple_multi_warp)
         self.assertEqual(result, "tpl3v3f4m33f4qf4", "tuple[vec3f, mat33f, quatf] should generate 'tpl3v3f4m33f4qf4'")
 
-        # Verify the fix works on Python 3.9-3.10 specifically
+        # Verify the fix works on Python 3.10 specifically
         if sys.version_info < (3, 11) and hasattr(types, "GenericAlias"):
-            # On Python 3.9-3.10, tuple[...] creates types.GenericAlias
+            # On Python 3.10, tuple[...] creates types.GenericAlias
             self.assertIsInstance(
-                tuple_mixed, types.GenericAlias, "On Python 3.9-3.10, tuple[...] should create types.GenericAlias"
+                tuple_mixed, types.GenericAlias, "On Python 3.10, tuple[...] should create types.GenericAlias"
             )
             self.assertIs(tuple_mixed.__origin__, tuple, "GenericAlias origin should be tuple")
 
@@ -730,7 +740,7 @@ class TestTypes(unittest.TestCase):
 
         self.assertEqual(repr(v2), "vec2i([1, 2])")
         self.assertEqual(repr(v3), "vec3f([1.0, 2.0, 3.0])")
-        self.assertEqual(repr(v4), "vec4d([1.0, 2.0, 3.0, 4.0])")
+        self.assertEqual(repr(v4), "vec4d([float64(1.0), float64(2.0), float64(3.0), float64(4.0)])")
 
         # Test matrices
         m22 = wp.mat22f(1.0, 2.0, 3.0, 4.0)
@@ -756,6 +766,62 @@ class TestTypes(unittest.TestCase):
         self.assertIn("vec2i", result)
         self.assertGreater(len(result), 0)
 
+    def test_int_float_comparison(self):
+        for int_type in wp._src.types.int_types:
+            with self.subTest(int_type=int_type):
+                one = int_type(1)
+                two = int_type(2)
+
+                # Equality must not truncate floats.
+                self.assertNotEqual(one, 1.5)
+                self.assertEqual(one, 1.0)
+
+                # Ordering operators.
+                self.assertLess(one, 1.5)
+                self.assertLessEqual(one, 1.5)
+                self.assertLessEqual(one, 1.0)
+                self.assertGreater(two, 1.5)
+                self.assertGreaterEqual(two, 1.5)
+                self.assertGreaterEqual(two, 2.0)
+
+                # Comparisons with Warp float scalars.
+                self.assertNotEqual(one, wp.float32(1.5))
+                self.assertEqual(one, wp.float32(1.0))
+
+                # Comparisons with NumPy float scalars (including types
+                # that are not subclasses of Python float).
+                for np_float in (np.float16, np.float32, np.float64):
+                    with self.subTest(np_float=np_float):
+                        self.assertNotEqual(one, np_float(1.5))
+                        self.assertEqual(one, np_float(1.0))
+                        self.assertLess(one, np_float(1.5))
+                        self.assertGreater(two, np_float(1.5))
+
+                # Int-to-int comparison still works.
+                self.assertEqual(one, 1)
+                self.assertNotEqual(one, 2)
+
+                # Hash/eq contract: equal values must have equal hashes.
+                self.assertEqual(hash(one), hash(1.0))
+                self.assertNotEqual(hash(one), hash(1.5))
+
+                # Sets must treat int8(1) and 1.5 as distinct.
+                self.assertEqual(len({one, 1.5}), 2)
+                # Sets must treat int8(1) and 1.0 as equal.
+                self.assertEqual(len({one, 1.0}), 1)
+
+                # Infinity must not crash.
+                self.assertNotEqual(one, float("inf"))
+                self.assertLess(one, float("inf"))
+
+    def test_float_overflow_comparison(self):
+        huge = 2**1024
+        for float_type in wp._src.types.float_types:
+            for op in ("__eq__", "__ne__", "__lt__", "__le__", "__gt__", "__ge__"):
+                with self.subTest(float_type=float_type, op=op):
+                    with self.assertRaises(OverflowError):
+                        getattr(float_type(1.0), op)(huge)
+
 
 for dtype in wp._src.types.int_types:
     add_function_test(TestTypes, f"test_integers_{dtype.__name__}", test_integers, devices=devices, dtype=dtype)
@@ -769,5 +835,4 @@ for dtype in (*wp._src.types.scalar_types, int, float):
 add_function_test(TestTypes, "test_introspection", test_introspection)
 
 if __name__ == "__main__":
-    wp.clear_kernel_cache()
     unittest.main(verbosity=2)

@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 ###########################################################################
 # Example Stokes Transfer
@@ -34,7 +22,7 @@ from warp.utils import array_cast
 
 
 @fem.integrand
-def vel_from_particles_form(s: fem.Sample, particle_vel: wp.array(dtype=wp.vec2), v: fem.Field):
+def vel_from_particles_form(s: fem.Sample, particle_vel: wp.array[wp.vec2], v: fem.Field):
     vel = particle_vel[s.qp_index]
     return wp.dot(vel, v(s))
 
@@ -81,11 +69,6 @@ def cell_activity(s: fem.Sample, domain: fem.Domain, c1: wp.vec2, c2: wp.vec2, r
     return 1.0
 
 
-@wp.kernel
-def inverse_array_kernel(m: wp.array(dtype=wp.float64)):
-    m[wp.tid()] = wp.float64(1.0) / m[wp.tid()]
-
-
 class Example:
     def __init__(self, quiet=False, resolution=50):
         self._quiet = quiet
@@ -126,10 +109,10 @@ class Example:
         p_space = fem.make_polynomial_space(geo, degree=0)
 
         self._active_space_partition = fem.make_space_partition(
-            space=u_space, geometry_partition=self._active_partition
+            space_topology=u_space.topology, geometry_partition=self._active_partition
         )
         self._active_p_space_partition = fem.make_space_partition(
-            space=p_space, geometry_partition=self._active_partition
+            space_topology=p_space.topology, geometry_partition=self._active_partition
         )
 
         self._u_field = u_space.make_field()
@@ -137,7 +120,7 @@ class Example:
 
         # Particle-based quadrature rule over active cells
         domain = fem.Cells(geometry=self._active_partition)
-        self._pic_quadrature = fem.PicQuadrature(domain, particles, particle_areas)
+        self._pic_quadrature = fem.PicQuadrature(domain, particles, particle_areas, use_domain_element_indices=True)
         self._particle_velocities = particle_velocities
 
         self.renderer = fem_example_utils.Plot()
@@ -155,7 +138,7 @@ class Example:
             quadrature=self._pic_quadrature,
             fields={"v": u_test},
             values={"particle_vel": self._particle_velocities},
-            output_dtype=wp.vec2d,
+            output_dtype=wp.vec2,
         )
         u_bd_matrix = fem.integrate(mass_form, quadrature=self._pic_quadrature, fields={"u": u_trial, "v": u_test})
 
@@ -172,12 +155,7 @@ class Example:
 
         div_matrix = fem.integrate(div_form, fields={"u": u_trial, "q": p_test})
         inv_p_mass_matrix = fem.integrate(scalar_mass_form, fields={"p": p_trial, "q": p_test})
-        wp.launch(
-            kernel=inverse_array_kernel,
-            dim=inv_p_mass_matrix.values.shape,
-            device=inv_p_mass_matrix.values.device,
-            inputs=[inv_p_mass_matrix.values],
-        )
+        inv_p_mass_matrix.values.assign(1.0 / inv_p_mass_matrix.values)
 
         # Assemble linear system
         u_matrix = u_visc_matrix

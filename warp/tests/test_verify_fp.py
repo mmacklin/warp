@@ -1,18 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
+import sys
 import unittest
 
 import warp as wp
@@ -63,6 +52,9 @@ def nan_kernel(foos: wp.array(dtype=TestStruct)):
 
 
 def test_nan(test, device):
+    if sys.platform == "win32":
+        test.skipTest("Skipping test on Windows due to unreliable stdout capture")
+
     foos = wp.zeros((10,), dtype=TestStruct, device=device)
 
     capture = StdOutCapture()
@@ -79,9 +71,7 @@ def test_nan(test, device):
     output = capture.end()
 
     # Check that the output contains warnings about "nan" being produced.
-    # Older Windows C runtimes have a bug where stdout sometimes does not get properly flushed.
-    if output != "" or sys.platform != "win32":
-        test.assertRegex(output, r"nan")
+    test.assertRegex(output, r"nan")
 
 
 devices = get_test_devices()
@@ -96,5 +86,4 @@ add_function_test(TestVerifyFP, "test_nan", test_nan, devices=devices, check_out
 
 
 if __name__ == "__main__":
-    wp.clear_kernel_cache()
     unittest.main(verbosity=2)

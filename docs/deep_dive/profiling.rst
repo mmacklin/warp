@@ -11,7 +11,7 @@ Profiling
 .. code:: python
 
     @wp.kernel
-    def inc_loop(a: wp.array(dtype=float), num_iters: int):
+    def inc_loop(a: wp.array[float], num_iters: int):
         i = wp.tid()
         for j in range(num_iters):
             a[i] += 1.0
@@ -45,7 +45,7 @@ By default, ``ScopedTimer`` measures the elapsed time on the CPU and does not in
 
 To get the total amount of time including the device executions time, create the :class:`ScopedTimer`
 with the ``synchronize=True`` flag.
-This is equivalent to calling :func:`wp.synchronize() <synchronize>` before and after the timed section of code.
+This is equivalent to calling :func:`wp.synchronize() <warp.synchronize>` before and after the timed section of code.
 Synchronizing at the beginning ensures that all prior CUDA work has completed prior to starting the timer.
 Synchronizing at the end ensures that all timed work finishes before stopping the timer.
 With the example above, the result might look like this:
@@ -400,7 +400,7 @@ also skip writing particle positions to a USD file so that we can focus on the G
 
 .. code-block:: bash
 
-    nsys profile --stats=true python example_sph.py --stage_path None --num_frames 10
+    nsys profile --stats=true python example_sph.py --stage-path None --num-frames 10
 
 The output tells us that the ``get_acceleration`` and the ``compute_density`` kernels take up the majority of the
 time on the GPU. We also see from the output that their full names become
@@ -412,7 +412,7 @@ A basic command to use the command-line profiler to save the report to ``example
 
 .. code-block:: bash
 
-    ncu -o example_sph -k get_acceleration_a9fb4286_cuda_kernel_forward --set full python example_sph.py --stage_path None --num_frames 10
+    ncu -o example_sph -k get_acceleration_a9fb4286_cuda_kernel_forward --set full python example_sph.py --stage-path None --num-frames 10
 
 This command takes a much longer time to execute than the Nsight Systems command since Nsight Compute performs
 multiple passes of each kernel launch to collect different metrics.
@@ -421,14 +421,14 @@ results:
 
 .. code-block:: bash
 
-    ncu -o example_sph -k get_acceleration_a9fb4286_cuda_kernel_forward --set full -c 5 python example_sph.py --stage_path None --num_frames 10
+    ncu -o example_sph -k get_acceleration_a9fb4286_cuda_kernel_forward --set full -c 5 python example_sph.py --stage-path None --num-frames 10
 
 Additionally, we can add the ``-f`` option to overwrite the output file and ``--open-in-ui`` to automatically open the
 report in the UI:
 
 .. code-block:: bash
 
-    ncu --open-in-ui -f -o example_sph -k get_acceleration_a9fb4286_cuda_kernel_forward --set full -c 5 python example_sph.py --stage_path None --num_frames 10
+    ncu --open-in-ui -f -o example_sph -k get_acceleration_a9fb4286_cuda_kernel_forward --set full -c 5 python example_sph.py --stage-path None --num-frames 10
 
 The following screenshot shows the Python/SASS correlation view from the Nsight Compute report (click to enlarge):
 
@@ -453,7 +453,7 @@ we can drop the ``-k`` option and increase the value of the ``-c`` option to 20:
 
 .. code-block:: bash
 
-    ncu --open-in-ui -f -o example_sph --set full -c 20 python example_sph.py --stage_path None --num_frames 10
+    ncu --open-in-ui -f -o example_sph --set full -c 20 python example_sph.py --stage-path None --num-frames 10
 
 Preserving source code context in Nsight Compute reports
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -463,7 +463,7 @@ It is convenient to permanently import the Python or CUDA-C source files into th
 
 .. code-block:: bash
 
-    ncu --open-in-ui --import-source 1 -f -o example_sph -k get_acceleration_a9fb4286_cuda_kernel_forward --set full -c 5 python example_sph.py --stage_path None --num_frames 10
+    ncu --open-in-ui --import-source 1 -f -o example_sph -k get_acceleration_a9fb4286_cuda_kernel_forward --set full -c 5 python example_sph.py --stage-path None --num-frames 10
 
 This ensures that a snapshot of the source files is taken at the time the profiling report was created,
 which prevents subsequent source-code modifications from affecting the SASS/source correlation information.
@@ -479,7 +479,7 @@ profiling command that directs Nsight Compute to search for the source files in 
 
 .. code-block:: bash
 
-    ncu --open-in-ui --import-source 1 --source-folders ~/.cache/warp/ -f -o example_sph -k get_acceleration_a9fb4286_cuda_kernel_forward --set full -c 5 python example_sph.py --stage_path None --num_frames 10
+    ncu --open-in-ui --import-source 1 --source-folders ~/.cache/warp/ -f -o example_sph -k get_acceleration_a9fb4286_cuda_kernel_forward --set full -c 5 python example_sph.py --stage-path None --num-frames 10
 
 For similar reasons, it may sometimes be necessary to clear the kernel cache using :func:`warp.clear_kernel_cache`
 to force an update of the ``#line`` directives added into the CUDA-C code. This is because there can be changes to
@@ -496,8 +496,85 @@ bottlenecks in the runtime compilation process.
 By setting the global configuration option :attr:`warp.config.compile_time_trace` to ``True``,
 an additional JSON file with the suffix ``_compile-time-trace.json`` will be
 generated in the corresponding kernel cache directory (see :attr:`warp.config.kernel_cache_dir`)
-when modules are compiled. This file can be opened in a viewer like a Chronium browser's built in
+when modules are compiled. This file can be opened in a viewer like a Chromium browser's built-in
 profiler (e.g. ``chrome://tracing/`` or ``edge://tracing/``) or the `Perfetto UI <https://ui.perfetto.dev/>`__.
 
 For more information about profiling the compilation process, see the NVIDIA Developer blog post
 `Optimizing Compile Times for CUDA C++ <https://developer.nvidia.com/blog/optimizing-compile-times-for-cuda-c/>`__.
+
+.. _benchmarking-cold-start-compilation:
+
+Benchmarking Cold-Start Compilation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When benchmarking module compilation times, clearing Warp's kernel cache alone
+is not sufficient to reach a true "cold" cache state. The NVIDIA CUDA driver
+maintains a separate cache layer that must also be accounted for.
+
+Two-Layer Cache System
+^^^^^^^^^^^^^^^^^^^^^^
+
+Warp maintains its own **kernel cache** (see :attr:`warp.config.kernel_cache_dir`)
+that stores generated C++/CUDA source files and compiled binaries. This cache is
+cleared with :func:`warp.clear_kernel_cache`. Separately, when kernels use tile-based
+linear algebra operations backed by NVIDIA's MathDx libraries (cuBLASDx/cuFFTDx),
+Warp compiles LTO (link-time optimization) objects that are stored in a dedicated
+**LTO cache**. This cache is cleared with :func:`warp.clear_lto_cache`. Both
+functions should be called to fully clear Warp's compilation artifacts.
+
+In addition, the NVIDIA CUDA driver maintains a **compute cache** that stores
+JIT-compiled GPU binaries produced from PTX or other intermediate representations.
+This driver-level cache is completely independent of Warp and is not affected by
+Warp's cache-clearing functions. Its default location is:
+
+- **Linux**: ``~/.nv/ComputeCache``
+- **Windows**: ``%APPDATA%\NVIDIA\ComputeCache``
+
+Both cache layers must be addressed to achieve a true cold-start compilation
+benchmark.
+
+Steps for Accurate Cold-Start Benchmarking
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+To measure true cold-start compilation time:
+
+1. Clear Warp's caches in Python:
+
+   .. code-block:: python
+
+       wp.clear_kernel_cache()
+       wp.clear_lto_cache()
+
+2. Address the CUDA compute cache using **one** of the following approaches:
+
+   **Option A**: Delete the compute cache contents before running:
+
+   .. code-block:: bash
+
+       # Linux
+       rm -rf ~/.nv/ComputeCache/*
+
+       # Windows (PowerShell)
+       Remove-Item -Recurse -Force "$env:APPDATA\NVIDIA\ComputeCache\*"
+
+   **Option B**: Disable the compute cache via an environment variable:
+
+   .. code-block:: bash
+
+       CUDA_CACHE_DISABLE=1 python my_benchmark.py
+
+These two approaches can produce different timings. Disabling the cache with
+``CUDA_CACHE_DISABLE=1`` can be *faster* than deleting cache contents because
+it avoids disk I/O overhead from cache lookup and write operations. When the
+cache is enabled but empty, the driver still performs file-system operations to
+search for and write cache entries. Choose the approach that best matches your
+benchmarking scenario: Option A reflects normal operation with an empty cache,
+while Option B eliminates all cache-related overhead.
+
+Additional References
+^^^^^^^^^^^^^^^^^^^^^
+
+- `CUDA Programming Guide: CUDA Environment Variables <https://docs.nvidia.com/cuda/cuda-c-programming-guide/#cuda-environment-variables>`__
+  - Authoritative reference for ``CUDA_CACHE_DISABLE``, ``CUDA_CACHE_PATH``, and other cache-related environment variables.
+- `CUDA Pro Tip: Understand Fat Binaries and JIT Caching <https://developer.nvidia.com/blog/cuda-pro-tip-understand-fat-binaries-jit-caching/>`__
+  - Background on how the CUDA compute cache works.

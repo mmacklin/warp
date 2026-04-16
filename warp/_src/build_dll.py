@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 from __future__ import annotations
 
@@ -24,6 +12,7 @@ import re
 import shutil
 import subprocess
 import sys
+import sysconfig
 import time
 
 from warp._src.utils import ScopedTimer
@@ -217,7 +206,7 @@ def find_nvcc_executable(cuda_home) -> str:
 
     Args:
         cuda_home: Path to CUDA installation (may be None). Can come from
-            CUDA_HOME env var, --cuda_path argument, or auto-detection.
+            CUDA_HOME env var, --cuda-path argument, or auto-detection.
 
     Returns:
         String command to invoke nvcc (either "nvcc" or quoted full path)
@@ -226,7 +215,7 @@ def find_nvcc_executable(cuda_home) -> str:
     nvcc_name = "nvcc.exe" if os.name == "nt" else "nvcc"
 
     # First priority: If cuda_home is provided, use its nvcc
-    # This handles CUDA_HOME env var, --cuda_path arg, and ensures consistency
+    # This handles CUDA_HOME env var, --cuda-path arg, and ensures consistency
     if cuda_home:
         nvcc_path = os.path.join(cuda_home, "bin", nvcc_name)
         if os.path.exists(nvcc_path):
@@ -270,7 +259,10 @@ def add_llvm_bin_to_path(args):
         print(f"Warning: LLVM bin directory not found at {llvm_bin_path}")
         return False
 
-    # Add to PATH environment variable
+    # Add to PATH environment variable (skip if already present)
+    if llvm_bin_path in os.environ.get("PATH", "").split(os.pathsep):
+        return False
+
     os.environ["PATH"] = llvm_bin_path + os.pathsep + os.environ.get("PATH", "")
 
     print(f"Added {llvm_bin_path} to PATH")
@@ -348,14 +340,14 @@ def _get_architectures_cu12(
     clang_arch_flags = []
 
     if quick_build:
-        gencode_opts = ["-gencode=arch=compute_52,code=compute_52", "-gencode=arch=compute_75,code=compute_75"]
-        clang_arch_flags = ["--cuda-gpu-arch=sm_52", "--cuda-gpu-arch=sm_75"]
+        gencode_opts = ["-gencode=arch=compute_75,code=compute_75"]
+        clang_arch_flags = ["--cuda-gpu-arch=sm_75"]
     else:
         if arch == "aarch64" and target_platform == "linux" and ctk_version == (12, 9):
             # Skip certain architectures for aarch64 with CUDA 12.9 due to CCCL bug
             print(
                 "[INFO] Skipping sm_52, sm_60, sm_61, and sm_70 targets for ARM due to a CUDA Toolkit bug. "
-                "See https://nvidia.github.io/warp/installation.html#cuda-12-9-limitation-on-linux-arm-platforms "
+                "See https://nvidia.github.io/warp/user_guide/installation.html#cuda-12-9-limitation-on-linux-arm-platforms "
                 "for details."
             )
         else:
@@ -504,6 +496,9 @@ def build_dll_for_arch(args, dll_path, cpp_paths, cu_paths, arch, libs: list[str
     cuda_home = args.cuda_path
     cuda_cmd = None
 
+    # Derive a unique tag from dll_path for object file names to allow parallel builds
+    _obj_tag = "." + os.path.splitext(os.path.basename(dll_path))[0].replace(".", "_")
+
     # Add LLVM bin directory to PATH
     add_llvm_bin_to_path(args)
 
@@ -618,19 +613,21 @@ def build_dll_for_arch(args, dll_path, cpp_paths, cu_paths, arch, libs: list[str
             cpp_flags += ' /D "WP_VERIFY_FP"'
 
         if args.fast_math:
-            cpp_flags += " /fp:fast"
+            cpp_flags += ' /fp:fast /D "WP_FAST_MATH"'
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as executor:
             futures, wall_clock = [], time.perf_counter_ns()
 
             cpp_cmds = []
             for cpp_path in cpp_paths:
-                cpp_out = cpp_path + ".obj"
+                cpp_out = cpp_path + _obj_tag + ".obj"
                 linkopts.append(quote(cpp_out))
                 # Add warning suppressions for clang.cpp to avoid LLVM header warnings
                 extra_flags = ""
                 if "clang/clang.cpp" in cpp_path.replace("\\", "/"):
                     extra_flags = " /wd4624"  # suppress C4624: destructor was implicitly defined as deleted
+                if "fastcall.cpp" in cpp_path:
+                    extra_flags += f' /I"{sysconfig.get_path("include")}" /DPy_LIMITED_API=0x030a0000'  # Python 3.10
                 cpp_cmd = f'"{args.host_compiler}" {cpp_flags}{extra_flags} -c "{cpp_path}" /Fo"{cpp_out}"'
                 cpp_cmds.append(cpp_cmd)
 
@@ -644,7 +641,7 @@ def build_dll_for_arch(args, dll_path, cpp_paths, cu_paths, arch, libs: list[str
             cuda_cmds = []
             if cu_paths:
                 for cu_path in cu_paths:
-                    cu_out = cu_path + ".o"
+                    cu_out = cu_path + _obj_tag + ".o"
 
                     _nvcc_opts = [
                         opt.replace("@filename@", os.path.basename(cu_path).replace(".", "_")) for opt in nvcc_opts
@@ -683,6 +680,10 @@ def build_dll_for_arch(args, dll_path, cpp_paths, cu_paths, arch, libs: list[str
                 elapsed = (time.perf_counter_ns() - wall_clock) / 1000000.0
                 print(f"build took {elapsed:.2f} ms ({args.jobs:d} workers)")
 
+        # Python stable ABI library for fastcall.cpp
+        python_libs_dir = os.path.join(sys.base_prefix, "libs")
+        linkopts.append(f'python3.lib /LIBPATH:"{python_libs_dir}"')
+
         with ScopedTimer("link", active=args.verbose):
             link_cmd = f'"{host_linker}" {" ".join(linkopts + libs)} /out:"{dll_path}"'
             run_cmd(link_cmd)
@@ -709,7 +710,7 @@ def build_dll_for_arch(args, dll_path, cpp_paths, cu_paths, arch, libs: list[str
             else:
                 version = ""
 
-        cpp_flags = f'-Werror -Wuninitialized {version} --std=c++17 -fno-rtti -D{cuda_enabled} -D{mathdx_enabled} -D{cuda_compat_enabled} -fPIC -fvisibility=hidden -D_GLIBCXX_USE_CXX11_ABI=0 -I"{native_dir}" {includes} '
+        cpp_flags = f'-Werror -Wuninitialized {version} --std=c++17 -fno-rtti -D{cuda_enabled} -D{mathdx_enabled} -D{cuda_compat_enabled} -fPIC -fvisibility=hidden -fvisibility-inlines-hidden -D_GLIBCXX_USE_CXX11_ABI=0 -I"{native_dir}" {includes} '
 
         if mode == "debug":
             cpp_flags += "-O0 -g -D_DEBUG -DWP_ENABLE_DEBUG=1 -fkeep-inline-functions"
@@ -721,7 +722,7 @@ def build_dll_for_arch(args, dll_path, cpp_paths, cu_paths, arch, libs: list[str
             cpp_flags += " -DWP_VERIFY_FP"
 
         if args.fast_math:
-            cpp_flags += " -ffast-math"
+            cpp_flags += " -ffast-math -DWP_FAST_MATH"
 
         ld_inputs = []
 
@@ -730,9 +731,12 @@ def build_dll_for_arch(args, dll_path, cpp_paths, cu_paths, arch, libs: list[str
 
             cpp_cmds = []
             for cpp_path in cpp_paths:
-                cpp_out = cpp_path + ".o"
+                cpp_out = cpp_path + _obj_tag + ".o"
                 ld_inputs.append(quote(cpp_out))
-                cpp_cmd = f'{cpp_compiler} {cpp_flags} -c "{cpp_path}" -o "{cpp_out}"'
+                extra_flags = ""
+                if "fastcall.cpp" in cpp_path:
+                    extra_flags = f' -I"{sysconfig.get_path("include")}" -DPy_LIMITED_API=0x030a0000'  # Python 3.10
+                cpp_cmd = f'{cpp_compiler} {cpp_flags}{extra_flags} -c "{cpp_path}" -o "{cpp_out}"'
                 cpp_cmds.append(cpp_cmd)
 
             if args.jobs <= 1:
@@ -745,7 +749,7 @@ def build_dll_for_arch(args, dll_path, cpp_paths, cu_paths, arch, libs: list[str
             cuda_cmds = []
             if cu_paths:
                 for cu_path in cu_paths:
-                    cu_out = cu_path + ".o"
+                    cu_out = cu_path + _obj_tag + ".o"
 
                     _nvcc_opts = [
                         opt.replace("@filename@", os.path.basename(cu_path).replace(".", "_")) for opt in nvcc_opts
@@ -753,15 +757,15 @@ def build_dll_for_arch(args, dll_path, cpp_paths, cu_paths, arch, libs: list[str
 
                     if cuda_compiler == "nvcc":
                         if mode == "debug":
-                            cuda_cmd = f'{nvcc_cmd} --std=c++17 -g -G -O0 --compiler-options -fPIC,-fvisibility=hidden -D_DEBUG -D_ITERATOR_DEBUG_LEVEL=0 -line-info {" ".join(_nvcc_opts)} -DWP_ENABLE_CUDA=1 -I"{native_dir}" -D{mathdx_enabled} {libmathdx_includes} -o "{cu_out}" -c "{cu_path}"'
+                            cuda_cmd = f'{nvcc_cmd} --std=c++17 -g -G -O0 --compiler-options -fPIC,-fvisibility=hidden,-fvisibility-inlines-hidden -D_DEBUG -D_ITERATOR_DEBUG_LEVEL=0 -line-info {" ".join(_nvcc_opts)} -DWP_ENABLE_CUDA=1 -I"{native_dir}" -D{mathdx_enabled} {libmathdx_includes} -o "{cu_out}" -c "{cu_path}"'
                         elif mode == "release":
-                            cuda_cmd = f'{nvcc_cmd} --std=c++17 -O3 --compiler-options -fPIC,-fvisibility=hidden {" ".join(_nvcc_opts)} -DNDEBUG -DWP_ENABLE_CUDA=1 -I"{native_dir}" -D{mathdx_enabled} {libmathdx_includes} -o "{cu_out}" -c "{cu_path}"'
+                            cuda_cmd = f'{nvcc_cmd} --std=c++17 -O3 --compiler-options -fPIC,-fvisibility=hidden,-fvisibility-inlines-hidden {" ".join(_nvcc_opts)} -DNDEBUG -DWP_ENABLE_CUDA=1 -I"{native_dir}" -D{mathdx_enabled} {libmathdx_includes} -o "{cu_out}" -c "{cu_path}"'
                     else:
                         # Use Clang compiler
                         if mode == "debug":
-                            cuda_cmd = f'clang++ -Werror -Wuninitialized -Wno-unknown-cuda-version {" ".join(clang_opts)} -g -O0 -fPIC -fvisibility=hidden -D_DEBUG -D_ITERATOR_DEBUG_LEVEL=0 -DWP_ENABLE_CUDA=1 -I"{native_dir}" -D{mathdx_enabled} {libmathdx_includes} -o "{cu_out}" -c "{cu_path}"'
+                            cuda_cmd = f'clang++ -Werror -Wuninitialized -Wno-unknown-cuda-version -Wno-openmp-target {" ".join(clang_opts)} -g -O0 -fPIC -fvisibility=hidden -fvisibility-inlines-hidden -D_DEBUG -D_ITERATOR_DEBUG_LEVEL=0 -DWP_ENABLE_CUDA=1 -I"{native_dir}" -D{mathdx_enabled} {libmathdx_includes} -o "{cu_out}" -c "{cu_path}"'
                         elif mode == "release":
-                            cuda_cmd = f'clang++ -Werror -Wuninitialized -Wno-unknown-cuda-version {" ".join(clang_opts)} -O3 -fPIC -fvisibility=hidden -DNDEBUG -DWP_ENABLE_CUDA=1 -I"{native_dir}" -D{mathdx_enabled} {libmathdx_includes} -o "{cu_out}" -c "{cu_path}"'
+                            cuda_cmd = f'clang++ -Werror -Wuninitialized -Wno-unknown-cuda-version -Wno-openmp-target {" ".join(clang_opts)} -O3 -fPIC -fvisibility=hidden -fvisibility-inlines-hidden -DNDEBUG -DWP_ENABLE_CUDA=1 -I"{native_dir}" -D{mathdx_enabled} {libmathdx_includes} -o "{cu_out}" -c "{cu_path}"'
 
                     cuda_cmds.append(cuda_cmd)
 
@@ -791,17 +795,57 @@ def build_dll_for_arch(args, dll_path, cpp_paths, cu_paths, arch, libs: list[str
                 elapsed = (time.perf_counter_ns() - wall_clock) / 1000000.0
                 print(f"build took {elapsed:.2f} ms ({args.jobs:d} workers)")
 
+        # Python C API symbols from fastcall.cpp are left unresolved at link time and
+        # resolved at runtime by the interpreter. A post-link nm -u check (below) verifies
+        # that only Python symbols are unresolved.
         if sys.platform == "darwin":
-            opt_no_undefined = "-Wl,-undefined,error"
+            # macOS linker rejects undefined symbols by default; this is the standard
+            # convention for Python extensions (used by CPython, pybind11).
+            opt_undefined = "-Wl,-undefined,dynamic_lookup"
             opt_exclude_libs = ""
+            opt_static_runtime = ""
         else:
-            opt_no_undefined = "-Wl,--no-undefined"
+            opt_undefined = ""
             opt_exclude_libs = "-Wl,--exclude-libs,ALL"
+            opt_static_runtime = f"-static-libstdc++ -static-libgcc -Wl,--version-script={native_dir}/warp.map"
 
         with ScopedTimer("link", active=args.verbose):
             origin = "@loader_path" if (sys.platform == "darwin") else "$ORIGIN"
-            link_cmd = f"{cpp_compiler} {version} -shared -Wl,-rpath,'{origin}' {opt_no_undefined} {opt_exclude_libs} -o '{dll_path}' {' '.join(ld_inputs + libs)}"
+            link_cmd = f"{cpp_compiler} {version} -shared -Wl,-rpath,'{origin}' {opt_static_runtime} {opt_undefined} {opt_exclude_libs} -o '{dll_path}' {' '.join(ld_inputs + libs)}"
             run_cmd(link_cmd)
+
+            # Verify that only Python C API symbols are truly undefined.
+            # Platform-specific paths collect all undefined symbol names.
+            undefined = []
+            if sys.platform == "darwin":
+                # nm -m -u lists undefined symbols with source annotations. Symbols
+                # from linked libraries show "(from libName)", while symbols allowed
+                # through -undefined dynamic_lookup show "(dynamically looked up)".
+                nm_output = subprocess.check_output(["nm", "-m", "-u", dll_path])
+                for line in nm_output.decode().splitlines():
+                    if "(dynamically looked up)" not in line:
+                        continue
+                    # Format: "   (undefined) external _SymName (dynamically looked up)"
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        undefined.append(parts[2].lstrip("_"))
+            else:
+                # readelf --dyn-syms lists dynamic symbols with type info. Symbols
+                # from linked dependencies (glibc, libm) have type FUNC or OBJECT,
+                # while truly undefined symbols (e.g. Python C API) have type NOTYPE.
+                # Format: "  54: 0...0  0 NOTYPE  GLOBAL DEFAULT  UND PyFloat_FromDouble"
+                readelf_output = subprocess.check_output(["readelf", "-W", "--dyn-syms", dll_path])
+                for line in readelf_output.decode().splitlines():
+                    fields = line.split()
+                    if len(fields) < 8:
+                        continue
+                    sym_type, sym_bind, sym_ndx, sym_name = fields[3], fields[4], fields[6], fields[7]
+                    if sym_bind == "GLOBAL" and sym_ndx == "UND" and sym_type == "NOTYPE":
+                        undefined.append(sym_name)
+
+            unexpected = [sym for sym in undefined if not sym.startswith(("Py", "_Py"))]
+            if unexpected:
+                raise RuntimeError("Unexpected undefined symbols in " + dll_path + ":\n" + "\n".join(unexpected))
 
             # Strip symbols to reduce the binary size
             if mode == "release":

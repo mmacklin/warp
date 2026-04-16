@@ -38,7 +38,7 @@ This approach allows you to:
 This example runs from within the Warp repository.
 
 **Requirements:**
-- **Python 3.8+**
+- **Python 3.10+**
 - **CUDA Toolkit 12.0+** (includes `nvcc` compiler)
 - **NVIDIA GPU** (Warp automatically compiles for your GPU architecture)
 - **Build System**: GNU Make (Unix/Linux) or CMake 3.20+ (cross-platform)
@@ -129,7 +129,7 @@ cudaMalloc(&d_x, N * sizeof(float));
 cudaMalloc(&d_y, N * sizeof(float));
 
 // 3. Create Warp data structures (kernel signature: saxpy(alpha, x, y))
-wp::launch_bounds_t dim = {.shape = {N, 0, 0, 0}, .ndim = 1, .size = size_t(N)};
+wp::launch_bounds_t<1> dim = {{N}, size_t(N), false};
 wp::float32 alpha = 2.5f;  // Scalar parameter
 wp::array_t<wp::float32> arr_x(d_x, N);
 wp::array_t<wp::float32> arr_y(d_y, N);

@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 ###########################################################################
 # Example Streamlines
@@ -59,9 +47,9 @@ def bourke_color_map(low, high, v):
 def classify_boundary_sides(
     s: fem.Sample,
     domain: fem.Domain,
-    outflow: wp.array(dtype=int),
-    freeslip: wp.array(dtype=int),
-    inflow: wp.array(dtype=int),
+    outflow: wp.array[int],
+    freeslip: wp.array[int],
+    inflow: wp.array[int],
 ):
     x = fem.position(domain, s)
     n = fem.normal(domain, s)
@@ -135,11 +123,11 @@ def gen_streamlines(
     s: fem.Sample,
     domain: fem.Domain,
     u: fem.Field,
-    spawn_points: wp.array(dtype=wp.vec3),
+    spawn_points: wp.array[wp.vec3],
     point_count: int,
     dx: float,
-    pos: wp.array2d(dtype=wp.vec3),
-    speed: wp.array2d(dtype=float),
+    pos: wp.array2d[wp.vec3],
+    speed: wp.array2d[float],
 ):
     idx = s.qp_index
 

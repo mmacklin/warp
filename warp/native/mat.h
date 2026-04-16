@@ -1,19 +1,5 @@
-/*
- * SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: Apache-2.0
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 #pragma once
 
@@ -3412,6 +3398,33 @@ inline CUDA_CALLABLE mat_t<Rows, Cols, Type> div(Type b, const mat_t<Rows, Cols,
     return t;
 }
 
+// approximate division
+template <unsigned Rows, unsigned Cols, typename Type>
+inline CUDA_CALLABLE mat_t<Rows, Cols, Type> approx_div(const mat_t<Rows, Cols, Type>& a, Type b)
+{
+    mat_t<Rows, Cols, Type> t;
+    for (unsigned i = 0; i < Rows; ++i) {
+        for (unsigned j = 0; j < Cols; ++j) {
+            t.data[i][j] = approx_div(a.data[i][j], b);
+        }
+    }
+
+    return t;
+}
+
+template <unsigned Rows, unsigned Cols, typename Type>
+inline CUDA_CALLABLE mat_t<Rows, Cols, Type> approx_div(Type b, const mat_t<Rows, Cols, Type>& a)
+{
+    mat_t<Rows, Cols, Type> t;
+    for (unsigned i = 0; i < Rows; ++i) {
+        for (unsigned j = 0; j < Cols; ++j) {
+            t.data[i][j] = approx_div(b, a.data[i][j]);
+        }
+    }
+
+    return t;
+}
+
 template <unsigned Rows, unsigned Cols, typename Type>
 inline CUDA_CALLABLE mat_t<Rows, Cols, Type> mul(const mat_t<Rows, Cols, Type>& a, Type b)
 {
@@ -3831,17 +3844,23 @@ inline CUDA_CALLABLE vec_t<Rows, Type> get_diag(const mat_t<Rows, Rows, Type>& m
 }
 
 // Only implementing inverses for 2x2, 3x3 and 4x4 matrices for now...
-template <typename Type> inline CUDA_CALLABLE mat_t<2, 2, Type> inverse(const mat_t<2, 2, Type>& m)
+template <typename Type, bool Approx> inline CUDA_CALLABLE mat_t<2, 2, Type> inverse_impl(const mat_t<2, 2, Type>& m)
 {
     Type det = determinant(m);
     if (det > Type(kEps) || det < -Type(kEps)) {
-        return mat_t<2, 2, Type>(m.data[1][1], -m.data[0][1], -m.data[1][0], m.data[0][0]) * (Type(1.0f) / det);
+        Type rcp_det = Approx ? approx_rcp(det) : (Type(1.0f) / det);
+        return mat_t<2, 2, Type>(m.data[1][1], -m.data[0][1], -m.data[1][0], m.data[0][0]) * rcp_det;
     } else {
         return mat_t<2, 2, Type>();
     }
 }
 
-template <typename Type> inline CUDA_CALLABLE mat_t<3, 3, Type> inverse(const mat_t<3, 3, Type>& m)
+template <typename Type> inline CUDA_CALLABLE mat_t<2, 2, Type> inverse(const mat_t<2, 2, Type>& m)
+{
+    return inverse_impl<Type, false>(m);
+}
+
+template <typename Type, bool Approx> inline CUDA_CALLABLE mat_t<3, 3, Type> inverse_impl(const mat_t<3, 3, Type>& m)
 {
     Type det = determinant(m);
 
@@ -3860,15 +3879,21 @@ template <typename Type> inline CUDA_CALLABLE mat_t<3, 3, Type> inverse(const ma
         b.data[1][2] = m.data[0][2] * m.data[1][0] - m.data[0][0] * m.data[1][2];
         b.data[2][2] = m.data[0][0] * m.data[1][1] - m.data[0][1] * m.data[1][0];
 
-        return b * (Type(1.0f) / det);
+        Type rcp_det = Approx ? approx_rcp(det) : (Type(1.0f) / det);
+        return b * rcp_det;
     } else {
         return mat_t<3, 3, Type>();
     }
 }
 
+template <typename Type> inline CUDA_CALLABLE mat_t<3, 3, Type> inverse(const mat_t<3, 3, Type>& m)
+{
+    return inverse_impl<Type, false>(m);
+}
+
 // Adapted from USD - see licenses/usd-LICENSE.txt
 // Copyright 2016 Pixar
-template <typename Type> inline CUDA_CALLABLE mat_t<4, 4, Type> inverse(const mat_t<4, 4, Type>& m)
+template <typename Type, bool Approx> inline CUDA_CALLABLE mat_t<4, 4, Type> inverse_impl(const mat_t<4, 4, Type>& m)
 {
     Type x00, x01, x02, x03;
     Type x10, x11, x12, x13;
@@ -3941,7 +3966,7 @@ template <typename Type> inline CUDA_CALLABLE mat_t<4, 4, Type> inverse(const ma
     if (fabs(det) > kEps) {
         mat_t<4, 4, Type> invm;
 
-        double rcp = 1.0 / det;
+        double rcp = Approx ? approx_rcp(det) : 1.0 / det;
 
         // Multiply all 3x3 cofactors by reciprocal & transpose
         invm.data[0][0] = Type(z00 * rcp);
@@ -3965,6 +3990,27 @@ template <typename Type> inline CUDA_CALLABLE mat_t<4, 4, Type> inverse(const ma
     } else {
         return mat_t<4, 4, Type>();
     }
+}
+
+template <typename Type> inline CUDA_CALLABLE mat_t<4, 4, Type> inverse(const mat_t<4, 4, Type>& m)
+{
+    return inverse_impl<Type, false>(m);
+}
+
+// Approximate inverse using approx_rcp for the determinant reciprocal
+template <typename Type> inline CUDA_CALLABLE mat_t<2, 2, Type> approx_inverse(const mat_t<2, 2, Type>& m)
+{
+    return inverse_impl<Type, true>(m);
+}
+
+template <typename Type> inline CUDA_CALLABLE mat_t<3, 3, Type> approx_inverse(const mat_t<3, 3, Type>& m)
+{
+    return inverse_impl<Type, true>(m);
+}
+
+template <typename Type> inline CUDA_CALLABLE mat_t<4, 4, Type> approx_inverse(const mat_t<4, 4, Type>& m)
+{
+    return inverse_impl<Type, true>(m);
 }
 
 template <unsigned Rows, typename Type> inline CUDA_CALLABLE mat_t<Rows, Rows, Type> diag(const vec_t<Rows, Type>& d)
@@ -4054,7 +4100,7 @@ inline CUDA_CALLABLE void adj_extract(
     const mat_t<Rows, Cols, Type>& m,
     int row,
     mat_t<Rows, Cols, Type>& adj_m,
-    int& adj_row,
+    int adj_row,
     const vec_t<Cols, Type>& adj_ret
 )
 {
@@ -4068,8 +4114,8 @@ inline void CUDA_CALLABLE adj_extract(
     int row,
     int col,
     mat_t<Rows, Cols, Type>& adj_m,
-    int& adj_row,
-    int& adj_col,
+    int adj_row,
+    int adj_col,
     Type adj_ret
 )
 {
@@ -4137,7 +4183,7 @@ inline CUDA_CALLABLE void adj_extract(
     int col,
     mat_t<Rows, Cols, Type>& adj_m,
     slice_t& adj_row_slice,
-    int& adj_col,
+    int adj_col,
     const vec_t<RowSliceLength, Type>& adj_ret
 )
 {
@@ -4177,7 +4223,7 @@ inline CUDA_CALLABLE void adj_extract(
     int row,
     slice_t col_slice,
     mat_t<Rows, Cols, Type>& adj_m,
-    int& adj_row,
+    int adj_row,
     slice_t& adj_col_slice,
     const vec_t<ColSliceLength, Type>& adj_ret
 )
@@ -4547,6 +4593,42 @@ inline CUDA_CALLABLE void adj_div(
 }
 
 template <unsigned Rows, unsigned Cols, typename Type>
+inline CUDA_CALLABLE void adj_approx_div(
+    const mat_t<Rows, Cols, Type>& a,
+    Type s,
+    mat_t<Rows, Cols, Type>& adj_a,
+    Type& adj_s,
+    const mat_t<Rows, Cols, Type>& adj_ret
+)
+{
+    adj_s -= approx_div(tensordot(a, adj_ret), (s * s));
+
+    for (unsigned i = 0; i < Rows; ++i) {
+        for (unsigned j = 0; j < Cols; ++j) {
+            adj_a.data[i][j] += approx_div(adj_ret.data[i][j], s);
+        }
+    }
+}
+
+template <unsigned Rows, unsigned Cols, typename Type>
+inline CUDA_CALLABLE void adj_approx_div(
+    Type s,
+    const mat_t<Rows, Cols, Type>& a,
+    Type& adj_s,
+    mat_t<Rows, Cols, Type>& adj_a,
+    const mat_t<Rows, Cols, Type>& adj_ret
+)
+{
+    for (unsigned i = 0; i < Rows; ++i) {
+        for (unsigned j = 0; j < Cols; ++j) {
+            Type inv = approx_rcp(a.data[i][j]);
+            adj_a.data[i][j] -= s * adj_ret.data[i][j] * inv * inv;
+            adj_s += adj_ret.data[i][j] * inv;
+        }
+    }
+}
+
+template <unsigned Rows, unsigned Cols, typename Type>
 inline CUDA_CALLABLE void adj_mul(
     const mat_t<Rows, Cols, Type>& a,
     Type b,
@@ -4778,6 +4860,18 @@ inline CUDA_CALLABLE void adj_inverse(
     adj_m -= mul(mul(invt, adj_ret), invt);
 }
 
+template <unsigned Rows, typename Type>
+inline CUDA_CALLABLE void adj_approx_inverse(
+    const mat_t<Rows, Rows, Type>& m,
+    mat_t<Rows, Rows, Type>& ret,
+    mat_t<Rows, Rows, Type>& adj_m,
+    const mat_t<Rows, Rows, Type>& adj_ret
+)
+{
+    // Adjoint of approx_inverse is the same as adj_inverse (no division in adjoint formula)
+    adj_inverse(m, ret, adj_m, adj_ret);
+}
+
 template <typename Type>
 inline CUDA_CALLABLE void adj_transform_point(
     const mat_t<4, 4, Type>& m,
@@ -4847,6 +4941,33 @@ inline CUDA_CALLABLE void adj_cw_div(
 {
     adj_a += cw_div(adj_ret, b);
     adj_b -= cw_mul(adj_ret, cw_div(ret, b));
+}
+
+// 5-arg overloads for tile operations (mat/scalar mixed types).
+// These forward to the existing 5-arg adj_div for mat/scalar which doesn't need ret.
+// The 6-arg adj_cw_div above is for mat/mat which needs ret for the gradient computation.
+template <unsigned Rows, unsigned Cols, typename Type>
+inline CUDA_CALLABLE void adj_cw_div(
+    const mat_t<Rows, Cols, Type>& a,
+    Type b,
+    mat_t<Rows, Cols, Type>& adj_a,
+    Type& adj_b,
+    const mat_t<Rows, Cols, Type>& adj_ret
+)
+{
+    adj_div(a, b, adj_a, adj_b, adj_ret);
+}
+
+template <unsigned Rows, unsigned Cols, typename Type>
+inline CUDA_CALLABLE void adj_cw_div(
+    Type a,
+    const mat_t<Rows, Cols, Type>& b,
+    Type& adj_a,
+    mat_t<Rows, Cols, Type>& adj_b,
+    const mat_t<Rows, Cols, Type>& adj_ret
+)
+{
+    adj_div(a, b, adj_a, adj_b, adj_ret);
 }
 
 // adjoint for the constant constructor:

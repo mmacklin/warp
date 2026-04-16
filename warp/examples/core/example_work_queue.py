@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 ###########################################################################
 # Example Work Queue
@@ -25,17 +13,17 @@ from warp.tests.unittest_utils import *
 
 
 @wp.func
-def volatile_read(ptr: wp.array(dtype=wp.int32), index: int):
+def volatile_read(ptr: wp.array[int], index: int):
     value = wp.atomic_add(ptr, index, 0)
     return value
 
 
 @wp.struct
 class WorkQueue:
-    buffer: wp.array(dtype=wp.int32)
+    buffer: wp.array[int]
     capacity: int
-    head: wp.array(dtype=wp.int32)
-    tail: wp.array(dtype=wp.int32)
+    head: wp.array[int]
+    tail: wp.array[int]
 
 
 @wp.func
@@ -97,9 +85,9 @@ def process_queue(queue: WorkQueue):
 def test_work_queue(device):
     # Create a work queue with capacity 1024
     capacity = 8192
-    head = wp.array([0], dtype=wp.int32, device=device)
-    tail = wp.array([4096], dtype=wp.int32, device=device)
-    buffer = wp.array(np.arange(4096, dtype=np.int32), dtype=wp.int32, device=device)
+    head = wp.array([0], dtype=int, device=device)
+    tail = wp.array([4096], dtype=int, device=device)
+    buffer = wp.array(np.arange(4096, dtype=np.int32), dtype=int, device=device)
 
     queue = WorkQueue()
     queue.capacity = capacity

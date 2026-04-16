@@ -1,22 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 from __future__ import annotations
 
 import ast
 import builtins
+import contextlib
 import ctypes
 import enum
 import functools
@@ -25,12 +14,11 @@ import inspect
 import itertools
 import math
 import re
-import sys
 import textwrap
 import threading
 import types
-from collections.abc import Mapping, Sequence
-from typing import Any, Callable, ClassVar, get_args, get_origin
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any, ClassVar, get_args, get_origin
 
 import warp.config
 from warp._src.types import *
@@ -132,134 +120,48 @@ builtin_operators[ast.Invert] = "invert"
 builtin_operators[ast.LShift] = "lshift"
 builtin_operators[ast.RShift] = "rshift"
 
-comparison_chain_strings = [
-    builtin_operators[ast.Gt],
-    builtin_operators[ast.Lt],
-    builtin_operators[ast.LtE],
-    builtin_operators[ast.GtE],
-    builtin_operators[ast.Eq],
-    builtin_operators[ast.NotEq],
-]
-
 
 def values_check_equal(a, b):
     if isinstance(a, Sequence) and isinstance(b, Sequence):
         if len(a) != len(b):
             return False
 
-        return all(x == y for x, y in zip(a, b))
+        return all(x == y for x, y in zip(a, b, strict=True))
 
     return a == b
 
 
-def op_str_is_chainable(op: str) -> builtins.bool:
-    return op in comparison_chain_strings
+def get_closure_vars(func: Callable) -> dict[str, Any]:
+    """Return a dict of the function's closure variables, skipping empty cells."""
+    result = {}
+    closure = func.__closure__
+    if closure is not None:
+        for name, cell in zip(func.__code__.co_freevars, closure, strict=True):
+            try:
+                result[name] = cell.cell_contents
+            except ValueError:
+                pass
+    return result
 
 
-def get_closure_cell_contents(obj):
-    """Retrieve a closure's cell contents or `None` if it's empty."""
-    try:
-        return obj.cell_contents
-    except ValueError:
-        pass
-
-    return None
-
-
-def eval_annotations(annotations: Mapping[str, Any], obj: Any) -> Mapping[str, Any]:
-    """Un-stringize annotations caused by `from __future__ import annotations` of PEP 563."""
-    # Implementation backported from `inspect.get_annotations()` for Python 3.9 and older.
-    if not annotations:
-        return {}
-
-    if not any(isinstance(x, str) for x in annotations.values()):
-        # No annotation to un-stringize.
-        return annotations
-
-    if isinstance(obj, type):
-        # class
-        globals = {}
-        module_name = getattr(obj, "__module__", None)
-        if module_name:
-            module = sys.modules.get(module_name, None)
-            if module:
-                globals = getattr(module, "__dict__", {})
-        locals = dict(vars(obj))
-        unwrap = obj
-    elif isinstance(obj, types.ModuleType):
-        # module
-        globals = obj.__dict__
-        locals = {}
-        unwrap = None
-    elif callable(obj):
-        # function
-        globals = getattr(obj, "__globals__", {})
-        # Capture the variables from the surrounding scope.
-        closure_vars = zip(
-            obj.__code__.co_freevars, tuple(get_closure_cell_contents(x) for x in (obj.__closure__ or ()))
-        )
-        locals = {k: v for k, v in closure_vars if v is not None}
-        unwrap = obj
-    else:
-        raise TypeError(f"{obj!r} is not a module, class, or callable.")
-
-    if unwrap is not None:
-        while True:
-            if hasattr(unwrap, "__wrapped__"):
-                unwrap = unwrap.__wrapped__
-                continue
-            if isinstance(unwrap, functools.partial):
-                unwrap = unwrap.func
-                continue
-            break
-        if hasattr(unwrap, "__globals__"):
-            globals = unwrap.__globals__
-
-    # "Inject" type parameters into the local namespace
-    # (unless they are shadowed by assignments *in* the local namespace),
-    # as a way of emulating annotation scopes when calling `eval()`
-    type_params = getattr(obj, "__type_params__", ())
-    if type_params:
-        locals = {param.__name__: param for param in type_params} | locals
-
-    return {k: v if not isinstance(v, str) else eval(v, globals, locals) for k, v in annotations.items()}
+def resolve_closure_or_global(func: Callable, name: str):
+    """Look up *name* in the function's closure variables, falling back to globals."""
+    closure_vars = get_closure_vars(func)
+    if name in closure_vars:
+        return closure_vars[name]
+    return func.__globals__.get(name)
 
 
 def get_annotations(obj: Any) -> Mapping[str, Any]:
     """Same as `inspect.get_annotations()` but always returning un-stringized annotations."""
-    # Python 3.10+: Use the built-in inspect.get_annotations() which handles
-    # PEP 649 (deferred annotation evaluation) in Python 3.14+
-    if hasattr(inspect, "get_annotations"):
-        # eval_str=True ensures stringized annotations from PEP 563 are evaluated
-        return inspect.get_annotations(obj, eval_str=True)
-    else:
-        # Python 3.9 and older: Manual backport of inspect.get_annotations()
-        # See https://docs.python.org/3/howto/annotations.html#accessing-the-annotations-dict-of-an-object-in-python-3-9-and-older
-        if isinstance(obj, type):
-            annotations = obj.__dict__.get("__annotations__", {})
-        else:
-            annotations = getattr(obj, "__annotations__", {})
-
-        return eval_annotations(annotations, obj)
+    return inspect.get_annotations(obj, eval_str=True)
 
 
 def get_full_arg_spec(func: Callable) -> inspect.FullArgSpec:
     """Same as `inspect.getfullargspec()` but always returning un-stringized annotations."""
     spec = inspect.getfullargspec(func)
-
-    # Python 3.10+: Use inspect.get_annotations()
-    if hasattr(inspect, "get_annotations"):
-        # Capture closure variables to handle cases like `foo.Data` where `foo` is a closure variable
-        closure_vars = dict(
-            zip(func.__code__.co_freevars, (get_closure_cell_contents(x) for x in (func.__closure__ or ())))
-        )
-        # Filter out None values from empty cells
-        closure_vars = {k: v for k, v in closure_vars.items() if v is not None}
-        return spec._replace(annotations=inspect.get_annotations(func, eval_str=True, locals=closure_vars))
-    else:
-        # Python 3.9 and older: Manually un-stringize annotations
-        # See https://docs.python.org/3/howto/annotations.html#manually-un-stringizing-stringized-annotations
-        return spec._replace(annotations=eval_annotations(spec.annotations, func))
+    closure_vars = get_closure_vars(func)
+    return spec._replace(annotations=inspect.get_annotations(func, eval_str=True, locals=closure_vars))
 
 
 def struct_instance_repr_recursive(inst: StructInstance, depth: int, use_repr: bool) -> str:
@@ -338,9 +240,14 @@ class StructInstance:
         while stack:
             src, dst, name, var = stack.pop()
             value = getattr(src, name)
-            if isinstance(var.type, array):
+            if matches_array_class(var.type, array):
                 # array_t
                 setattr(dst, name, value.to(device))
+            elif matches_array_class(var.type, indexedarray):
+                # indexedarray_t
+                # `.to` returns an array if on different device, force to identity indexedarray
+                cloned = value.to(device)
+                setattr(dst, name, cloned if isinstance(cloned, indexedarray) else indexedarray(cloned))
             elif isinstance(var.type, Struct):
                 # nested struct
                 new_struct = var.type()
@@ -365,8 +272,11 @@ class StructInstance:
             # get the attribute value
             value = getattr(self._ctype, name)
 
-            if isinstance(var.type, array):
+            if matches_array_class(var.type, array):
                 # array_t
+                npvalue.append(value.numpy_value())
+            elif matches_array_class(var.type, indexedarray):
+                # indexedarray_t
                 npvalue.append(value.numpy_value())
             elif isinstance(var.type, Struct):
                 # nested struct
@@ -388,6 +298,11 @@ class StructInstance:
         return tuple(npvalue)
 
 
+def _is_tid_call(node) -> bool:
+    """Return True if *node* is an AST call to ``wp.tid()``."""
+    return isinstance(node, ast.Call) and hasattr(node.func, "attr") and node.func.attr == "tid"
+
+
 def _is_texture_type(var_type: type) -> bool:
     """Check if var_type is a Texture subclass (Texture2D, Texture3D, etc.)."""
     from warp._src.texture import Texture  # noqa: PLC0415
@@ -401,7 +316,9 @@ def _is_texture_type(var_type: type) -> bool:
 def _make_struct_field_constructor(field: str, var_type: type):
     if isinstance(var_type, Struct):
         return lambda ctype: var_type.instance_type(ctype=getattr(ctype, field))
-    elif isinstance(var_type, warp._src.types.array):
+    elif matches_array_class(var_type, warp._src.types.array):
+        return lambda ctype: None
+    elif matches_array_class(var_type, warp._src.types.indexedarray):
         return lambda ctype: None
     elif _is_texture_type(var_type):
         return lambda ctype: None
@@ -433,6 +350,27 @@ def _make_struct_field_setter(cls, field: str, var_type: type):
 
         cls.__setattr__(inst, field, value)
 
+    def set_indexedarray_value(inst, value):
+        if value is None:
+            setattr(inst._ctype, field, var_type.__ctype__())
+        else:
+            assert isinstance(value, indexedarray)
+            assert types_equal(value.dtype, var_type.dtype), (
+                f"assign to struct member variable {field} failed, expected type {type_repr(var_type.dtype)}, got type {type_repr(value.dtype)}"
+            )
+            setattr(inst._ctype, field, value.__ctype__())
+
+        # workaround to prevent gradient buffers being garbage collected
+        # (indexedarray_t embeds an array_t)
+        grad_attr = "_" + field + "_grad"
+        if value is not None and value.data is not None and value.data.requires_grad:
+            cls.__setattr__(inst, grad_attr, value.data.grad)
+        else:
+            # clear any previous keepalive
+            cls.__setattr__(inst, grad_attr, None)
+
+        cls.__setattr__(inst, field, value)
+
     def set_struct_value(inst, value):
         getattr(inst, field).assign(value)
 
@@ -443,6 +381,14 @@ def _make_struct_field_setter(cls, field: str, var_type: type):
         elif type(value) is var_type:
             setattr(inst._ctype, field, value)
         else:
+            if is_scalar(value):
+                warp._src.utils.warn(
+                    f"Implicit conversion from a scalar type to the composite type "
+                    f"`{type_repr(var_type)}` for struct field '{field}' is deprecated. "
+                    f"Use an explicit conversion, e.g.: `{type_repr(var_type)}(...)`.",
+                    DeprecationWarning,
+                    stacklevel=3,
+                )
             # conversion from list/tuple, ndarray, etc.
             setattr(inst._ctype, field, var_type(value))
 
@@ -454,8 +400,10 @@ def _make_struct_field_setter(cls, field: str, var_type: type):
         if value is None:
             # zero initialize
             setattr(inst._ctype, field, var_type._type_())
+            cls.__setattr__(inst, field, var_type())
         else:
-            if hasattr(value, "_type_"):
+            is_warp_scalar = hasattr(value, "_type_")
+            if is_warp_scalar:
                 # assigning warp type value (e.g.: wp.float32)
                 value = value.value
             # float16 needs conversion to uint16 bits
@@ -464,7 +412,10 @@ def _make_struct_field_setter(cls, field: str, var_type: type):
             else:
                 setattr(inst._ctype, field, value)
 
-        cls.__setattr__(inst, field, value)
+            # Re-wrap in the Warp scalar type so the Python attribute preserves
+            # the declared type (e.g. wp.uint8) instead of decaying to plain
+            # int/float, but only when the caller passed a Warp scalar.
+            cls.__setattr__(inst, field, var_type(value) if is_warp_scalar else value)
 
     def set_texture_value(inst, value):
         # Texture2D, Texture3D, etc.
@@ -477,8 +428,10 @@ def _make_struct_field_setter(cls, field: str, var_type: type):
 
         cls.__setattr__(inst, field, value)
 
-    if isinstance(var_type, array):
+    if matches_array_class(var_type, array):
         return set_array_value
+    elif matches_array_class(var_type, indexedarray):
+        return set_indexedarray_value
     elif isinstance(var_type, Struct):
         return set_struct_value
     elif _is_texture_type(var_type):
@@ -507,8 +460,10 @@ class Struct:
 
         fields = []
         for label, var in self.vars.items():
-            if isinstance(var.type, array):
+            if matches_array_class(var.type, array):
                 fields.append((label, array_t))
+            elif matches_array_class(var.type, indexedarray):
+                fields.append((label, indexedarray_t))
             elif isinstance(var.type, Struct):
                 fields.append((label, var.type.ctype))
             elif issubclass(var.type, ctypes.Array):
@@ -621,9 +576,12 @@ class Struct:
         for name, var in self.vars.items():
             names.append(name)
             offsets.append(getattr(self.ctype, name).offset)
-            if isinstance(var.type, array):
+            if matches_array_class(var.type, array):
                 # array_t
                 formats.append(array_t.numpy_dtype())
+            elif matches_array_class(var.type, indexedarray):
+                # indexedarray_t
+                formats.append(indexedarray_t.numpy_dtype())
             elif isinstance(var.type, Struct):
                 # nested struct
                 formats.append(var.type.numpy_dtype())
@@ -651,12 +609,15 @@ class Struct:
 
         for name, var in self.vars.items():
             offset = getattr(self.ctype, name).offset
-            if isinstance(var.type, array):
+            if matches_array_class(var.type, array):
                 # We could reconstruct wp.array from array_t, but it's problematic.
                 # There's no guarantee that the original wp.array is still allocated and
                 # no easy way to make a backref.
                 # Instead, we just create a stub annotation, which is not a fully usable array object.
                 setattr(instance, name, array(dtype=var.type.dtype, ndim=var.type.ndim))
+            elif matches_array_class(var.type, indexedarray):
+                # Same as regular arrays: return an annotation stub only.
+                setattr(instance, name, indexedarray(dtype=var.type.dtype, ndim=var.type.ndim))
             elif isinstance(var.type, Struct):
                 # nested struct
                 value = var.type.from_ptr(ptr + offset)
@@ -669,7 +630,7 @@ class Struct:
                 # scalar
                 cvalue = ctypes.cast(ptr + offset, ctypes.POINTER(var.type._type_)).contents
                 if var.type == warp.float16:
-                    setattr(instance, name, half_bits_to_float(cvalue))
+                    setattr(instance, name, half_bits_to_float(cvalue.value))
                 else:
                     setattr(instance, name, cvalue.value)
 
@@ -784,7 +745,7 @@ class Var:
             return f"{classstr}_t<{dtypestr}>"
         elif is_array(t):
             dtypestr = Var.dtype_to_ctype(t.dtype)
-            classstr = f"wp::{type(t).__name__}"
+            classstr = f"wp::{concrete_array_type(t).__name__}"
             return f"{classstr}_t<{dtypestr}>"
         elif get_origin(t) is tuple:
             dtypestr = ", ".join(Var.dtype_to_ctype(x) for x in get_args(t))
@@ -837,7 +798,7 @@ class Var:
             return
 
         # detect if we are writing to an array after reading from it within the same kernel
-        if self.is_read and warp.config.verify_autograd_array_access:
+        if self.is_read and warp._src.codegen.options.get("verify_autograd_array_access", False):
             if "kernel_name" and "filename" and "lineno" in kwargs:
                 print(
                     f"Warning: Array passed to argument {self.label} in kernel {kwargs['kernel_name']} at {kwargs['filename']}:{kwargs['lineno']} is being written to after it has been read from within the same kernel. This may corrupt gradient computation in the backward pass."
@@ -906,7 +867,7 @@ def func_match_args(func, arg_types, kwarg_types):
     bound_arg_types = tuple(bound_arg_types.arguments.values())
 
     # Check the given argument types against the ones defined on the function.
-    for bound_arg_type, func_arg_type in zip(bound_arg_types, func.input_types.values()):
+    for bound_arg_type, func_arg_type in zip(bound_arg_types, func.input_types.values(), strict=True):
         # Let the `value_func` callback infer the type.
         if bound_arg_type is None:
             continue
@@ -923,12 +884,11 @@ def func_match_args(func, arg_types, kwarg_types):
         bound_arg_type_stripped = strip_reference(bound_arg_type)
 
         # Handle array polymorphism (e.g., passing a fixed array to a function taking an array).
+        func_concrete = concrete_array_type(func_arg_type)
+        bound_concrete = concrete_array_type(bound_arg_type_stripped)
         if (
             is_array(func_arg_type)
-            and (
-                issubclass(type(func_arg_type), type(bound_arg_type_stripped))
-                or issubclass(type(bound_arg_type_stripped), type(func_arg_type))
-            )
+            and (issubclass(func_concrete, bound_concrete) or issubclass(bound_concrete, func_concrete))
             and types_equal_generic(func_arg_type.dtype, bound_arg_type_stripped.dtype, match_generic=True)
         ):
             continue
@@ -950,7 +910,17 @@ def get_arg_type(arg: Var | Any) -> type:
         return arg._cls
 
     if isinstance(
-        arg, (type, *array_types, warp._src.codegen.Struct, warp._src.context.Function, tuple_t, slice_t, tile)
+        arg,
+        (
+            type,
+            *array_types,
+            warp._src.types._ArrayAnnotationBase,
+            warp._src.codegen.Struct,
+            warp._src.context.Function,
+            tuple_t,
+            slice_t,
+            tile,
+        ),
     ):
         return arg
 
@@ -1110,11 +1080,18 @@ class Adjoint:
         # This will signal to the module builder that this module needs to be rebuilt even if the module hash is unchanged.
         adj.has_unresolved_static_expressions = False
 
-        # try to replace static expressions by their constant result if the
-        # expression can be evaluated at declaration time
-        adj.static_expressions: dict[str, Any] = {}
+        # wp.static() expressions resolved at declaration time (replace_static_expressions),
+        # keyed by source code string. Used for hashing. Immutable after __init__.
+        adj.resolved_static_expressions: dict[str, Any] = {}
         if "static" in adj.source:
             adj.replace_static_expressions()
+
+        # wp.static() expressions resolved during codegen (emit_Call) for expressions that
+        # depend on loop variables; reset at the start of each build(). Used for hashing.
+        # This is a list (not a dict) because the same source expression can evaluate to
+        # different values across loop iterations — e.g. wp.static(values[i]) always has
+        # key "values[i]" but a different value per iteration.
+        adj.deferred_static_expressions: list[tuple[str, Any]] = []
 
         # There are cases where a same module might be rebuilt multiple times,
         # for example when kernels are nested inside of functions, or when
@@ -1123,6 +1100,36 @@ class Adjoint:
         # so we only avoid rebuilding kernels that errored out to give a chance
         # for unit testing errors being spit out from kernels.
         adj.skip_build = False
+
+        # Infer kernel_dim from wp.tid() calls in the AST.  This must happen
+        # early (before hashing) because kernel_dim determines the
+        # launch_bounds_t<N> template parameter in the generated C++ and
+        # therefore affects the compiled binary.  The hasher runs before
+        # build(), so kernel_dim must already be correct at this point.
+        adj.kernel_dim = adj._infer_kernel_dim()
+
+    def _infer_kernel_dim(adj) -> int:
+        """Infer kernel_dim from ``wp.tid()`` calls in the already-parsed AST.
+
+        This is a lightweight scan that runs during ``__init__`` (before hashing
+        and before ``build()``).  It mirrors the tid-tracking logic that was
+        previously inside ``build()`` but only walks assignments looking for
+        ``wp.tid()`` patterns, so it is much cheaper than a full build.
+
+        Also sets ``max_tid_dimensionality`` (0 when no ``wp.tid()`` calls
+        exist) which is used by ``_construct_tiled_bounds`` to detect
+        kernels that don't call ``wp.tid()`` at all.
+        """
+        max_dim = 0
+        for node in ast.walk(adj.tree):
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call) and _is_tid_call(node.value):
+                target = node.targets[0]
+                if isinstance(target, ast.Tuple):
+                    max_dim = max(max_dim, len(target.elts))
+                else:
+                    max_dim = max(max_dim, 1)
+        adj.max_tid_dimensionality = max_dim
+        return max_dim if max_dim > 0 else 1
 
     # allocate extra space for a function call that requires its
     # own shared memory space, we treat shared memory as a stack
@@ -1181,6 +1188,7 @@ class Adjoint:
 
         adj.symbols = {}  # map from symbols to adjoint variables
         adj.variables = []  # list of local variables (in order)
+        adj.deferred_static_expressions = []
 
         adj.return_var = None  # return type for function or kernel
         adj.loop_symbols = []  # symbols at the start of each loop
@@ -1208,6 +1216,13 @@ class Adjoint:
         # recursively evaluate function body
         try:
             adj.eval(adj.tree.body[0])
+
+            # After evaluating the whole function we can validate the return
+            # type. This needs to happen before actually writing the generated
+            # code to the CUDA/C++ file to avoid a broken function from affecting
+            # the compilation of valid ones.
+            adj._validate_return_type()
+
         except Exception as original_exc:
             try:
                 lineno = adj.lineno + adj.fun_lineno
@@ -1228,11 +1243,60 @@ class Adjoint:
             for a in adj.args:
                 if isinstance(a.type, Struct):
                     builder.build_struct_recursive(a.type)
-                elif isinstance(a.type, warp._src.types.array) and isinstance(a.type.dtype, Struct):
+                elif warp._src.types.matches_array_class(a.type, warp._src.types.array) and isinstance(
+                    a.type.dtype, Struct
+                ):
                     builder.build_struct_recursive(a.type.dtype)
 
             # release builder reference for GC
             adj.builder = None
+
+    def _validate_return_type(adj):
+        """Validate function return type annotation against actual return values.
+
+        This validation happens during build() (before C++ code generation) to catch
+        errors early and prevent module contamination. If validation fails here,
+        the function is marked as skip_build and won't emit any C++ code.
+        """
+        if adj.return_var is not None and "return" in adj.arg_types:
+            if get_origin(adj.arg_types["return"]) is tuple:
+                if len(get_args(adj.arg_types["return"])) != len(adj.return_var):
+                    raise WarpCodegenError(
+                        f"The function `{adj.fun_name}` has its return type "
+                        f"annotated as a tuple of {len(get_args(adj.arg_types['return']))} elements "
+                        f"but the code returns {len(adj.return_var)} values."
+                    )
+                elif not types_equal_generic(adj.arg_types["return"], tuple(x.type for x in adj.return_var)):
+                    raise WarpCodegenError(
+                        f"The function `{adj.fun_name}` has its return type "
+                        f"annotated as `{warp._src.context.type_str(adj.arg_types['return'])}` "
+                        f"but the code returns a tuple with types `({', '.join(warp._src.context.type_str(x.type) for x in adj.return_var)})`."
+                    )
+            elif len(adj.return_var) > 1 and get_origin(adj.arg_types["return"]) is not tuple:
+                raise WarpCodegenError(
+                    f"The function `{adj.fun_name}` has its return type "
+                    f"annotated as `{warp._src.context.type_str(adj.arg_types['return'])}` "
+                    f"but the code returns {len(adj.return_var)} values."
+                )
+            elif (
+                isinstance(adj.return_var[0].type, warp._src.types.fixedarray)
+                and type(adj.arg_types["return"]) is warp._src.types.array
+            ):
+                # If the return statement yields a `fixedarray` while the function is annotated
+                # to return a standard `array`, then raise an error since the `fixedarray` storage
+                # allocated on the stack will be freed once the function exits, meaning that the
+                # resulting `array` instance will point to an invalid data.
+                raise WarpCodegenError(
+                    f"The function `{adj.fun_name}` returns a fixed-size array "
+                    f"whereas it has its return type annotated as "
+                    f"`{warp._src.context.type_str(adj.arg_types['return'])}`."
+                )
+            elif not types_equal(adj.arg_types["return"], adj.return_var[0].type):
+                raise WarpCodegenError(
+                    f"The function `{adj.fun_name}` has its return type "
+                    f"annotated as `{warp._src.context.type_str(adj.arg_types['return'])}` "
+                    f"but the code returns a value of type `{warp._src.context.type_str(adj.return_var[0].type)}`."
+                )
 
     # code generation methods
     def format_template(adj, template, input_vars, output_var):
@@ -1376,11 +1440,11 @@ class Adjoint:
 
         # lineinfo is enabled by default in debug mode regardless of the builder option, don't want to unnecessarily
         # emit line directives in generated code if it's not being compiled with line information
-        build_mode = val if (val := adj.builder_options.get("mode")) is not None else warp.config.mode
+        build_mode = adj.builder_options.get("mode", "release")
 
         lineinfo_enabled = adj.builder_options.get("lineinfo", False) or build_mode == "debug"
 
-        if relative_lineno is not None and lineinfo_enabled and warp.config.line_directives:
+        if relative_lineno is not None and lineinfo_enabled and adj.builder_options.get("line_directives", True):
             is_comment = statement.strip().startswith("//")
             if not is_comment:
                 line = relative_lineno + adj.fun_lineno
@@ -1434,9 +1498,8 @@ class Adjoint:
 
         prev_comp_var = None
 
-        for op, comp in zip(op_strings, comps):
-            comp_chainable = op_str_is_chainable(op)
-            if comp_chainable and prev_comp_var:
+        for op, comp in zip(op_strings, comps, strict=True):
+            if prev_comp_var:
                 # We restrict chaining to operands of the same type
                 if prev_comp_var.type is comp.type:
                     prev_comp_var = adj.load(prev_comp_var)
@@ -1455,14 +1518,6 @@ class Adjoint:
         s = s.rstrip() + ";"
 
         adj.add_forward(s)
-
-        return output
-
-    def add_bool_op(adj, op_string, exprs):
-        exprs = [adj.load(expr) for expr in exprs]
-        output = adj.add_var(builtins.bool)
-        command = output.emit() + " = " + (" " + op_string + " ").join([expr.emit() for expr in exprs]) + ";"
-        adj.add_forward(command)
 
         return output
 
@@ -1563,6 +1618,32 @@ class Adjoint:
             apply_defaults(bound_args, default_vars)
 
         bound_args = bound_args.arguments
+
+        # Constant precision preservation: when calling a 64-bit scalar type
+        # constructor with a single compile-time constant argument, emit
+        # a variable of the target type initialized directly from the
+        # literal value.  This avoids precision loss from the intermediate
+        # variable being narrowed to int32/float32.
+        # The variable is NOT marked as a constant (via add_var's constant=
+        # parameter) because emit_Assign maps symbols directly to the Var
+        # returned here, and a const-qualified C++ variable cannot be passed
+        # by non-const reference to functions that write through it.
+        if func.is_builtin() and func.value_type in (float64, int64, uint64) and len(bound_args) == 1:
+            arg = next(iter(bound_args.values()))
+            if isinstance(arg, Var) and arg.constant is not None:
+                raw = arg.constant
+                # Unwrap Warp scalar type instances to their raw Python value
+                if type(raw) in warp._src.types.scalar_types:
+                    raw = raw.value
+                if isinstance(raw, builtins.int) or (isinstance(raw, builtins.float) and not math.isnan(raw)):
+                    # Repurpose the original arg variable: change its type to
+                    # the 64-bit target and clear its constant so it emits as
+                    # an uninitialized variable of the correct type, avoiding
+                    # compiler warnings from narrowing a 64-bit literal.
+                    arg.type = func.value_type
+                    arg.constant = None
+                    adj.add_forward(f"var_{arg} = {constant_str(func.value_type(raw))};")
+                    return arg
 
         # if it is a user-function then build it recursively
         if not func.is_builtin():
@@ -1705,7 +1786,11 @@ class Adjoint:
                 require_original_output_arg=func.require_original_output_arg,
             )
             if arg_str is not None:
-                reverse_call = f"{func.namespace}adj_{func.native_func}({arg_str});"
+                if func.lto_dispatch_func is not None:
+                    adj_func_name = compute_type_str(func.native_func, template_args)
+                else:
+                    adj_func_name = func.native_func
+                reverse_call = f"{func.namespace}adj_{adj_func_name}({arg_str});"
                 adj.add_reverse(reverse_call)
 
         # update our smem roofline requirements based on any
@@ -2072,13 +2157,14 @@ class Adjoint:
                 if isinstance(obj.func, ast.Attribute):
                     if obj.func.attr == "func_native":
                         is_func_native = True
-        if is_func_native and node.returns is not None:
-            if isinstance(node.returns, ast.Name):  # python built-in type
-                var = Var(label="return_type", type=eval(node.returns.id))
-            elif isinstance(node.returns, ast.Attribute):  # warp type
-                var = Var(label="return_type", type=eval(node.returns.attr))
-            else:
-                raise WarpCodegenTypeError("Native function return type not recognized")
+        if is_func_native and "return" in adj.arg_types:
+            ret_type = adj.arg_types["return"]
+            if not (type_is_value(ret_type) or is_array(ret_type)):
+                raise WarpCodegenError(
+                    f"Native function '{adj.fun_name}' has unsupported return type `{ret_type}`. "
+                    f"Expected a Warp scalar, vector, matrix, quaternion, array, or fixedarray type."
+                )
+            var = Var(label="return_type", type=ret_type)
             adj.return_var = (var,)
 
     def emit_If(adj, node):
@@ -2178,13 +2264,42 @@ class Adjoint:
 
         op = node.op
         if isinstance(op, ast.And):
-            func = "&&"
+            is_and = True
         elif isinstance(op, ast.Or):
-            func = "||"
+            is_and = False
         else:
             raise WarpCodegenKeyError(f"Op {op} is not supported")
 
-        return adj.add_bool_op(func, [adj.eval(expr) for expr in node.values])
+        # Short-circuit evaluation: only evaluate subsequent operands
+        # if the result so far permits it (true for 'and', false for 'or').
+        output = adj.add_var(builtins.bool)
+        first = adj.eval(node.values[0])
+        first = adj.load(first)
+        adj.add_forward(f"{output.emit()} = {first.emit()};")
+
+        for expr in node.values[1:]:
+            # Guard: only evaluate next operand if short-circuit condition holds
+            if is_and:
+                adj.add_forward(f"if ({output.emit()}) {{")
+                adj.add_reverse("}")
+            else:
+                adj.add_forward(f"if (!{output.emit()}) {{")
+                adj.add_reverse("}")
+            adj.indent()
+
+            val = adj.eval(expr)
+            val = adj.load(val)
+            op_str = "&&" if is_and else "||"
+            adj.add_forward(f"{output.emit()} = {output.emit()} {op_str} {val.emit()};")
+
+            adj.dedent()
+            adj.add_forward("}")
+            if is_and:
+                adj.add_reverse(f"if ({output.emit()}) {{")
+            else:
+                adj.add_reverse(f"if (!{output.emit()}) {{")
+
+        return output
 
     def emit_Name(adj, node):
         # lookup symbol, if it has already been assigned to a variable then return the existing mapping
@@ -2256,11 +2371,12 @@ class Adjoint:
         # possibly holding differentiable values (for which gradients must be accumulated)
         return type_scalar_type(var_type) in float_types or isinstance(var_type, Struct)
 
-    def emit_Attribute(adj, node):
+    def emit_Attribute(adj, node, aggregate=None):
         if hasattr(node, "is_adjoint"):
             node.value.is_adjoint = True
 
-        aggregate = adj.eval(node.value)
+        if aggregate is None:
+            aggregate = adj.eval(node.value)
 
         try:
             if isinstance(aggregate, Var) and aggregate.constant is not None:
@@ -2363,7 +2479,7 @@ class Adjoint:
     def emit_BinOp(adj, node):
         # evaluate binary operator arguments
 
-        if warp.config.verify_autograd_array_access:
+        if adj.builder_options.get("verify_autograd_array_access", False):
             # array overwrite tracking: in-place operators are a special case
             # x[tid] = x[tid] + 1 is a read followed by a write, but we only want to record the write
             # so we save the current arg read flags and restore them after lhs eval
@@ -2374,7 +2490,7 @@ class Adjoint:
         # evaluate lhs binary operator argument
         left = adj.eval(node.left)
 
-        if warp.config.verify_autograd_array_access:
+        if adj.builder_options.get("verify_autograd_array_access", False):
             # restore arg read flags
             for i, arg in enumerate(adj.args):
                 arg.is_read = is_read_states[i]
@@ -2399,8 +2515,16 @@ class Adjoint:
         arg = adj.eval(node.operand)
 
         # evaluate expression to a compile-time constant if arg is a constant
-        if arg.constant is not None and math.isfinite(arg.constant):
+        if isinstance(arg.constant, (builtins.int, builtins.float)):
             if isinstance(node.op, ast.USub):
+                # When the operand is a literal constant (ast.Constant), the
+                # arg Var was just created and is not referenced by any symbol,
+                # so we can safely repurpose it with the negated value to avoid
+                # emitting a dead variable with a potentially truncating
+                # constant initializer (e.g. int32 assigned a 64-bit literal).
+                if isinstance(node.operand, ast.Constant):
+                    arg.constant = -arg.constant
+                    return arg
                 return adj.add_constant(-arg.constant)
 
         name = builtin_operators[type(node.op)]
@@ -2508,7 +2632,7 @@ class Adjoint:
         # It is important to do that in one pass, so that if evaluating these arguments have side effects
         # the code does not get generated more than once
         range_args = [adj.eval_num(arg) for arg in loop.iter.args]
-        arg_is_numeric, arg_values = zip(*range_args)
+        arg_is_numeric, arg_values = zip(*range_args, strict=True)
 
         if all(arg_is_numeric):
             # All argument are numeric constants
@@ -2534,10 +2658,7 @@ class Adjoint:
             # test if we're above max unroll count
             max_iters = abs(end - start) // abs(step)
 
-            if "max_unroll" in adj.builder_options:
-                max_unroll = adj.builder_options["max_unroll"]
-            else:
-                max_unroll = warp.config.max_unroll
+            max_unroll = adj.builder_options.get("max_unroll", 16)
 
             ok_to_unroll = True
 
@@ -2779,7 +2900,7 @@ class Adjoint:
 
         if is_array(target_type):
             builtin_name = "address"
-            if warp.config.verify_autograd_array_access:
+            if adj.builder_options.get("verify_autograd_array_access", False):
                 target.mark_read()
         else:
             builtin_name = "extract"
@@ -2807,7 +2928,7 @@ class Adjoint:
             # try to evaluate wp.static() expressions
             obj, code = adj.evaluate_static_expression(node)
             if obj is not None:
-                adj.static_expressions[code] = obj
+                adj.deferred_static_expressions.append((code, obj))
                 if isinstance(obj, warp._src.context.Function):
                     # special handling for wp.static() evaluating to a function
                     return obj
@@ -2841,8 +2962,28 @@ class Adjoint:
             caller = func
             func = None
 
+            # Handle module callers: check if attribute exists on the module
+            if isinstance(caller, types.ModuleType):
+                if hasattr(caller, attr):
+                    # Attribute exists on the module - use it
+                    func = getattr(caller, attr)
+                    if not isinstance(func, warp._src.context.Function):
+                        # It's not a Function, might be a type - let subsequent logic handle it
+                        caller = func
+                        func = None
+                elif caller is warp and attr in warp._src.context.builtin_functions:
+                    # Fallback: for the warp module, check builtin_functions
+                    # (builtins like tid() are not actual attributes of the warp module)
+                    func = warp._src.context.builtin_functions[attr]
+                else:
+                    # Attribute doesn't exist on this module
+                    raise WarpCodegenAttributeError(
+                        f"Could not find function {'.'.join(path)} as a built-in or user-defined function. "
+                        "Note that user functions must be annotated with a @wp.func decorator to be called from a kernel."
+                    )
+
             # try and lookup function name in builtins (e.g.: using `dot` directly without wp prefix)
-            if attr in warp._src.context.builtin_functions:
+            if func is None and attr in warp._src.context.builtin_functions:
                 func = warp._src.context.builtin_functions[attr]
 
             # vector class type e.g.: wp.vec3f constructor
@@ -2894,7 +3035,7 @@ class Adjoint:
 
         out = adj.add_call(func, args, kwargs, type_args, min_outputs=min_outputs)
 
-        if warp.config.verify_autograd_array_access:
+        if adj.builder_options.get("verify_autograd_array_access", False):
             # Extract the types and values passed as arguments to the function call.
             arg_types = tuple(get_arg_type(x) for x in args)
             kwarg_types = {k: get_arg_type(v) for k, v in kwargs.items()}
@@ -2946,11 +3087,11 @@ class Adjoint:
                 # handles array loads (where each dimension has an index specified)
                 out = adj.add_builtin_call("address", [target, *indices])
 
-                if warp.config.verify_autograd_array_access:
+                if adj.builder_options.get("verify_autograd_array_access", False):
                     target.mark_read()
 
             else:
-                if isinstance(target_type, warp._src.types.array):
+                if warp._src.types.matches_array_class(target_type, warp._src.types.array):
                     # In order to reduce the number of overloads needed in the C
                     # implementation to support combinations of int/slice indices,
                     # we convert all integer indices into slices, and set their
@@ -2968,7 +3109,7 @@ class Adjoint:
                 # handles array views (fewer indices than dimensions)
                 out = adj.add_builtin_call("view", [target, *indices])
 
-                if warp.config.verify_autograd_array_access:
+                if adj.builder_options.get("verify_autograd_array_access", False):
                     # store reference to target Var to propagate downstream read/write state back to root arg Var
                     out.parent = target
 
@@ -3022,12 +3163,6 @@ class Adjoint:
 
             if isinstance(node.slice, ast.Tuple):
                 ij = node.slice.elts
-            elif isinstance(node.slice, ast.Index) and isinstance(node.slice.value, ast.Tuple):
-                # The node `ast.Index` is deprecated in Python 3.9.
-                ij = node.slice.value.elts
-            elif isinstance(node.slice, ast.ExtSlice):
-                # The node `ast.ExtSlice` is deprecated in Python 3.9.
-                ij = node.slice.dims
             else:
                 ij = [node.slice]
 
@@ -3083,7 +3218,7 @@ class Adjoint:
         # more generally in `adj.eval()`.
         if isinstance(node.value, ast.List):
             raise WarpCodegenError(
-                "List constructs are not supported in kernels. Use vectors like `wp.vec3()` for small collections instead."
+                "List constructs are not supported in kernels. Use vectors like `wp.vec3()` for small fixed-size collections, or `wp.zeros(shape=N, dtype=...)` for stack-allocated arrays."
             )
 
         lhs = node.targets[0]
@@ -3126,7 +3261,7 @@ class Adjoint:
                 )
 
             out = rhs
-            for name, rhs in zip(names, out):
+            for name, rhs in zip(names, out, strict=True):
                 if name in adj.symbols:
                     if not types_equal(rhs.type, adj.symbols[name].type):
                         raise WarpCodegenTypeError(
@@ -3146,67 +3281,9 @@ class Adjoint:
                 return
 
             target, indices = adj.eval_subscript(lhs)
-
             target_type = strip_reference(target.type)
             indices = adj.eval_indices(target_type, indices)
-
-            if is_array(target_type):
-                adj.add_builtin_call("array_store", [target, *indices, rhs])
-
-                if warp.config.verify_autograd_array_access:
-                    kernel_name = adj.fun_name
-                    filename = adj.filename
-                    lineno = adj.lineno + adj.fun_lineno
-
-                    target.mark_write(kernel_name=kernel_name, filename=filename, lineno=lineno)
-
-            elif is_tile(target_type):
-                adj.add_builtin_call("assign", [target, *indices, rhs])
-
-            elif (
-                type_is_vector(target_type)
-                or type_is_quaternion(target_type)
-                or type_is_matrix(target_type)
-                or type_is_transformation(target_type)
-            ):
-                # recursively unwind AST, stopping at penultimate node
-                root = lhs
-                while hasattr(root.value, "value"):
-                    root = root.value
-                # lhs is updating a variable adjoint (i.e. wp.adjoint[var])
-                if hasattr(root, "attr") and root.attr == "adjoint":
-                    attr = adj.add_builtin_call("index", [target, *indices])
-                    adj.add_builtin_call("store", [attr, rhs])
-                    return
-
-                # TODO: array vec component case
-                if is_reference(target.type):
-                    attr = adj.add_builtin_call("indexref", [target, *indices])
-                    adj.add_builtin_call("store", [attr, rhs])
-
-                    if warp.config.verbose and not adj.custom_reverse_mode:
-                        lineno = adj.lineno + adj.fun_lineno
-                        line = adj.source_lines[adj.lineno]
-                        node_source = adj.get_node_source(lhs.value)
-                        print(
-                            f"Warning: mutating {node_source} in function {adj.fun_name} at {adj.filename}:{lineno}: this is a non-differentiable operation.\n{line}\n"
-                        )
-                else:
-                    if warp.config.enable_vector_component_overwrites:
-                        out = adj.add_builtin_call("assign_copy", [target, *indices, rhs])
-
-                        # re-point target symbol to out var
-                        for id in adj.symbols:
-                            if adj.symbols[id] == target:
-                                adj.symbols[id] = out
-                                break
-                    else:
-                        adj.add_builtin_call("assign_inplace", [target, *indices, rhs])
-
-            else:
-                raise WarpCodegenError(
-                    f"Can only subscript assign array, vector, quaternion, transformation, and matrix types, got {target_type}"
-                )
+            adj._store_subscript(lhs, target, indices, rhs)
 
         elif isinstance(lhs, ast.Name):
             # symbol name
@@ -3238,55 +3315,127 @@ class Adjoint:
             adj.symbols[name] = out
 
         elif isinstance(lhs, ast.Attribute):
-            aggregate = adj.eval(lhs.value)
-            aggregate_type = strip_reference(aggregate.type)
+            adj._store_attribute(lhs, adj.eval(lhs.value), rhs)
 
-            # assigning to a vector or quaternion component
-            if type_is_vector(aggregate_type) or type_is_quaternion(aggregate_type):
-                index = adj.vector_component_index(lhs.attr, aggregate_type)
+        else:
+            raise WarpCodegenError("Error, unsupported assignment statement.")
 
-                if is_reference(aggregate.type):
-                    attr = adj.add_builtin_call("indexref", [aggregate, index])
-                    adj.add_builtin_call("store", [attr, rhs])
-                else:
-                    if warp.config.enable_vector_component_overwrites:
-                        out = adj.add_builtin_call("assign_copy", [aggregate, index, rhs])
+    def _store_subscript(adj, lhs, target, indices, rhs):
+        """Store ``rhs`` into a subscript target using pre-evaluated ``target`` and ``indices``.
 
-                        # re-point target symbol to out var
-                        for id in adj.symbols:
-                            if adj.symbols[id] == aggregate:
-                                adj.symbols[id] = out
-                                break
-                    else:
-                        adj.add_builtin_call("assign_inplace", [aggregate, index, rhs])
+        Shared by ``emit_Assign`` and ``emit_AugAssign`` to avoid duplicating
+        the store-dispatch logic for array, tile, and vector/matrix subscripts.
+        """
+        target_type = strip_reference(target.type)
 
-            elif type_is_transformation(aggregate_type):
-                component = adj.transform_component(lhs.attr)
+        if is_array(target_type):
+            adj.add_builtin_call("array_store", [target, *indices, rhs])
 
-                # TODO: x[i,j].p = rhs case
-                if is_reference(aggregate.type):
-                    raise WarpCodegenError(f"Error, assigning transform attribute {component} to an array element")
+            if adj.builder_options.get("verify_autograd_array_access", False):
+                kernel_name = adj.fun_name
+                filename = adj.filename
+                lineno = adj.lineno + adj.fun_lineno
+                target.mark_write(kernel_name=kernel_name, filename=filename, lineno=lineno)
 
-                if component == "p":
-                    return adj.add_builtin_call("transform_set_translation", [aggregate, rhs])
-                else:
-                    return adj.add_builtin_call("transform_set_rotation", [aggregate, rhs])
+        elif is_tile(target_type):
+            adj.add_builtin_call("assign", [target, *indices, rhs])
 
-            else:
-                attr = adj.emit_Attribute(lhs)
-                if is_reference(attr.type):
-                    adj.add_builtin_call("store", [attr, rhs])
-                else:
-                    adj.add_builtin_call("assign", [attr, rhs])
+        elif (
+            type_is_vector(target_type)
+            or type_is_quaternion(target_type)
+            or type_is_matrix(target_type)
+            or type_is_transformation(target_type)
+        ):
+            # recursively unwind AST, stopping at penultimate node
+            root = lhs
+            while hasattr(root.value, "value"):
+                root = root.value
+            # lhs is updating a variable adjoint (i.e. wp.adjoint[var])
+            if hasattr(root, "attr") and root.attr == "adjoint":
+                attr = adj.add_builtin_call("index", [target, *indices])
+                adj.add_builtin_call("store", [attr, rhs])
+                return
+
+            # TODO: array vec component case
+            if is_reference(target.type):
+                attr = adj.add_builtin_call("indexref", [target, *indices])
+                adj.add_builtin_call("store", [attr, rhs])
 
                 if warp.config.verbose and not adj.custom_reverse_mode:
                     lineno = adj.lineno + adj.fun_lineno
                     line = adj.source_lines[adj.lineno]
-                    msg = f'Warning: detected mutated struct {attr.label} during function "{adj.fun_name}" at {adj.filename}:{lineno}: this is a non-differentiable operation.\n{line}\n'
-                    print(msg)
+                    node_source = adj.get_node_source(lhs.value)
+                    print(
+                        f"Warning: mutating {node_source} in function {adj.fun_name} at {adj.filename}:{lineno}: this is a non-differentiable operation.\n{line}\n"
+                    )
+            else:
+                if adj.builder_options.get("enable_vector_component_overwrites", False):
+                    out = adj.add_builtin_call("assign_copy", [target, *indices, rhs])
+
+                    # re-point target symbol to out var
+                    for id in adj.symbols:
+                        if adj.symbols[id] == target:
+                            adj.symbols[id] = out
+                            break
+                else:
+                    adj.add_builtin_call("assign_inplace", [target, *indices, rhs])
 
         else:
-            raise WarpCodegenError("Error, unsupported assignment statement.")
+            raise WarpCodegenError(
+                f"Can only subscript assign array, vector, quaternion, transformation, and matrix types, got {target_type}"
+            )
+
+    def _store_attribute(adj, lhs, aggregate, rhs):
+        """Store ``rhs`` into an attribute target using pre-evaluated ``aggregate``.
+
+        Shared by ``emit_Assign`` and ``emit_AugAssign`` to avoid duplicating
+        the store-dispatch logic for vector/quaternion/transform/struct attributes.
+        """
+        aggregate_type = strip_reference(aggregate.type)
+
+        # assigning to a vector or quaternion component
+        if type_is_vector(aggregate_type) or type_is_quaternion(aggregate_type):
+            index = adj.vector_component_index(lhs.attr, aggregate_type)
+
+            if is_reference(aggregate.type):
+                attr = adj.add_builtin_call("indexref", [aggregate, index])
+                adj.add_builtin_call("store", [attr, rhs])
+            else:
+                if adj.builder_options.get("enable_vector_component_overwrites", False):
+                    out = adj.add_builtin_call("assign_copy", [aggregate, index, rhs])
+
+                    # re-point target symbol to out var
+                    for id in adj.symbols:
+                        if adj.symbols[id] == aggregate:
+                            adj.symbols[id] = out
+                            break
+                else:
+                    adj.add_builtin_call("assign_inplace", [aggregate, index, rhs])
+
+        elif type_is_transformation(aggregate_type):
+            component = adj.transform_component(lhs.attr)
+
+            # TODO: x[i,j].p = rhs case
+            if is_reference(aggregate.type):
+                raise WarpCodegenError(f"Error, assigning transform attribute {component} to an array element")
+
+            if component == "p":
+                return adj.add_builtin_call("transform_set_translation", [aggregate, rhs])
+            else:
+                return adj.add_builtin_call("transform_set_rotation", [aggregate, rhs])
+
+        else:
+            attr = adj.emit_Attribute(lhs, aggregate=aggregate)
+            if is_reference(attr.type):
+                adj.add_builtin_call("store", [attr, rhs])
+            else:
+                adj.add_builtin_call("assign", [attr, rhs])
+
+            if warp.config.verbose and not adj.custom_reverse_mode:
+                lineno = adj.lineno + adj.fun_lineno
+                line = adj.source_lines[adj.lineno]
+                msg = f'Warning: detected mutated struct {attr.label} during function "{adj.fun_name}" at {adj.filename}:{lineno}: this is a non-differentiable operation.\n{line}\n'
+                print(msg)
 
     def emit_Return(adj, node):
         if node.value is None:
@@ -3317,21 +3466,128 @@ class Adjoint:
 
         adj.add_return(adj.return_var)
 
+    @contextlib.contextmanager
+    def suppress_read_tracking(adj):
+        """Save and restore ``is_read`` states on function arguments.
+
+        Used by augmented assignment emission to prevent the LHS load from
+        registering as a read in the autograd verification system, since the
+        overall operation is a write, not a read.
+        """
+        if adj.builder_options.get("verify_autograd_array_access", False):
+            is_read_states = [arg.is_read for arg in adj.args]
+        else:
+            is_read_states = None
+        try:
+            yield
+        finally:
+            if is_read_states is not None:
+                for i, arg in enumerate(adj.args):
+                    arg.is_read = is_read_states[i]
+
     def emit_AugAssign(adj, node):
         lhs = node.target
 
-        # replace augmented assignment with assignment statement + binary op (default behaviour)
-        def make_new_assign_statement():
-            new_node = ast.Assign(targets=[lhs], value=ast.BinOp(lhs, node.op, node.value))
-            adj.eval(new_node)
+        # For simple name targets (x += expr), evaluate the RHS once and
+        # apply the operation directly to avoid double-evaluation.
+        if isinstance(lhs, ast.Name):
+            rhs = adj.eval(node.value)
+            target = adj.eval(lhs)
 
+            # In-place tile ops mutate target directly; no symbol table update needed.
+            if is_tile(target.type) and is_tile(rhs.type):
+                if isinstance(node.op, ast.Add):
+                    adj.add_builtin_call("add_inplace", [target, rhs])
+                    return
+                if isinstance(node.op, ast.Sub):
+                    adj.add_builtin_call("sub_inplace", [target, rhs])
+                    return
+                if isinstance(node.op, ast.BitAnd):
+                    adj.add_builtin_call("bit_and_inplace", [target, rhs])
+                    return
+                if isinstance(node.op, ast.BitOr):
+                    adj.add_builtin_call("bit_or_inplace", [target, rhs])
+                    return
+                if isinstance(node.op, ast.BitXor):
+                    adj.add_builtin_call("bit_xor_inplace", [target, rhs])
+                    return
+
+            # Non-inplace: produces a new value, rebind the symbol.
+            # Check for user-defined operator overloads first (same as emit_BinOp).
+            op_name = builtin_operators[type(node.op)]
+            try:
+                user_func = adj.resolve_external_reference(op_name)
+                if isinstance(user_func, warp._src.context.Function):
+                    result = adj.add_call(user_func, (target, rhs), {}, {})
+                    adj.symbols[lhs.id] = result
+                    return
+            except WarpCodegenError:
+                pass
+
+            result = adj.add_builtin_call(op_name, [target, rhs])
+
+            # Validate type consistency (same as emit_Assign for Name targets).
+            if lhs.id in adj.symbols:
+                if not types_equal(strip_reference(result.type), adj.symbols[lhs.id].type):
+                    raise WarpCodegenTypeError(
+                        f"Error, augmented assignment to `{lhs.id}` ({adj.symbols[lhs.id].type}) "
+                        f"produces different type ({result.type})"
+                    )
+
+            adj.symbols[lhs.id] = result
+            return
+
+        # Evaluate RHS once for non-Name targets.
         rhs = adj.eval(node.value)
 
+        def apply_op(current):
+            """Compute ``current <op> rhs`` using user-defined overloads or builtins."""
+            op_name = builtin_operators[type(node.op)]
+            try:
+                user_func = adj.resolve_external_reference(op_name)
+                if isinstance(user_func, warp._src.context.Function):
+                    return adj.add_call(user_func, (current, rhs), {}, {})
+            except WarpCodegenError:
+                pass
+            return adj.add_builtin_call(op_name, [current, rhs])
+
+        def augassign_subscript(target, indices):
+            """Load current value via pre-evaluated target/indices, apply op, store back."""
+            target_type = strip_reference(target.type)
+
+            with adj.suppress_read_tracking():
+                if is_array(target_type):
+                    current = adj.add_builtin_call("address", [target, *indices])
+                elif is_tile(target_type):
+                    current = adj.add_builtin_call("tile_extract", [target, *indices])
+                else:
+                    current = adj.add_builtin_call("extract", [target, *indices])
+
+            result = apply_op(current)
+            adj._store_subscript(lhs, target, indices, result)
+
+        def augassign_attribute():
+            """Load current value of attribute target, apply op, store back."""
+            aggregate = adj.eval(lhs.value)
+
+            with adj.suppress_read_tracking():
+                current = adj.emit_Attribute(lhs, aggregate=aggregate)
+
+            result = apply_op(current)
+            adj._store_attribute(lhs, aggregate, result)
+
         if isinstance(lhs, ast.Subscript):
-            # wp.adjoint[var] appears in custom grad functions, and does not require
-            # special consideration in the AugAssign case
+            # wp.adjoint[var] appears in custom grad functions; handle the
+            # adjoint store inline rather than through augassign_subscript.
             if hasattr(lhs.value, "attr") and lhs.value.attr == "adjoint":
-                make_new_assign_statement()
+                with adj.suppress_read_tracking():
+                    current = adj.eval(lhs)
+
+                result = apply_op(current)
+                lhs.slice.is_adjoint = True
+                src_var = adj.eval(lhs.slice)
+                var = Var(f"adj_{src_var.label}", type=src_var.type, constant=None, prefix=False)
+                adj.add_forward(f"{var.emit()} = {result.emit()};")
                 return
 
             target, indices = adj.eval_subscript(lhs)
@@ -3342,7 +3598,7 @@ class Adjoint:
             if is_array(target_type):
                 # target_types int8, uint8, int16, uint16 are not suitable for atomic array accumulation
                 if target_type.dtype in warp._src.types.non_atomic_types:
-                    make_new_assign_statement()
+                    augassign_subscript(target, indices)
                     return
 
                 # the same holds true for vecs/mats/quats that are composed of these types
@@ -3354,7 +3610,7 @@ class Adjoint:
                 ):
                     dtype = getattr(target_type.dtype, "_wp_scalar_type_", None)
                     if dtype in warp._src.types.non_atomic_types:
-                        make_new_assign_statement()
+                        augassign_subscript(target, indices)
                         return
 
                 kernel_name = adj.fun_name
@@ -3364,36 +3620,36 @@ class Adjoint:
                 if isinstance(node.op, ast.Add):
                     adj.add_builtin_call("atomic_add", [target, *indices, rhs])
 
-                    if warp.config.verify_autograd_array_access:
+                    if adj.builder_options.get("verify_autograd_array_access", False):
                         target.mark_write(kernel_name=kernel_name, filename=filename, lineno=lineno)
 
                 elif isinstance(node.op, ast.Sub):
                     adj.add_builtin_call("atomic_sub", [target, *indices, rhs])
 
-                    if warp.config.verify_autograd_array_access:
+                    if adj.builder_options.get("verify_autograd_array_access", False):
                         target.mark_write(kernel_name=kernel_name, filename=filename, lineno=lineno)
 
                 elif isinstance(node.op, ast.BitAnd):
                     adj.add_builtin_call("atomic_and", [target, *indices, rhs])
 
-                    if warp.config.verify_autograd_array_access:
+                    if adj.builder_options.get("verify_autograd_array_access", False):
                         target.mark_write(kernel_name=kernel_name, filename=filename, lineno=lineno)
 
                 elif isinstance(node.op, ast.BitOr):
                     adj.add_builtin_call("atomic_or", [target, *indices, rhs])
 
-                    if warp.config.verify_autograd_array_access:
+                    if adj.builder_options.get("verify_autograd_array_access", False):
                         target.mark_write(kernel_name=kernel_name, filename=filename, lineno=lineno)
 
                 elif isinstance(node.op, ast.BitXor):
                     adj.add_builtin_call("atomic_xor", [target, *indices, rhs])
 
-                    if warp.config.verify_autograd_array_access:
+                    if adj.builder_options.get("verify_autograd_array_access", False):
                         target.mark_write(kernel_name=kernel_name, filename=filename, lineno=lineno)
                 else:
                     if warp.config.verbose:
                         print(f"Warning: in-place op {node.op} is not differentiable")
-                    make_new_assign_statement()
+                    augassign_subscript(target, indices)
                     return
 
             elif (
@@ -3415,7 +3671,7 @@ class Adjoint:
                 else:
                     if warp.config.verbose:
                         print(f"Warning: in-place op {node.op} is not differentiable")
-                    make_new_assign_statement()
+                    augassign_subscript(target, indices)
                     return
 
             elif is_tile(target.type):
@@ -3432,41 +3688,18 @@ class Adjoint:
                 else:
                     if warp.config.verbose:
                         print(f"Warning: in-place op {node.op} is not differentiable")
-                    make_new_assign_statement()
+                    augassign_subscript(target, indices)
                     return
 
             else:
                 raise WarpCodegenError("Can only subscript in-place assign array, vector, quaternion, and matrix types")
 
-        elif isinstance(lhs, ast.Name):
-            target = adj.eval(node.target)
-
-            if is_tile(target.type) and is_tile(rhs.type):
-                if isinstance(node.op, ast.Add):
-                    adj.add_builtin_call("add_inplace", [target, rhs])
-                elif isinstance(node.op, ast.Sub):
-                    adj.add_builtin_call("sub_inplace", [target, rhs])
-                elif isinstance(node.op, ast.BitAnd):
-                    adj.add_builtin_call("bit_and_inplace", [target, rhs])
-                elif isinstance(node.op, ast.BitOr):
-                    adj.add_builtin_call("bit_or_inplace", [target, rhs])
-                elif isinstance(node.op, ast.BitXor):
-                    adj.add_builtin_call("bit_xor_inplace", [target, rhs])
-                else:
-                    make_new_assign_statement()
-                    return
-            else:
-                make_new_assign_statement()
-                return
-
-        # TODO
         elif isinstance(lhs, ast.Attribute):
-            make_new_assign_statement()
+            augassign_attribute()
             return
 
         else:
-            make_new_assign_statement()
-            return
+            raise WarpCodegenError("Error, unsupported target for augmented assignment.")
 
     def emit_Tuple(adj, node):
         elements = tuple(adj.eval(x) for x in node.elts)
@@ -3540,21 +3773,20 @@ class Adjoint:
             for i in range(1, len(path)):
                 if hasattr(expr, path[i]):
                     expr = getattr(expr, path[i])
+                elif i < len(path) - 1:
+                    # Intermediate attribute doesn't exist - path is invalid.
+                    # Only the last element is allowed to be missing (e.g., for builtin functions
+                    # like wp.tid() where 'tid' is not an attribute of the warp module but is
+                    # looked up in builtin_functions by emit_Call).
+                    return None
 
         return expr
 
     # retrieves a dictionary of all closure and global variables and their values
     # to be used in the evaluation context of wp.static() expressions
     def get_static_evaluation_context(adj):
-        closure_vars = dict(
-            zip(
-                adj.func.__code__.co_freevars,
-                [c.cell_contents for c in (adj.func.__closure__ or [])],
-            )
-        )
-
         # variables captured in closure have precedence over global vars
-        vars_dict = adj.func.__globals__ | closure_vars
+        vars_dict = adj.func.__globals__ | get_closure_vars(adj.func)
 
         return vars_dict
 
@@ -3813,7 +4045,7 @@ class Adjoint:
                         # only depends on global or captured variables
                         obj, code = adj.evaluate_static_expression(node)
                         if code is not None:
-                            adj.static_expressions[code] = obj
+                            adj.resolved_static_expressions[code] = obj
                             if isinstance(obj, warp._src.context.Function):
                                 name_node = ast.Name("__warp_func__")
                                 # we add a pointer to the Warp function here so that we can refer to it later at
@@ -3894,14 +4126,7 @@ class Adjoint:
         return None, path
 
     def resolve_external_reference(adj, name: str):
-        try:
-            # look up in closure variables
-            idx = adj.func.__code__.co_freevars.index(name)
-            obj = adj.func.__closure__[idx].cell_contents
-        except ValueError:
-            # look up in global variables
-            obj = adj.func.__globals__.get(name)
-        return obj
+        return resolve_closure_or_global(adj.func, name)
 
     # annotate generated code with the original source code line
     def set_lineno(adj, lineno):
@@ -4147,7 +4372,7 @@ extern "C" {{
 
 // Python CPU entry points
 WP_API void {name}_cpu_forward(
-    wp::launch_bounds_t dim,
+    wp::launch_bounds_t<{launch_ndim}> dim,
     wp_args_{name} *_wp_args)
 {{
     wp::tile_shared_storage_t tile_mem;
@@ -4170,7 +4395,7 @@ cpu_module_template_backward = """
 extern "C" {{
 
 WP_API void {name}_cpu_backward(
-    wp::launch_bounds_t dim,
+    wp::launch_bounds_t<{launch_ndim}> dim,
     wp_args_{name} *_wp_args,
     wp_args_{name} *_wp_adj_args)
 {{
@@ -4230,8 +4455,27 @@ def constant_str(value):
         return f"{dtypestr}{{{', '.join(initlist)}}}"
 
     elif value_type in warp._src.types.scalar_types:
-        # make sure we emit the value of objects, e.g. uint32
-        return str(value.value)
+        # Unwrap the raw value and handle special floats before applying
+        # C++ literal suffixes for wide integer types.
+        raw = value.value
+        if isinstance(raw, (enum.IntEnum, enum.IntFlag)):
+            raw = int(raw)
+        elif isinstance(raw, builtins.float):
+            if raw == math.inf:
+                return "INFINITY"
+            if raw == -math.inf:
+                return "-INFINITY"
+            if math.isnan(raw):
+                return "NAN"
+        s = str(raw)
+        if isinstance(raw, builtins.int):
+            if value_type is uint64:
+                return s + "ull"
+            elif value_type is int64:
+                return s + "ll"
+            elif value_type is uint32:
+                return s + "u"
+        return s
 
     elif issubclass(value_type, StructInstance):
         # constant struct instance
@@ -4244,6 +4488,9 @@ def constant_str(value):
 
     elif value == math.inf:
         return "INFINITY"
+
+    elif value == -math.inf:
+        return "-INFINITY"
 
     elif math.isnan(value):
         return "NAN"
@@ -4477,46 +4724,6 @@ def codegen_func(adj, c_func_name: str, device="cpu", options=None, forward_only
     if options is None:
         options = {}
 
-    if adj.return_var is not None and "return" in adj.arg_types:
-        if get_origin(adj.arg_types["return"]) is tuple:
-            if len(get_args(adj.arg_types["return"])) != len(adj.return_var):
-                raise WarpCodegenError(
-                    f"The function `{adj.fun_name}` has its return type "
-                    f"annotated as a tuple of {len(get_args(adj.arg_types['return']))} elements "
-                    f"but the code returns {len(adj.return_var)} values."
-                )
-            elif not types_equal_generic(adj.arg_types["return"], tuple(x.type for x in adj.return_var)):
-                raise WarpCodegenError(
-                    f"The function `{adj.fun_name}` has its return type "
-                    f"annotated as `{warp._src.context.type_str(adj.arg_types['return'])}` "
-                    f"but the code returns a tuple with types `({', '.join(warp._src.context.type_str(x.type) for x in adj.return_var)})`."
-                )
-        elif len(adj.return_var) > 1 and get_origin(adj.arg_types["return"]) is not tuple:
-            raise WarpCodegenError(
-                f"The function `{adj.fun_name}` has its return type "
-                f"annotated as `{warp._src.context.type_str(adj.arg_types['return'])}` "
-                f"but the code returns {len(adj.return_var)} values."
-            )
-        elif (
-            isinstance(adj.return_var[0].type, warp._src.types.fixedarray)
-            and type(adj.arg_types["return"]) is warp._src.types.array
-        ):
-            # If the return statement yields a `fixedarray` while the function is annotated
-            # to return a standard `array`, then raise an error since the `fixedarray` storage
-            # allocated on the stack will be freed once the function exits, meaning that the
-            # resulting `array` instance will point to an invalid data.
-            raise WarpCodegenError(
-                f"The function `{adj.fun_name}` returns a fixed-size array "
-                f"whereas it has its return type annotated as "
-                f"`{warp._src.context.type_str(adj.arg_types['return'])}`."
-            )
-        elif not types_equal(adj.arg_types["return"], adj.return_var[0].type):
-            raise WarpCodegenError(
-                f"The function `{adj.fun_name}` has its return type "
-                f"annotated as `{warp._src.context.type_str(adj.arg_types['return'])}` "
-                f"but the code returns a value of type `{warp._src.context.type_str(adj.return_var[0].type)}`."
-            )
-
     # Build line directive for function definition (subtract 1 to account for 1-indexing of AST line numbers)
     # This is used as a catch-all C-to-Python source line mapping for any code that does not have
     # a direct mapping to a Python source line.
@@ -4535,9 +4742,41 @@ def codegen_func(adj, c_func_name: str, device="cpu", options=None, forward_only
     forward_args = []
     reverse_args = []
 
+    # Tile parameters are emitted as C++ template parameters so that the
+    # same @wp.func can accept tiles with any storage type (register or
+    # shared) without requiring separate overloads.  The Python-level tile
+    # annotation (e.g. wp.tile[float, M, N]) defaults to
+    # register storage, but at the call site the tile may actually live in
+    # shared memory.  By generating ``template<typename tile_t>`` instead
+    # of the concrete ``tile_register_t<...>`` type, C++ template argument
+    # deduction resolves the correct storage type automatically.
+    #
+    # Tile parameters are passed by non-const reference (not by value)
+    # for two reasons: (1) owning shared tiles (tile_shared_t with
+    # Owner=true) cannot be copied (static_assert in copy constructor),
+    # and (2) adjoint built-ins like adj_tile_sum() expect non-const
+    # Tile& parameters.
+    #
+    # This is a semantic change for register tiles, which were previously
+    # passed by value.  The difference is observable for in-place tile
+    # operations (e.g., a += b where both are tiles), which mutate the
+    # parameter directly.  Simple rebinding (a = expr) creates a new C++
+    # variable: for register tiles this is a full value copy, for shared
+    # tiles a non-owning handle to the same shared memory (element-level
+    # writes through either variable affect the same data).
+    # The pass-by-reference behavior for in-place ops is intentional:
+    # it matches the Python semantics where augmented assignment on a
+    # mutable object modifies it in place.
+    template_params = []
+
     # forward args
     for i, arg in enumerate(adj.args):
-        s = f"{arg.ctype()} {arg.emit()}"
+        if is_tile(arg.type):
+            tname = f"tile_{arg.label}"
+            template_params.append(tname)
+            s = f"{tname}& {arg.emit()}"
+        else:
+            s = f"{arg.ctype()} {arg.emit()}"
         forward_args.append(s)
         if not adj.custom_reverse_mode or i < adj.custom_reverse_num_input_args:
             reverse_args.append(s)
@@ -4551,9 +4790,12 @@ def codegen_func(adj, c_func_name: str, device="cpu", options=None, forward_only
         if adj.custom_reverse_mode and i >= adj.custom_reverse_num_input_args:
             break
         # indexed array gradients are regular arrays
-        if isinstance(arg.type, indexedarray):
+        if matches_array_class(arg.type, indexedarray):
             _arg = Var(arg.label, array(dtype=arg.type.dtype, ndim=arg.type.ndim))
             reverse_args.append(_arg.ctype() + " & adj_" + arg.label)
+        elif is_tile(arg.type):
+            tname = f"tile_{arg.label}"
+            reverse_args.append(f"{tname} & adj_{arg.label}")
         else:
             reverse_args.append(arg.ctype() + " & adj_" + arg.label)
     if has_multiple_outputs:
@@ -4564,7 +4806,16 @@ def codegen_func(adj, c_func_name: str, device="cpu", options=None, forward_only
     # custom output reverse args (user-declared)
     if adj.custom_reverse_mode:
         for arg in adj.args[adj.custom_reverse_num_input_args :]:
-            reverse_args.append(f"{arg.ctype()} & {arg.emit()}")
+            if is_tile(arg.type):
+                tname = f"tile_{arg.label}"
+                reverse_args.append(f"{tname} & {arg.emit()}")
+            else:
+                reverse_args.append(f"{arg.ctype()} & {arg.emit()}")
+
+    # build template prefix for functions with tile parameters
+    template_prefix = ""
+    if template_params:
+        template_prefix = "template<" + ", ".join(f"typename {t}" for t in template_params) + ">\n"
 
     if device == "cpu":
         forward_template = cpu_forward_function_template
@@ -4580,7 +4831,7 @@ def codegen_func(adj, c_func_name: str, device="cpu", options=None, forward_only
 
     s = ""
     if not adj.skip_forward_codegen and not reverse_only:
-        s += forward_template.format(
+        s += template_prefix + forward_template.format(
             name=c_func_name,
             return_type=return_type,
             forward_args=indent(forward_args),
@@ -4607,7 +4858,7 @@ def codegen_func(adj, c_func_name: str, device="cpu", options=None, forward_only
                 reverse_body = codegen_func_reverse(adj, func_type="function", device=device)
             else:
                 reverse_body = '\t// reverse mode disabled (module option "enable_backward" is False or no dependent kernel found with "enable_backward")\n'
-        s += reverse_template.format(
+        s += template_prefix + reverse_template.format(
             name=c_func_name,
             return_type=return_type,
             reverse_args=indent(reverse_args),
@@ -4638,7 +4889,7 @@ def codegen_snippet(adj, name, snippet, adj_snippet, replay_snippet, forward_onl
 
     # reverse args
     for _i, arg in enumerate(adj.args):
-        if isinstance(arg.type, indexedarray):
+        if matches_array_class(arg.type, indexedarray):
             _arg = Var(arg.label, array(dtype=arg.type.dtype, ndim=arg.type.ndim))
             reverse_args.append(_arg.ctype() + " & adj_" + arg.label)
         else:
@@ -4747,7 +4998,7 @@ def codegen_kernel(kernel, device, options):
             raise ValueError(f"launch_bounds must be an int or a tuple/list of 1-2 ints, got {type(launch_bounds)}")
 
     # build forward signature
-    forward_args = ["wp::launch_bounds_t dim"]
+    forward_args = [f"wp::launch_bounds_t<{adj.kernel_dim}> dim"]
     if device == "cpu":
         forward_args.append("size_t task_index")
     else:
@@ -4767,7 +5018,7 @@ def codegen_kernel(kernel, device, options):
 
     if options["enable_backward"]:
         # build reverse signature
-        reverse_args = ["wp::launch_bounds_t dim"]
+        reverse_args = [f"wp::launch_bounds_t<{adj.kernel_dim}> dim"]
         if device == "cpu":
             reverse_args.append("size_t task_index")
         else:
@@ -4775,7 +5026,7 @@ def codegen_kernel(kernel, device, options):
                 reverse_args.append(arg.ctype() + " var_" + arg.label)
             for arg in adj.args:
                 # indexed array gradients are regular arrays
-                if isinstance(arg.type, indexedarray):
+                if matches_array_class(arg.type, indexedarray):
                     _arg = Var(arg.label, array(dtype=arg.type.dtype, ndim=arg.type.ndim))
                     reverse_args.append(_arg.ctype() + " adj_" + arg.label)
                 else:
@@ -4804,6 +5055,7 @@ def codegen_module(kernel, device, options):
     template = ""
     template_fmt_args = {
         "name": kernel.get_mangled_name(),
+        "launch_ndim": kernel.adj.kernel_dim,
     }
 
     template += cpu_module_template_forward
