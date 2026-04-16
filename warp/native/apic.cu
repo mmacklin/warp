@@ -54,55 +54,56 @@ struct APICPtrLocation {
     uint64_t stride;  // 0 = single pointer
 };
 
-// Internal APIC state structure
-// Operations are stored in a single contiguous byte stream for efficient
-// serialization and to maintain operation order without a separate index.
-struct APICStateInternal {
+// Merged internal structure for both recording (APICState) and loaded graph (APICGraph).
+// Some fields are only used during recording, some only during loading -- unused fields
+// stay at their default values.
+struct APICGraphInternal {
+    // === Recording state (populated during capture) ===
     bool recording = false;
-
-    // Contiguous operation stream - operations are serialized directly here
-    // Each operation has an APICOpHeader at the start with op_type and total_size
-    std::vector<uint8_t> operation_stream;
-    uint32_t operation_count = 0;  // Number of operations in stream
-
-    // Memory regions (keyed by base pointer for lookup)
-    std::unordered_map<uint64_t, APICRegion> memory_regions;
+    std::unordered_map<uint64_t, APICRegion> memory_regions;  // keyed by base_ptr (recording)
     uint32_t next_region_id = 0;
 
-    // Module and kernel metadata
+    // === Loaded graph state (populated during file loading) ===
+    void* cuda_context = nullptr;
+    int target_arch = 0;
+    std::unordered_map<uint32_t, APICRegion> regions;  // keyed by region_id (loaded)
+    std::unordered_map<std::string, uint32_t> bindings;  // name -> region_id (loaded)
+    std::vector<std::string> binding_names;  // ordered for indexing (loaded)
+    std::unordered_map<uint64_t, uint64_t> handle_ptr_remap;
+    std::vector<APICMeshRecord> mesh_records;
+    std::vector<uint64_t> created_mesh_ids;
+    CUgraph cuda_graph = nullptr;
+    CUgraphExec cuda_graph_exec = nullptr;
+    std::string base_path;
+
+    // === Shared state (used by both recording and loaded paths) ===
+    std::vector<uint8_t> operation_stream;
+    uint32_t operation_count = 0;
     std::unordered_map<std::string, APICModule> modules;
     std::unordered_map<std::string, APICKernel> kernels;
-
-    // Named bindings (name -> region_id)
-    std::vector<std::pair<std::string, uint32_t>> bindings;
-
-    // Handle pointer locations in memory regions (for fixup during replay)
+    std::vector<std::pair<std::string, uint32_t>> recording_bindings;  // name->id pairs (recording)
     std::vector<APICPtrLocation> ptr_locations;
+    bool is_cpu = false;
+    std::unordered_map<std::string, std::pair<void*, void*>> host_functions;
+    std::unordered_map<uint32_t, uint64_t> region_id_to_ptr;  // region_id -> base_ptr (both)
 
-    // CPU graph support
-    bool is_cpu = false;  // True when recording for CPU device
-    std::unordered_map<std::string, std::pair<void*, void*>> host_functions;  // kernel_key -> {forward_fn, backward_fn}
-    std::unordered_map<uint32_t, uint64_t> region_id_to_ptr;  // region_id -> base_ptr (reverse lookup for replay)
+    // === Methods ===
 
-    // Helper: resolve region_id + offset to a pointer (for CPU replay from recording state)
     void* resolve_region_ptr(int32_t region_id, uint64_t offset) const
     {
         auto it = region_id_to_ptr.find(region_id);
-        if (it != region_id_to_ptr.end()) {
+        if (it != region_id_to_ptr.end())
             return (void*)(it->second + offset);
-        }
         return nullptr;
     }
 
-    // Helper: append bytes to operation stream
     void append_bytes(const void* data, size_t size)
     {
-        size_t offset = operation_stream.size();
-        operation_stream.resize(offset + size);
-        memcpy(operation_stream.data() + offset, data, size);
+        size_t off = operation_stream.size();
+        operation_stream.resize(off + size);
+        memcpy(operation_stream.data() + off, data, size);
     }
 
-    // Helper: find region containing a pointer
     bool find_region(uint64_t ptr, int32_t& region_id, uint64_t& offset) const
     {
         for (const auto& kv : memory_regions) {
@@ -115,13 +116,40 @@ struct APICStateInternal {
         }
         return false;
     }
+
+    // Destructor handles both recording and loaded cleanup
+    ~APICGraphInternal()
+    {
+        // CUDA loaded graph cleanup
+        if (cuda_context) {
+            ContextGuard guard(cuda_context);
+            for (uint64_t mesh_id : created_mesh_ids)
+                wp_mesh_destroy_device(mesh_id);
+            if (cuda_graph_exec)
+                cudaGraphExecDestroy((cudaGraphExec_t)cuda_graph_exec);
+            if (cuda_graph)
+                cudaGraphDestroy((cudaGraph_t)cuda_graph);
+            if (!is_cpu) {
+                for (auto& pair : regions)
+                    if (pair.second.ptr) cudaFree(pair.second.ptr);
+            }
+            for (auto& pair : modules)
+                if (pair.second.cuda_module) cuModuleUnload_f(pair.second.cuda_module);
+        }
+        // CPU loaded graph cleanup (regions allocated with malloc)
+        if (is_cpu) {
+            for (auto& pair : regions)
+                if (pair.second.ptr) free(pair.second.ptr);
+        }
+        // Recording state doesn't own any allocated memory (arrays belong to Python)
+    }
 };
 
 // Thread-local APIC state (set during recording)
-thread_local APICState g_apic_state = nullptr;
+thread_local APICGraphInternal* g_apic_state = nullptr;
 
 // Helper to check if APIC is recording (hides struct internals from warp.cu)
-bool apic_is_recording(APICState state) { return state && state->recording; }
+bool apic_is_recording(APICGraphInternal* state) { return state && state->recording; }
 
 // ============================================================================
 // APIC (API Capture) Implementation
@@ -132,7 +160,7 @@ namespace wp {
 extern std::map<uint64_t, Mesh> g_mesh_descriptors;
 }
 
-APICState wp_apic_create_state() { return new APICStateInternal(); }
+APICState wp_apic_create_state() { return new APICGraphInternal(); }
 
 void wp_apic_destroy_state(APICState state)
 {
@@ -150,7 +178,7 @@ void wp_apic_begin_recording(APICState state)
         state->memory_regions.clear();
         state->modules.clear();
         state->kernels.clear();
-        state->bindings.clear();
+        state->recording_bindings.clear();
         state->ptr_locations.clear();
         state->next_region_id = 0;
         g_apic_state = state;
@@ -284,7 +312,7 @@ void wp_apic_register_binding(APICState state, const char* name, uint32_t region
     if (!state || !name)
         return;
 
-    state->bindings.push_back({ std::string(name), region_id });
+    state->recording_bindings.push_back({ std::string(name), region_id });
 
     // Capture data for this param region if not already captured
     // This ensures input params have their data serialized
@@ -500,7 +528,7 @@ void apic_record_alloc(APICState state, void* ptr, size_t size)
 }
 
 // =============================================================================
-// APIC WGF File Writing - Serialize directly from APICStateInternal
+// APIC WGF File Writing - Serialize directly from APICGraphInternal
 // =============================================================================
 
 // Helper: write uint32_t to buffer
@@ -532,7 +560,7 @@ static void apic_write_string(std::vector<uint8_t>& buf, const std::string& s)
 
 // Helper: find region ID for a device pointer, or register and capture device data
 static uint32_t
-apic_find_or_register_region_with_data(APICStateInternal* state, uint64_t ptr, uint64_t size, uint32_t elem_size)
+apic_find_or_register_region_with_data(APICGraphInternal* state, uint64_t ptr, uint64_t size, uint32_t elem_size)
 {
     // Check if region already exists
     auto it = state->memory_regions.find(ptr);
@@ -575,7 +603,7 @@ static std::vector<std::pair<uint64_t, wp::Mesh>> apic_collect_meshes_for_serial
 // Write a single mesh as APICMeshRecord to the buffer
 // Registers memory regions for mesh arrays and captures their data
 static void
-apic_write_mesh(std::vector<uint8_t>& data, APICStateInternal* state, uint64_t mesh_id, const wp::Mesh& mesh)
+apic_write_mesh(std::vector<uint8_t>& data, APICGraphInternal* state, uint64_t mesh_id, const wp::Mesh& mesh)
 {
     // Find or register regions for mesh arrays
     uint64_t points_ptr = (uint64_t)mesh.points.data;
@@ -612,7 +640,7 @@ apic_write_mesh(std::vector<uint8_t>& data, APICStateInternal* state, uint64_t m
 }
 
 // Build binary metadata section from internal state
-static std::vector<uint8_t> apic_serialize_metadata(APICStateInternal* state, uint32_t target_arch)
+static std::vector<uint8_t> apic_serialize_metadata(APICGraphInternal* state, uint32_t target_arch)
 {
     std::vector<uint8_t> data;
 
@@ -624,7 +652,7 @@ static std::vector<uint8_t> apic_serialize_metadata(APICStateInternal* state, ui
     apic_write_u32(data, target_arch);
     apic_write_u32(data, static_cast<uint32_t>(state->modules.size()));
     apic_write_u32(data, static_cast<uint32_t>(state->kernels.size()));
-    apic_write_u32(data, static_cast<uint32_t>(state->bindings.size()));
+    apic_write_u32(data, static_cast<uint32_t>(state->recording_bindings.size()));
     apic_write_u32(data, static_cast<uint32_t>(meshes.size()));
 
     // Pointer locations count
@@ -652,7 +680,7 @@ static std::vector<uint8_t> apic_serialize_metadata(APICStateInternal* state, ui
     }
 
     // Params: name, region_id
-    for (const auto& b : state->bindings) {
+    for (const auto& b : state->recording_bindings) {
         apic_write_string(data, b.first);
         apic_write_u32(data, b.second);
     }
@@ -807,104 +835,6 @@ static const uint32_t WGF_VERSION = APIC_FORMAT_VERSION;
 static const uint32_t WGF_SECTION_METADATA = APIC_SECTION_METADATA;
 static const uint32_t WGF_SECTION_MEMORY = APIC_SECTION_MEMORY;
 static const uint32_t WGF_SECTION_OPERATIONS = APIC_SECTION_OPERATIONS;
-
-// Internal graph structure
-// Note: APICModule, APICKernel, APICRegion, APICPtrLocation are defined in warp.cu
-struct APICGraphInternal {
-    void* cuda_context;
-    int target_arch;
-    bool is_cpu = false;  // True when loaded as a CPU graph
-
-    // Loaded modules
-    std::unordered_map<std::string, APICModule> modules;
-
-    // Kernel info
-    std::unordered_map<std::string, APICKernel> kernels;
-
-    // Memory regions
-    std::unordered_map<uint32_t, APICRegion> regions;
-
-    // Named bindings (name -> region_id) - unified for inputs and outputs
-    std::unordered_map<std::string, uint32_t> bindings;
-    std::vector<std::string> binding_names;  // Ordered list for indexing
-
-    // Operation stream - stored directly in serialized format
-    // Iterate through using APICOpHeader to dispatch
-    std::vector<uint8_t> operation_stream;
-    uint32_t operation_count;
-
-    // Handle pointer remapping (old_ptr -> new_ptr) for Mesh, Volume, BVH, etc.
-    std::unordered_map<uint64_t, uint64_t> handle_ptr_remap;
-
-    // Pointer locations in memory regions that need fixup
-    std::vector<APICPtrLocation> ptr_locations;
-
-    // Mesh records loaded from metadata (for deferred creation)
-    std::vector<APICMeshRecord> mesh_records;
-
-    // Mesh IDs created by this graph (for cleanup)
-    std::vector<uint64_t> created_mesh_ids;
-
-    // CPU graph support: host function pointers (kernel_key -> {forward_fn, backward_fn})
-    std::unordered_map<std::string, std::pair<void*, void*>> host_functions;
-
-    // CUDA graph (built once on first access)
-    CUgraph cuda_graph;
-    CUgraphExec cuda_graph_exec;
-
-    // Base path for modules directory
-    std::string base_path;
-
-    APICGraphInternal()
-        : cuda_context(nullptr)
-        , target_arch(0)
-        , operation_count(0)
-        , cuda_graph(nullptr)
-        , cuda_graph_exec(nullptr)
-    {
-    }
-
-    ~APICGraphInternal()
-    {
-        if (is_cpu) {
-            // CPU path: free host-allocated memory regions
-            for (auto& pair : regions) {
-                if (pair.second.ptr) {
-                    free(pair.second.ptr);
-                }
-            }
-            // Module unloading for CPU is handled by Python (wp_unload_obj);
-            // no CUDA graph or module cleanup needed.
-        } else {
-            ContextGuard guard(cuda_context);
-
-            // Destroy meshes created by this graph
-            for (uint64_t mesh_id : created_mesh_ids) {
-                wp_mesh_destroy_device(mesh_id);
-            }
-
-            // Free CUDA graph resources using runtime API
-            if (cuda_graph_exec) {
-                cudaGraphExecDestroy((cudaGraphExec_t)cuda_graph_exec);
-            }
-            if (cuda_graph) {
-                cudaGraphDestroy((cudaGraph_t)cuda_graph);
-            }
-            // Free allocated memory regions using runtime API
-            for (auto& pair : regions) {
-                if (pair.second.ptr) {
-                    cudaFree(pair.second.ptr);
-                }
-            }
-            // Unload modules using wrapper function
-            for (auto& pair : modules) {
-                if (pair.second.cuda_module) {
-                    cuModuleUnload_f(pair.second.cuda_module);
-                }
-            }
-        }
-    }
-};
 
 // Helper: Read file contents
 static bool apic_read_file(const char* path, std::vector<uint8_t>& data)
@@ -1251,18 +1181,6 @@ static void apic_fixup_ptr_locations(APICGraphInternal* graph)
     }
 }
 
-// Helper: resolve region_id + offset to a pointer
-static void* apic_resolve_region_ptr(APICGraphInternal* graph, int32_t region_id, uint64_t offset)
-{
-    if (region_id < 0)
-        return nullptr;
-    auto it = graph->regions.find(region_id);
-    if (it != graph->regions.end() && it->second.ptr) {
-        return (void*)((uint8_t*)it->second.ptr + offset);
-    }
-    return nullptr;
-}
-
 // Helper: get kernel function (looks up or retrieves from cache)
 static CUfunction apic_get_kernel_function(
     APICGraphInternal* graph,
@@ -1383,7 +1301,7 @@ static bool apic_rebuild_cuda_graph(APICGraphInternal* graph, CUstream stream)
                     apic_array_t* arr_ptr = reinterpret_cast<apic_array_t*>(arr.get());
                     memset(arr_ptr, 0, sizeof(apic_array_t));
 
-                    void* resolved = apic_resolve_region_ptr(graph, binding->region_id, binding->byte_offset);
+                    void* resolved = graph->resolve_region_ptr(binding->region_id, binding->byte_offset);
                     arr_ptr->data = (uint64_t)resolved;
                     arr_ptr->grad = 0;
                     arr_ptr->ndim = binding->ndim;
@@ -1438,7 +1356,7 @@ static bool apic_rebuild_cuda_graph(APICGraphInternal* graph, CUstream stream)
         case APIC_OP_MEMCPY_H2D: {
             const APICMemcpyH2DRecord* rec = reinterpret_cast<const APICMemcpyH2DRecord*>(ptr);
             const uint8_t* src_data = ptr + sizeof(APICMemcpyH2DRecord);
-            void* dst_ptr = apic_resolve_region_ptr(graph, rec->dst_region_id, rec->dst_offset);
+            void* dst_ptr = graph->resolve_region_ptr(rec->dst_region_id, rec->dst_offset);
             cuda_err = cudaMemcpyAsync(dst_ptr, src_data, rec->size, cudaMemcpyHostToDevice, (cudaStream_t)stream);
             if (cuda_err != cudaSuccess) {
                 wp::set_error_string("Failed H2D memcpy: %d", cuda_err);
@@ -1449,8 +1367,8 @@ static bool apic_rebuild_cuda_graph(APICGraphInternal* graph, CUstream stream)
 
         case APIC_OP_MEMCPY_D2D: {
             const APICMemcpyD2DRecord* rec = reinterpret_cast<const APICMemcpyD2DRecord*>(ptr);
-            void* dst_ptr = apic_resolve_region_ptr(graph, rec->dst_region_id, rec->dst_offset);
-            void* src_ptr = apic_resolve_region_ptr(graph, rec->src_region_id, rec->src_offset);
+            void* dst_ptr = graph->resolve_region_ptr(rec->dst_region_id, rec->dst_offset);
+            void* src_ptr = graph->resolve_region_ptr(rec->src_region_id, rec->src_offset);
             cuda_err = cudaMemcpyAsync(dst_ptr, src_ptr, rec->size, cudaMemcpyDeviceToDevice, (cudaStream_t)stream);
             if (cuda_err != cudaSuccess) {
                 wp::set_error_string("Failed D2D memcpy: %d", cuda_err);
@@ -1461,7 +1379,7 @@ static bool apic_rebuild_cuda_graph(APICGraphInternal* graph, CUstream stream)
 
         case APIC_OP_MEMSET: {
             const APICMemsetRecord* rec = reinterpret_cast<const APICMemsetRecord*>(ptr);
-            void* dst_ptr = apic_resolve_region_ptr(graph, rec->region_id, rec->offset);
+            void* dst_ptr = graph->resolve_region_ptr(rec->region_id, rec->offset);
             cuda_err = cudaMemsetAsync(dst_ptr, rec->value, rec->size, (cudaStream_t)stream);
             if (cuda_err != cudaSuccess) {
                 wp::set_error_string("Failed memset: %d", cuda_err);
@@ -1472,8 +1390,8 @@ static bool apic_rebuild_cuda_graph(APICGraphInternal* graph, CUstream stream)
 
         case APIC_OP_ARRAY_COPY: {
             const APICArrayCopyRecord* rec = reinterpret_cast<const APICArrayCopyRecord*>(ptr);
-            void* dst_data = apic_resolve_region_ptr(graph, rec->dst_region_id, rec->dst_offset);
-            void* src_data = apic_resolve_region_ptr(graph, rec->src_region_id, rec->src_offset);
+            void* dst_data = graph->resolve_region_ptr(rec->dst_region_id, rec->dst_offset);
+            void* src_data = graph->resolve_region_ptr(rec->src_region_id, rec->src_offset);
             if (dst_data && src_data) {
                 wp::array_t<void> dst_arr = {};
                 dst_arr.data = dst_data;
@@ -1653,6 +1571,11 @@ APICGraph wp_apic_load_graph(void* context, const char* path)
             pair.second.ptr = host_ptr;
         }
 
+        // Populate region_id_to_ptr for resolve_region_ptr()
+        for (auto& pair : graph->regions) {
+            graph->region_id_to_ptr[pair.first] = (uint64_t)pair.second.ptr;
+        }
+
         // Initialize memory with saved data
         if (memory_ptr && !apic_init_memory(memory_ptr, memory_size, graph)) {
             delete graph;
@@ -1695,6 +1618,11 @@ APICGraph wp_apic_load_graph(void* context, const char* path)
                     return nullptr;
                 }
                 pair.second.ptr = device_ptr;
+            }
+
+            // Populate region_id_to_ptr for resolve_region_ptr()
+            for (auto& pair : graph->regions) {
+                graph->region_id_to_ptr[pair.first] = (uint64_t)pair.second.ptr;
             }
 
             // Initialize memory with saved data
@@ -1951,7 +1879,7 @@ void wp_apic_record_array_copy(void* dst, void* src, int dst_type, int src_type,
     if (!apic_is_recording(g_apic_state))
         return;
 
-    APICStateInternal* state = g_apic_state;
+    APICGraphInternal* state = g_apic_state;
 
     // Only support regular arrays for now
     if (dst_type != wp::ARRAY_TYPE_REGULAR || src_type != wp::ARRAY_TYPE_REGULAR) {
@@ -2083,12 +2011,13 @@ void wp_apic_register_host_function(APICState state, const char* kernel_key, voi
 
 // Build a CPU kernel args struct from APIC parameter records.
 // Returns the total size written to args_buf.
-// For arrays, builds apic_array_t with resolved data pointer.
+// For arrays, builds array_t with resolved data pointer via g->resolve_region_ptr().
 // For scalars, copies inline value bytes.
+// Works for both recording state and loaded graph (unified struct).
 static size_t apic_build_host_args(
     const APICLaunchParamRecord* params,
     int num_params,
-    APICStateInternal* state,
+    const APICGraphInternal* g,
     uint8_t* args_buf,
     size_t buf_capacity)
 {
@@ -2104,9 +2033,9 @@ static size_t apic_build_host_args(
                 return 0;
 
             // Write array_t<T> fields matching the layout in array.h
-            // (NOT the packed apic_array_t — the runtime struct may have trailing padding)
+            // (NOT the packed apic_array_t -- the runtime struct may have trailing padding)
             wp::array_t<int> arr = {};
-            void* resolved = state->resolve_region_ptr(p.region_id, p.byte_offset);
+            void* resolved = g->resolve_region_ptr(p.region_id, p.byte_offset);
             arr.data = (int*)resolved;
             arr.grad = nullptr;
             for (int d = 0; d < APIC_MAX_DIMS; d++) {
@@ -2150,24 +2079,17 @@ static size_t apic_build_host_args(
     return offset;
 }
 
-int wp_apic_replay_host_ops(APICState state)
+// Single internal CPU replay implementation for the unified struct.
+// Works for both in-process recording replay and loaded graph replay.
+static int apic_replay_cpu_ops(APICGraphInternal* g)
 {
-    if (!state) {
-        wp::set_error_string("Null state passed to wp_apic_replay_host_ops");
-        return 0;
-    }
-
-    // Debug trace (uncomment for troubleshooting):
-    // fprintf(stderr, "APIC CPU replay: stream_size=%zu, op_count=%u\n",
-    //         state->operation_stream.size(), state->operation_count);
-
-    const uint8_t* ptr = state->operation_stream.data();
-    const uint8_t* end = ptr + state->operation_stream.size();
+    const uint8_t* ptr = g->operation_stream.data();
+    const uint8_t* end = ptr + g->operation_stream.size();
 
     // Temporary buffer for reconstructed kernel args (reused across launches)
     std::vector<uint8_t> args_buf(4096);
 
-    for (uint32_t i = 0; i < state->operation_count && ptr < end; i++) {
+    for (uint32_t i = 0; i < g->operation_count && ptr < end; i++) {
         const APICOpHeader* hdr = reinterpret_cast<const APICOpHeader*>(ptr);
         const uint8_t* op_start = ptr;
 
@@ -2180,26 +2102,17 @@ int wp_apic_replay_host_ops(APICState state)
             std::string key_str(reinterpret_cast<const char*>(var_data), rec->kernel_key_len);
 
             // Look up host function
-            auto fn_it = state->host_functions.find(key_str);
-            if (fn_it == state->host_functions.end()) {
-                wp::set_error_string("Host function not found for replay: %s", key_str.c_str());
+            auto fn_it = g->host_functions.find(key_str);
+            if (fn_it == g->host_functions.end()) {
+                wp::set_error_string("Host function not found for CPU replay: %s", key_str.c_str());
                 return 0;
             }
 
-            // Build launch bounds matching launch_bounds_t<N> layout:
-            //   int shape[N]; size_t size; bool tiled;
-            // We construct this dynamically on the stack since N varies.
             int ndim = rec->ndim;
-            uint8_t bounds_buf[64] = {};  // large enough for any launch_bounds_t<N>
-            int* shape_ptr = reinterpret_cast<int*>(bounds_buf);
+            int shape[APIC_LAUNCH_MAX_DIMS] = {};
             for (int d = 0; d < ndim && d < APIC_LAUNCH_MAX_DIMS; d++)
-                shape_ptr[d] = rec->shape[d];
-            // size_t follows shape[N] with alignment padding
-            size_t shape_bytes = ndim * sizeof(int);
-            size_t size_offset = (shape_bytes + sizeof(size_t) - 1) & ~(sizeof(size_t) - 1);
-            *reinterpret_cast<size_t*>(bounds_buf + size_offset) = rec->size;
-            // bool tiled follows size
-            *reinterpret_cast<bool*>(bounds_buf + size_offset + sizeof(size_t)) = false;
+                shape[d] = rec->shape[d];
+            size_t launch_size = rec->size;
 
             // Parse parameter bindings
             const uint8_t* params_ptr = var_data + rec->kernel_key_len + rec->module_hash_len;
@@ -2207,20 +2120,14 @@ int wp_apic_replay_host_ops(APICState state)
                 = reinterpret_cast<const APICLaunchParamRecord*>(params_ptr);
 
             // Ensure args buffer is large enough
-            size_t estimated_size = rec->num_params * (WP_ARRAY_T_SIZE + 8);  // generous estimate
+            size_t estimated_size = rec->num_params * (WP_ARRAY_T_SIZE + 8);
             if (args_buf.size() < estimated_size)
                 args_buf.resize(estimated_size);
-
-            // Dispatch to the correct launch_bounds_t<N> overload via template helper
-            int shape[APIC_LAUNCH_MAX_DIMS] = {};
-            for (int d = 0; d < ndim && d < APIC_LAUNCH_MAX_DIMS; d++)
-                shape[d] = rec->shape[d];
-            size_t launch_size = rec->size;
 
             if (rec->is_forward) {
                 // Forward pass: all params are forward args
                 size_t args_size = apic_build_host_args(
-                    params, rec->num_params, state, args_buf.data(), args_buf.size());
+                    params, rec->num_params, g, args_buf.data(), args_buf.size());
                 if (args_size == 0 && rec->num_params > 0) {
                     wp::set_error_string("Failed to reconstruct kernel args for: %s", key_str.c_str());
                     return 0;
@@ -2248,14 +2155,14 @@ int wp_apic_replay_host_ops(APICState state)
                 }
                 int half = rec->num_params / 2;
                 size_t fwd_size = apic_build_host_args(
-                    params, half, state, args_buf.data(), args_buf.size());
+                    params, half, g, args_buf.data(), args_buf.size());
                 if (fwd_size == 0 && half > 0) {
                     wp::set_error_string("Failed to reconstruct forward args for backward: %s", key_str.c_str());
                     return 0;
                 }
                 std::vector<uint8_t> adj_buf(args_buf.size());
                 size_t adj_size = apic_build_host_args(
-                    params + half, rec->num_params - half, state, adj_buf.data(), adj_buf.size());
+                    params + half, rec->num_params - half, g, adj_buf.data(), adj_buf.size());
                 (void)adj_size;
                 switch (ndim) {
                 case 1: apic_call_cpu_bwd<1>(bwd, shape, launch_size, args_buf.data(), adj_buf.data()); break;
@@ -2273,17 +2180,17 @@ int wp_apic_replay_host_ops(APICState state)
         case APIC_OP_MEMCPY_H2H:
         case APIC_OP_MEMCPY_D2D: {
             const APICMemcpyD2DRecord* rec = reinterpret_cast<const APICMemcpyD2DRecord*>(ptr);
-            void* dst = state->resolve_region_ptr(rec->dst_region_id, rec->dst_offset);
-            void* src = state->resolve_region_ptr(rec->src_region_id, rec->src_offset);
+            void* dst = g->resolve_region_ptr(rec->dst_region_id, rec->dst_offset);
+            void* src = g->resolve_region_ptr(rec->src_region_id, rec->src_offset);
             if (dst && src)
                 memcpy(dst, src, rec->size);
             break;
         }
 
         case APIC_OP_MEMCPY_H2D: {
-            // H2D with inline data — copy inline bytes to destination region
+            // H2D with inline data -- copy inline bytes to destination region
             const APICMemcpyH2DRecord* rec = reinterpret_cast<const APICMemcpyH2DRecord*>(ptr);
-            void* dst = state->resolve_region_ptr(rec->dst_region_id, rec->dst_offset);
+            void* dst = g->resolve_region_ptr(rec->dst_region_id, rec->dst_offset);
             const void* src_data = ptr + sizeof(APICMemcpyH2DRecord);
             if (dst)
                 memcpy(dst, src_data, rec->size);
@@ -2292,7 +2199,7 @@ int wp_apic_replay_host_ops(APICState state)
 
         case APIC_OP_MEMSET: {
             const APICMemsetRecord* rec = reinterpret_cast<const APICMemsetRecord*>(ptr);
-            void* dst = state->resolve_region_ptr(rec->region_id, rec->offset);
+            void* dst = g->resolve_region_ptr(rec->region_id, rec->offset);
             if (dst) {
                 // Use same logic as wp_memset_host
                 if ((rec->size % 4) > 0) {
@@ -2308,8 +2215,8 @@ int wp_apic_replay_host_ops(APICState state)
 
         case APIC_OP_ARRAY_COPY: {
             const APICArrayCopyRecord* rec = reinterpret_cast<const APICArrayCopyRecord*>(ptr);
-            void* dst_data = state->resolve_region_ptr(rec->dst_region_id, rec->dst_offset);
-            void* src_data = state->resolve_region_ptr(rec->src_region_id, rec->src_offset);
+            void* dst_data = g->resolve_region_ptr(rec->dst_region_id, rec->dst_offset);
+            void* src_data = g->resolve_region_ptr(rec->src_region_id, rec->src_offset);
             if (dst_data && src_data) {
                 wp::array_t<void> dst_arr = {};
                 dst_arr.data = dst_data;
@@ -2331,7 +2238,7 @@ int wp_apic_replay_host_ops(APICState state)
         }
 
         case APIC_OP_ALLOC:
-            // Allocations are pre-existing for in-process replay
+            // Allocations are pre-existing (recording) or handled during loading
             break;
 
         default:
@@ -2346,6 +2253,15 @@ int wp_apic_replay_host_ops(APICState state)
     return 1;
 }
 
+int wp_apic_replay_host_ops(APICState state)
+{
+    if (!state) {
+        wp::set_error_string("Null state passed to wp_apic_replay_host_ops");
+        return 0;
+    }
+    return apic_replay_cpu_ops(state);
+}
+
 // =============================================================================
 // APIC Loaded CPU Graph Support
 // =============================================================================
@@ -2355,71 +2271,6 @@ void wp_apic_graph_register_host_function(APICGraph graph, const char* kernel_ke
     if (!graph || !kernel_key)
         return;
     graph->host_functions[std::string(kernel_key)] = { forward_fn, backward_fn };
-}
-
-// Build CPU kernel args from APIC parameter records, resolving pointers from APICGraphInternal.
-// Mirrors apic_build_host_args() but uses graph->regions instead of state->region_id_to_ptr.
-static size_t apic_build_host_args_from_graph(
-    const APICLaunchParamRecord* params,
-    int num_params,
-    APICGraphInternal* graph,
-    uint8_t* args_buf,
-    size_t buf_capacity)
-{
-    size_t offset = 0;
-
-    for (int j = 0; j < num_params; j++) {
-        const APICLaunchParamRecord& p = params[j];
-
-        if (p.is_array) {
-            // Align to 8 bytes (pointer alignment, matches array_t<T> alignment)
-            offset = (offset + 7) & ~(size_t)7;
-            if (offset + WP_ARRAY_T_SIZE > buf_capacity)
-                return 0;
-
-            wp::array_t<int> arr = {};
-            void* resolved = apic_resolve_region_ptr(graph, p.region_id, p.byte_offset);
-            arr.data = (int*)resolved;
-            arr.grad = nullptr;
-            for (int d = 0; d < APIC_MAX_DIMS; d++) {
-                arr.shape.dims[d] = (int)p.shape[d];
-                arr.strides[d] = (int)p.strides[d];
-            }
-            arr.ndim = p.ndim;
-            memcpy(args_buf + offset, &arr, WP_ARRAY_T_SIZE);
-            offset += WP_ARRAY_T_SIZE;
-        } else {
-            // Scalar parameter
-            size_t scalar_size = p.byte_offset;
-            if (scalar_size == 0)
-                continue;
-
-            // Align to natural alignment (at most 8)
-            size_t align = 1;
-            if (scalar_size >= 8)
-                align = 8;
-            else if (scalar_size >= 4)
-                align = 4;
-            else if (scalar_size >= 2)
-                align = 2;
-            offset = (offset + align - 1) & ~(align - 1);
-
-            if (offset + scalar_size > buf_capacity)
-                return 0;
-
-            // Scalar bytes stored in shape[] (first 32B) and strides[] (next 32B)
-            const uint8_t* shape_bytes = reinterpret_cast<const uint8_t*>(p.shape);
-            const uint8_t* strides_bytes = reinterpret_cast<const uint8_t*>(p.strides);
-            size_t first_part = std::min(scalar_size, (size_t)(APIC_MAX_DIMS * sizeof(int64_t)));
-            memcpy(args_buf + offset, shape_bytes, first_part);
-            if (scalar_size > first_part) {
-                memcpy(args_buf + offset + first_part, strides_bytes, scalar_size - first_part);
-            }
-            offset += scalar_size;
-        }
-    }
-
-    return offset;
 }
 
 int wp_apic_replay_loaded_host_graph(APICGraph graph)
@@ -2434,169 +2285,5 @@ int wp_apic_replay_loaded_host_graph(APICGraph graph)
         return 0;
     }
 
-    const uint8_t* ptr = graph->operation_stream.data();
-    const uint8_t* end = ptr + graph->operation_stream.size();
-
-    // Temporary buffer for reconstructed kernel args (reused across launches)
-    std::vector<uint8_t> args_buf(4096);
-
-    for (uint32_t i = 0; i < graph->operation_count && ptr < end; i++) {
-        const APICOpHeader* hdr = reinterpret_cast<const APICOpHeader*>(ptr);
-        const uint8_t* op_start = ptr;
-
-        switch (hdr->op_type) {
-        case APIC_OP_KERNEL_LAUNCH: {
-            const APICLaunchRecord* rec = reinterpret_cast<const APICLaunchRecord*>(ptr);
-            const uint8_t* var_data = ptr + sizeof(APICLaunchRecord);
-
-            // Parse kernel key
-            std::string key_str(reinterpret_cast<const char*>(var_data), rec->kernel_key_len);
-
-            // Look up host function
-            auto fn_it = graph->host_functions.find(key_str);
-            if (fn_it == graph->host_functions.end()) {
-                wp::set_error_string("Host function not found for loaded graph replay: %s", key_str.c_str());
-                return 0;
-            }
-
-            int ndim = rec->ndim;
-            int shape[APIC_LAUNCH_MAX_DIMS] = {};
-            for (int d = 0; d < ndim && d < APIC_LAUNCH_MAX_DIMS; d++)
-                shape[d] = rec->shape[d];
-            size_t launch_size = rec->size;
-
-            // Parse parameter bindings
-            const uint8_t* params_ptr = var_data + rec->kernel_key_len + rec->module_hash_len;
-            const APICLaunchParamRecord* params
-                = reinterpret_cast<const APICLaunchParamRecord*>(params_ptr);
-
-            // Ensure args buffer is large enough
-            size_t estimated_size = rec->num_params * (WP_ARRAY_T_SIZE + 8);
-            if (args_buf.size() < estimated_size)
-                args_buf.resize(estimated_size);
-
-            if (rec->is_forward) {
-                size_t args_size = apic_build_host_args_from_graph(
-                    params, rec->num_params, graph, args_buf.data(), args_buf.size());
-                if (args_size == 0 && rec->num_params > 0) {
-                    wp::set_error_string("Failed to reconstruct kernel args for: %s", key_str.c_str());
-                    return 0;
-                }
-                void* fwd = fn_it->second.first;
-                if (!fwd) {
-                    wp::set_error_string("No forward function registered for: %s", key_str.c_str());
-                    return 0;
-                }
-                switch (ndim) {
-                case 1: apic_call_cpu_fwd<1>(fwd, shape, launch_size, args_buf.data()); break;
-                case 2: apic_call_cpu_fwd<2>(fwd, shape, launch_size, args_buf.data()); break;
-                case 3: apic_call_cpu_fwd<3>(fwd, shape, launch_size, args_buf.data()); break;
-                case 4: apic_call_cpu_fwd<4>(fwd, shape, launch_size, args_buf.data()); break;
-                default:
-                    wp::set_error_string("Unsupported launch ndim %d for: %s", ndim, key_str.c_str());
-                    return 0;
-                }
-            } else {
-                void* bwd = fn_it->second.second;
-                if (!bwd) {
-                    wp::set_error_string("No backward function registered for: %s", key_str.c_str());
-                    return 0;
-                }
-                int half = rec->num_params / 2;
-                size_t fwd_size = apic_build_host_args_from_graph(
-                    params, half, graph, args_buf.data(), args_buf.size());
-                if (fwd_size == 0 && half > 0) {
-                    wp::set_error_string("Failed to reconstruct forward args for backward: %s", key_str.c_str());
-                    return 0;
-                }
-                std::vector<uint8_t> adj_buf(args_buf.size());
-                size_t adj_size = apic_build_host_args_from_graph(
-                    params + half, rec->num_params - half, graph, adj_buf.data(), adj_buf.size());
-                (void)adj_size;
-                switch (ndim) {
-                case 1: apic_call_cpu_bwd<1>(bwd, shape, launch_size, args_buf.data(), adj_buf.data()); break;
-                case 2: apic_call_cpu_bwd<2>(bwd, shape, launch_size, args_buf.data(), adj_buf.data()); break;
-                case 3: apic_call_cpu_bwd<3>(bwd, shape, launch_size, args_buf.data(), adj_buf.data()); break;
-                case 4: apic_call_cpu_bwd<4>(bwd, shape, launch_size, args_buf.data(), adj_buf.data()); break;
-                default:
-                    wp::set_error_string("Unsupported launch ndim %d for backward: %s", ndim, key_str.c_str());
-                    return 0;
-                }
-            }
-            break;
-        }
-
-        case APIC_OP_MEMCPY_H2H:
-        case APIC_OP_MEMCPY_D2D: {
-            const APICMemcpyD2DRecord* rec = reinterpret_cast<const APICMemcpyD2DRecord*>(ptr);
-            void* dst = apic_resolve_region_ptr(graph, rec->dst_region_id, rec->dst_offset);
-            void* src = apic_resolve_region_ptr(graph, rec->src_region_id, rec->src_offset);
-            if (dst && src)
-                memcpy(dst, src, rec->size);
-            break;
-        }
-
-        case APIC_OP_MEMCPY_H2D: {
-            // H2D with inline data -- copy inline bytes to destination region
-            const APICMemcpyH2DRecord* rec = reinterpret_cast<const APICMemcpyH2DRecord*>(ptr);
-            void* dst = apic_resolve_region_ptr(graph, rec->dst_region_id, rec->dst_offset);
-            const void* src_data = ptr + sizeof(APICMemcpyH2DRecord);
-            if (dst)
-                memcpy(dst, src_data, rec->size);
-            break;
-        }
-
-        case APIC_OP_MEMSET: {
-            const APICMemsetRecord* rec = reinterpret_cast<const APICMemsetRecord*>(ptr);
-            void* dst = apic_resolve_region_ptr(graph, rec->region_id, rec->offset);
-            if (dst) {
-                if ((rec->size % 4) > 0) {
-                    memset(dst, rec->value, rec->size);
-                } else {
-                    const size_t num_words = rec->size / 4;
-                    for (size_t w = 0; w < num_words; ++w)
-                        ((int*)dst)[w] = rec->value;
-                }
-            }
-            break;
-        }
-
-        case APIC_OP_ARRAY_COPY: {
-            const APICArrayCopyRecord* rec = reinterpret_cast<const APICArrayCopyRecord*>(ptr);
-            void* dst_data = apic_resolve_region_ptr(graph, rec->dst_region_id, rec->dst_offset);
-            void* src_data = apic_resolve_region_ptr(graph, rec->src_region_id, rec->src_offset);
-            if (dst_data && src_data) {
-                wp::array_t<void> dst_arr = {};
-                dst_arr.data = dst_data;
-                dst_arr.ndim = rec->dst_ndim;
-                for (int d = 0; d < APIC_MAX_DIMS; d++) {
-                    dst_arr.shape.dims[d] = rec->dst_shape[d];
-                    dst_arr.strides[d] = rec->dst_strides[d];
-                }
-                wp::array_t<void> src_arr = {};
-                src_arr.data = src_data;
-                src_arr.ndim = rec->src_ndim;
-                for (int d = 0; d < APIC_MAX_DIMS; d++) {
-                    src_arr.shape.dims[d] = rec->src_shape[d];
-                    src_arr.strides[d] = rec->src_strides[d];
-                }
-                wp_array_copy_host(&dst_arr, &src_arr, rec->dst_type, rec->src_type, rec->elem_size);
-            }
-            break;
-        }
-
-        case APIC_OP_ALLOC:
-            // Allocations are handled by memory region setup during loading
-            break;
-
-        default:
-            wp::set_error_string("Unknown operation type during loaded CPU graph replay: %d", hdr->op_type);
-            return 0;
-        }
-
-        // Advance to next operation
-        ptr = op_start + hdr->total_size;
-    }
-
-    return 1;
+    return apic_replay_cpu_ops(graph);
 }

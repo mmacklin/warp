@@ -43,7 +43,7 @@ extern "C" {
 // =============================================================================
 
 // Opaque handle to APIC state (used internally during CUDA graph capture)
-typedef struct APICStateInternal* APICState;
+typedef struct APICGraphInternal* APICState;
 
 // APIC State Management
 WP_API APICState wp_apic_create_state();
@@ -218,7 +218,7 @@ bool apic_is_recording(APICState state);
 
 // Internal recording functions (called from wp_cuda_launch_kernel, wp_memcpy_*, etc.)
 void apic_record_kernel_launch(
-    APICStateInternal* state,
+    APICGraphInternal* state,
     void* kernel,
     size_t dim,
     const int* shape,
@@ -233,10 +233,10 @@ void apic_record_kernel_launch(
     int num_params
 );
 
-void apic_record_memcpy(APICStateInternal* state, void* dst, void* src, size_t size, APICOpType kind);
+void apic_record_memcpy(APICGraphInternal* state, void* dst, void* src, size_t size, APICOpType kind);
 
-void apic_record_memset(APICStateInternal* state, void* dst, int value, size_t size);
+void apic_record_memset(APICGraphInternal* state, void* dst, int value, size_t size);
 
-void apic_record_alloc(APICStateInternal* state, void* ptr, size_t size);
+void apic_record_alloc(APICGraphInternal* state, void* ptr, size_t size);
 
 #endif  // __cplusplus
