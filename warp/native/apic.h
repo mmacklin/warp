@@ -134,6 +134,58 @@ WP_API int wp_apic_get_num_params(APICGraph graph);
 WP_API const char* wp_apic_get_param_name(APICGraph graph, int index);
 WP_API size_t wp_apic_get_param_size(APICGraph graph, const char* name);
 
+// =============================================================================
+// APIC Public API - CPU Graph Support
+// =============================================================================
+
+// Check if any APIC recording is active on the current thread.
+// Callable from any compilation unit (wraps access to thread-local g_apic_state).
+WP_API int wp_apic_is_recording_active(void);
+
+// Record a host-to-host memcpy to the active APIC state.
+// Called from warp.cpp host memory function hooks.
+WP_API void wp_apic_record_host_memcpy(void* dst, void* src, size_t size);
+
+// Record a host memset to the active APIC state.
+// Called from warp.cpp host memory function hooks.
+WP_API void wp_apic_record_host_memset(void* dst, int value, size_t size);
+
+// Record a host memtile (repeat pattern) to the active APIC state.
+// Must be called AFTER execution so the full dst content can be captured as inline data.
+WP_API void wp_apic_record_host_memtile(void* dst, size_t total_size);
+
+// Launch a host kernel with optional APIC recording.
+// Mirrors wp_cuda_launch_kernel() for CPU function pointers.
+// bounds: pointer to launch_bounds_t; args: pointer to packed args struct;
+// adj_args: NULL for forward pass, pointer to adjoint args for backward;
+// args_size: sizeof the args struct (for potential recording);
+// apic_info: NULL when not capturing, otherwise APIC launch info.
+WP_API void wp_launch_host_kernel(
+    void* kernel_fn,
+    void* bounds,
+    void* args,
+    void* adj_args,
+    size_t args_size,
+    const APICLaunchInfo* apic_info
+);
+
+// Register a host function pointer for CPU graph replay.
+// Must be called during capture for each unique kernel.
+WP_API void wp_apic_register_host_function(
+    APICState state,
+    const char* kernel_key,
+    void* forward_fn,
+    void* backward_fn
+);
+
+// Replay all operations in the state's operation stream on CPU.
+// Uses registered host functions for kernel launches, memcpy/memset for memory ops.
+// Returns 1 on success, 0 on failure.
+WP_API int wp_apic_replay_host_ops(APICState state);
+
+// Mark APIC state as targeting CPU (affects serialization behavior).
+WP_API void wp_apic_set_cpu_mode(APICState state);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

@@ -139,6 +139,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
     from warp.tests.test_conditional import TestConditional
     from warp.tests.test_context import TestContext
     from warp.tests.test_copy import TestCopy
+    from warp.tests.test_cpu_graph import TestCPUGraph
     from warp.tests.test_ctypes import TestCTypes
     from warp.tests.test_dense import TestDense
     from warp.tests.test_devices import TestDevices
@@ -231,6 +232,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestConstants,
         TestContext,
         TestCopy,
+        TestCPUGraph,
         TestCTypes,
         TestDense,
         TestDevices,

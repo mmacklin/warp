@@ -3797,6 +3797,7 @@ class Graph:
         self._params: dict = {}  # name -> binding info (size, etc.)
         self._source_path: str | None = None  # path if loaded from file
         self._native_graph = None  # Native C++ APIC graph handle
+        self._is_cpu_graph = False
 
     @classmethod
     def load(cls, path: str, device: Device = None) -> Graph:
@@ -3844,6 +3845,12 @@ class Graph:
 
     def __del__(self):
         if not hasattr(self, "graph") or not hasattr(self, "device"):
+            return
+
+        # For CPU graphs, just clean up APIC state
+        if getattr(self, '_is_cpu_graph', False):
+            if hasattr(self, 'apic_capture') and self.apic_capture is not None:
+                self.apic_capture.destroy()
             return
 
         try:
@@ -4981,6 +4988,31 @@ class Runtime:
             self.core.wp_apic_get_param_size.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
             self.core.wp_apic_get_param_size.restype = ctypes.c_size_t
 
+            # CPU graph support
+            self.core.wp_apic_is_recording_active.argtypes = []
+            self.core.wp_apic_is_recording_active.restype = ctypes.c_int
+
+            self.core.wp_launch_host_kernel.argtypes = [
+                ctypes.c_void_p,  # kernel_fn
+                ctypes.c_void_p,  # bounds
+                ctypes.c_void_p,  # args
+                ctypes.c_void_p,  # adj_args
+                ctypes.c_size_t,   # args_size
+                ctypes.c_void_p,  # apic_info
+            ]
+            self.core.wp_launch_host_kernel.restype = None
+
+            self.core.wp_apic_register_host_function.argtypes = [
+                ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_void_p
+            ]
+            self.core.wp_apic_register_host_function.restype = None
+
+            self.core.wp_apic_replay_host_ops.argtypes = [ctypes.c_void_p]
+            self.core.wp_apic_replay_host_ops.restype = ctypes.c_int
+
+            self.core.wp_apic_set_cpu_mode.argtypes = [ctypes.c_void_p]
+            self.core.wp_apic_set_cpu_mode.restype = None
+
             self.core.wp_cuda_compile_program.argtypes = [
                 ctypes.c_char_p,  # cuda_src
                 ctypes.c_char_p,  # program name
@@ -5257,6 +5289,8 @@ class Runtime:
 
         # global tape
         self.tape = None
+
+        self.cpu_capture = None  # Active CPU graph capture, or None
 
         # print device and version information
         if not warp.config.quiet:
@@ -6870,6 +6904,49 @@ def pack_arg(kernel, arg_type, arg_name, value, device, adjoint=False):
             ) from e
 
 
+def _build_args_struct(kernel, params):
+    """Build a ctypes args struct from kernel parameters.
+
+    Returns:
+        (ArgsStructType, args_instance) - the struct type and populated instance.
+        The args struct contains all kernel arguments (params[1:]).
+    """
+    fields = []
+    for i in range(0, len(kernel.adj.args)):
+        arg_name = kernel.adj.args[i].label
+        field = (arg_name, type(params[1 + i]))
+        fields.append(field)
+
+    ArgsStruct = type("ArgsStruct", (ctypes.Structure,), {"_fields_": fields})
+    args = ArgsStruct()
+    for i, field in enumerate(fields):
+        name = field[0]
+        setattr(args, name, params[1 + i])
+
+    return ArgsStruct, args
+
+
+def _build_adj_args_struct(kernel, params, num_forward_args):
+    """Build the adjoint args struct for backward pass.
+
+    Returns:
+        (AdjArgsStructType, adj_args_instance)
+    """
+    adj_fields = []
+    for i in range(0, len(kernel.adj.args)):
+        arg_name = kernel.adj.args[i].label
+        field = (arg_name, type(params[1 + num_forward_args + i]))
+        adj_fields.append(field)
+
+    AdjArgsStruct = type("AdjArgsStruct", (ctypes.Structure,), {"_fields_": adj_fields})
+    adj_args = AdjArgsStruct()
+    for i, field in enumerate(adj_fields):
+        name = field[0]
+        setattr(adj_args, name, params[1 + num_forward_args + i])
+
+    return AdjArgsStruct, adj_args
+
+
 # invoke a CPU kernel by passing the parameters as a ctypes structure
 def invoke(kernel, hooks, params: Sequence[Any], adjoint: bool):
     fields = []
@@ -7286,7 +7363,54 @@ def launch(
                 )
                 return launch
 
-            invoke(kernel, hooks, params, adjoint)
+            # Check for active CPU capture
+            apic_info = None
+            if runtime.cpu_capture is not None:
+                graph = runtime.cpu_capture
+                graph.retain_module_exec(module_exec)
+                if graph.apic_capture is not None:
+                    apic_launch = Launch(
+                        kernel=kernel,
+                        hooks=hooks,
+                        params=params,
+                        params_addr=None,
+                        bounds=bounds,
+                        device=device,
+                        adjoint=adjoint,
+                    )
+                    apic_info = graph.apic_capture.build_launch_info(apic_launch, inputs=inputs, outputs=outputs)
+                    # Register host function for native replay
+                    runtime.core.wp_apic_register_host_function(
+                        graph.apic_capture.native_state,
+                        kernel.key.encode("utf-8"),
+                        hooks.forward if hooks.forward else None,
+                        hooks.backward if hooks.backward else None,
+                    )
+
+            if apic_info is not None:
+                # Route through C++ dispatch for APIC recording + execution
+                ArgsStruct, args = _build_args_struct(kernel, params)
+                if adjoint:
+                    _AdjStruct, adj_args = _build_adj_args_struct(kernel, params, len(kernel.adj.args))
+                    runtime.core.wp_launch_host_kernel(
+                        hooks.backward,
+                        ctypes.byref(params[0]),
+                        ctypes.byref(args),
+                        ctypes.byref(adj_args),
+                        ctypes.sizeof(ArgsStruct),
+                        ctypes.byref(apic_info),
+                    )
+                else:
+                    runtime.core.wp_launch_host_kernel(
+                        hooks.forward,
+                        ctypes.byref(params[0]),
+                        ctypes.byref(args),
+                        None,
+                        ctypes.sizeof(ArgsStruct),
+                        ctypes.byref(apic_info),
+                    )
+            else:
+                invoke(kernel, hooks, params, adjoint)
 
         else:
             kernel_args = [ctypes.c_void_p(ctypes.addressof(x)) for x in params]
@@ -8027,23 +8151,41 @@ def capture_begin(
 
     """
 
+    # Resolve device early so we can take the CPU path before CUDA-specific checks
+    if stream is not None:
+        device = stream.device
+    else:
+        device = runtime.get_device(device)
+        if not device.is_cuda and not device.is_cpu:
+            raise RuntimeError("Must be a CUDA or CPU device")
+        if device.is_cuda:
+            stream = device.stream
+
+    if device.is_cpu:
+        # CPU graph capture uses APIC mechanism only (no CUDA stream capture)
+        from warp._src.apic import APICapture
+
+        apic_capture = APICapture(device, stream=None)
+        apic_capture.begin(track_memory=apic)
+
+        # Use the native state pointer as a unique capture ID
+        capture_id = ctypes.cast(apic_capture.native_state, ctypes.c_void_p).value
+        graph = Graph(device, capture_id, apic_capture)
+        graph._is_cpu_graph = True
+        runtime.cpu_capture = graph
+        device.captures[None] = graph  # CPU has no stream key
+        runtime.captures[capture_id] = graph
+        return
+
+    # CUDA-specific checks (only reached for CUDA devices)
     if force_module_load is None:
         if runtime.driver_version is not None and runtime.driver_version >= (12, 3):
-            # Driver versions 12.3 and can compile modules during graph capture
             force_module_load = False
         else:
             force_module_load = warp.config.enable_graph_capture_module_load_by_default
 
     if warp.config.verify_cuda:
         raise RuntimeError("Cannot use CUDA error verification during graph capture")
-
-    if stream is not None:
-        device = stream.device
-    else:
-        device = runtime.get_device(device)
-        if not device.is_cuda:
-            raise RuntimeError("Must be a CUDA device")
-        stream = device.stream
 
     if external:
         # make sure the stream is already capturing
@@ -8090,9 +8232,21 @@ def capture_end(device: DeviceLike = None, stream: Stream | None = None) -> Grap
         device = stream.device
     else:
         device = runtime.get_device(device)
-        if not device.is_cuda:
-            raise RuntimeError("Must be a CUDA device")
-        stream = device.stream
+        if not device.is_cuda and not device.is_cpu:
+            raise RuntimeError("Must be a CUDA or CPU device")
+        if device.is_cuda:
+            stream = device.stream
+
+    if device.is_cpu:
+        graph = device.captures.get(None)
+        if graph is None:
+            raise RuntimeError("Graph capture is not active on CPU device")
+        del device.captures[None]
+        del runtime.captures[graph.capture_id]
+        runtime.cpu_capture = None
+        if graph.apic_capture is not None:
+            graph.apic_capture.end()
+        return graph
 
     # get the graph being captured
     graph = device.captures.get(stream)
@@ -8494,6 +8648,15 @@ def capture_launch(graph: Graph, stream: Stream | None = None):
         stream: A :class:`Stream` to launch the graph on
     """
 
+    # CPU graph replay
+    if getattr(graph, '_is_cpu_graph', False):
+        if graph.apic_capture is None or graph.apic_capture.native_state is None:
+            raise RuntimeError("CPU graph has no recorded operations")
+        result = runtime.core.wp_apic_replay_host_ops(graph.apic_capture.native_state)
+        if not result:
+            raise RuntimeError(f"CPU graph replay failed: {runtime.get_error_string()}")
+        return
+
     if stream is not None:
         if stream.device != graph.device:
             raise RuntimeError(f"Cannot launch graph from device {graph.device} on stream from device {stream.device}")
@@ -8709,6 +8872,10 @@ def copy(
                     src.device.context, dst_ptr, src_ptr, bytes_to_copy, stream.cuda_stream
                 )
             else:
+                # Track arrays for CPU graph capture (recording handled by C++ hook)
+                if runtime.cpu_capture is not None and runtime.cpu_capture.apic_capture is not None:
+                    runtime.cpu_capture.apic_capture.track_array(dest)
+                    runtime.cpu_capture.apic_capture.track_array(src)
                 result = runtime.core.wp_memcpy_h2h(dst_ptr, src_ptr, bytes_to_copy)
 
         if not result:

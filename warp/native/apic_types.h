@@ -41,12 +41,17 @@ typedef enum {
     APIC_OP_MEMCPY_D2D = 4,
     APIC_OP_MEMSET = 5,
     APIC_OP_ALLOC = 6,  // In-graph allocation
+    APIC_OP_MEMCPY_H2H = 7,  // Host-to-host memcpy (CPU graphs, uses APICMemcpyD2DRecord format)
 
     // Future: high-level Warp operations
     // APIC_OP_MESH_CREATE = 10,
     // APIC_OP_VOLUME_CREATE = 11,
     // APIC_OP_BVH_CREATE = 12,
 } APICOpType;
+
+// Device type for graph target
+#define APIC_DEVICE_CUDA 0
+#define APIC_DEVICE_CPU  1
 
 
 // =============================================================================

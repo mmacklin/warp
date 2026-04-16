@@ -17,6 +17,7 @@
 
 #include "warp.h"
 
+#include "apic.h"
 #include "array.h"
 #include "error.h"
 #include "exports.h"
@@ -191,12 +192,16 @@ void wp_free_host(void* ptr)
 
 bool wp_memcpy_h2h(void* dest, void* src, size_t n)
 {
+    if (wp_apic_is_recording_active())
+        wp_apic_record_host_memcpy(dest, src, n);
     memcpy(dest, src, n);
     return true;
 }
 
 void wp_memset_host(void* dest, int value, size_t n)
 {
+    if (wp_apic_is_recording_active())
+        wp_apic_record_host_memset(dest, value, n);
     if ((n % 4) > 0) {
         memset(dest, value, n);
     } else {
@@ -216,6 +221,10 @@ template <typename T> void memtile_value_host(T* dst, T value, size_t n)
 
 void wp_memtile_host(void* dst, const void* src, size_t srcsize, size_t n)
 {
+    bool recording = wp_apic_is_recording_active();
+    void* dst_start = dst;    // save for APIC recording after execution
+    size_t total_bytes = srcsize * n;  // save before n gets modified by the loop
+
     size_t dst_addr = reinterpret_cast<size_t>(dst);
     size_t src_addr = reinterpret_cast<size_t>(src);
 
@@ -235,6 +244,10 @@ void wp_memtile_host(void* dst, const void* src, size_t srcsize, size_t n)
             dst = (int8_t*)dst + srcsize;
         }
     }
+
+    // APIC: record after execution so we capture the final tiled content
+    if (recording)
+        wp_apic_record_host_memtile(dst_start, total_bytes);
 }
 
 void wp_array_scan_int_host(uint64_t in, uint64_t out, int len, bool inclusive)

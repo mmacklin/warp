@@ -118,7 +118,7 @@ class APICapture:
 
     def __init__(self, device, stream=None):
         self.device = device
-        self.stream = stream or device.stream
+        self.stream = stream if stream is not None else (device.stream if device.is_cuda else None)
 
         # Native APIC state handle
         self.native_state = None
@@ -133,17 +133,22 @@ class APICapture:
 
         # Internal tracking
         self._recording: bool = False
+        self._track_memory: bool = True  # Default to full tracking; begin() may override
 
-    def begin(self):
+    def begin(self, track_memory=True):
         """Start APIC recording."""
         import warp._src.context
 
+        self._track_memory = track_memory
         runtime = warp._src.context.runtime
 
         # Create native state
         self.native_state = runtime.core.wp_apic_create_state()
         if not self.native_state:
             raise RuntimeError("Failed to create APIC state")
+
+        if self.device.is_cpu:
+            runtime.core.wp_apic_set_cpu_mode(self.native_state)
 
         # Begin native recording
         runtime.core.wp_apic_begin_recording(self.native_state)
@@ -260,12 +265,13 @@ class APICapture:
         )
         self.memory_regions[base_ptr] = region
 
-        # Auto-detect handle locations in the array's dtype (including nested structs)
-        handle_offsets = self._find_handle_offsets(arr.dtype)
-        if handle_offsets:
-            stride = warp.types.type_size_in_bytes(arr.dtype)
-            for handle_offset in handle_offsets:
-                runtime.core.wp_apic_register_ptr_location(self.native_state, region_id, handle_offset, stride)
+        # Auto-detect handle locations (only needed for serialization/memory tracking)
+        if self._track_memory:
+            handle_offsets = self._find_handle_offsets(arr.dtype)
+            if handle_offsets:
+                stride = warp.types.type_size_in_bytes(arr.dtype)
+                for handle_offset in handle_offsets:
+                    runtime.core.wp_apic_register_ptr_location(self.native_state, region_id, handle_offset, stride)
 
         return region_id, offset
 
@@ -329,11 +335,17 @@ class APICapture:
         if kernel.key not in self.kernels:
             hooks = launch.hooks
             mangled_name = kernel.get_mangled_name()
+            if self.device.is_cpu:
+                forward_name = f"{mangled_name}_cpu_forward"
+                backward_name = f"{mangled_name}_cpu_backward" if hooks.backward else None
+            else:
+                forward_name = f"{mangled_name}_cuda_kernel_forward"
+                backward_name = f"{mangled_name}_cuda_kernel_backward" if hooks.backward else None
             self.kernels[kernel.key] = KernelInfo(
                 kernel_key=kernel.key,
                 module_hash=module_hash,
-                forward_name=f"{mangled_name}_cuda_kernel_forward",
-                backward_name=(f"{mangled_name}_cuda_kernel_backward" if hooks.backward else None),
+                forward_name=forward_name,
+                backward_name=backward_name,
                 forward_smem_bytes=hooks.forward_smem_bytes,
                 backward_smem_bytes=hooks.backward_smem_bytes if hooks.backward else 0,
                 block_dim=launch.block_dim,
