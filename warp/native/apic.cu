@@ -1470,6 +1470,31 @@ static bool apic_rebuild_cuda_graph(APICGraphInternal* graph, CUstream stream)
             break;
         }
 
+        case APIC_OP_ARRAY_COPY: {
+            const APICArrayCopyRecord* rec = reinterpret_cast<const APICArrayCopyRecord*>(ptr);
+            void* dst_data = apic_resolve_region_ptr(graph, rec->dst_region_id, rec->dst_offset);
+            void* src_data = apic_resolve_region_ptr(graph, rec->src_region_id, rec->src_offset);
+            if (dst_data && src_data) {
+                wp::array_t<void> dst_arr = {};
+                dst_arr.data = dst_data;
+                dst_arr.ndim = rec->dst_ndim;
+                for (int d = 0; d < APIC_MAX_DIMS; d++) {
+                    dst_arr.shape.dims[d] = rec->dst_shape[d];
+                    dst_arr.strides[d] = rec->dst_strides[d];
+                }
+                wp::array_t<void> src_arr = {};
+                src_arr.data = src_data;
+                src_arr.ndim = rec->src_ndim;
+                for (int d = 0; d < APIC_MAX_DIMS; d++) {
+                    src_arr.shape.dims[d] = rec->src_shape[d];
+                    src_arr.strides[d] = rec->src_strides[d];
+                }
+                wp_array_copy_device(graph->cuda_context, &dst_arr, &src_arr,
+                                     rec->dst_type, rec->src_type, rec->elem_size);
+            }
+            break;
+        }
+
         case APIC_OP_ALLOC:
             // Allocations are handled by memory region setup, skip
             break;
@@ -1921,6 +1946,53 @@ void wp_apic_record_host_memtile(void* dst, size_t total_size)
     }
 }
 
+void wp_apic_record_array_copy(void* dst, void* src, int dst_type, int src_type, int elem_size)
+{
+    if (!apic_is_recording(g_apic_state))
+        return;
+
+    APICStateInternal* state = g_apic_state;
+
+    // Only support regular arrays for now
+    if (dst_type != wp::ARRAY_TYPE_REGULAR || src_type != wp::ARRAY_TYPE_REGULAR) {
+        fprintf(stderr, "APIC: Warning - array_copy with non-regular array types (%d, %d) not recorded\n",
+                dst_type, src_type);
+        return;
+    }
+
+    const wp::array_t<void>& dst_arr = *static_cast<const wp::array_t<void>*>(dst);
+    const wp::array_t<void>& src_arr = *static_cast<const wp::array_t<void>*>(src);
+
+    // Resolve data pointers to region IDs
+    int32_t dst_region_id = -1, src_region_id = -1;
+    uint64_t dst_offset = 0, src_offset = 0;
+    state->find_region(reinterpret_cast<uint64_t>(dst_arr.data), dst_region_id, dst_offset);
+    state->find_region(reinterpret_cast<uint64_t>(src_arr.data), src_region_id, src_offset);
+
+    APICArrayCopyRecord rec = {};
+    rec.header.op_type = APIC_OP_ARRAY_COPY;
+    rec.header.total_size = sizeof(rec);
+    rec.dst_region_id = dst_region_id;
+    rec.dst_type = dst_type;
+    rec.dst_offset = dst_offset;
+    rec.dst_ndim = dst_arr.ndim;
+    rec.src_region_id = src_region_id;
+    rec.src_type = src_type;
+    rec.src_offset = src_offset;
+    rec.src_ndim = src_arr.ndim;
+    rec.elem_size = elem_size;
+
+    for (int d = 0; d < APIC_MAX_DIMS; d++) {
+        rec.dst_shape[d] = dst_arr.shape.dims[d];
+        rec.dst_strides[d] = dst_arr.strides[d];
+        rec.src_shape[d] = src_arr.shape.dims[d];
+        rec.src_strides[d] = src_arr.strides[d];
+    }
+
+    state->append_bytes(&rec, sizeof(rec));
+    state->operation_count++;
+}
+
 void wp_apic_set_cpu_mode(APICState state)
 {
     if (state)
@@ -2234,6 +2306,30 @@ int wp_apic_replay_host_ops(APICState state)
             break;
         }
 
+        case APIC_OP_ARRAY_COPY: {
+            const APICArrayCopyRecord* rec = reinterpret_cast<const APICArrayCopyRecord*>(ptr);
+            void* dst_data = state->resolve_region_ptr(rec->dst_region_id, rec->dst_offset);
+            void* src_data = state->resolve_region_ptr(rec->src_region_id, rec->src_offset);
+            if (dst_data && src_data) {
+                wp::array_t<void> dst_arr = {};
+                dst_arr.data = dst_data;
+                dst_arr.ndim = rec->dst_ndim;
+                for (int d = 0; d < APIC_MAX_DIMS; d++) {
+                    dst_arr.shape.dims[d] = rec->dst_shape[d];
+                    dst_arr.strides[d] = rec->dst_strides[d];
+                }
+                wp::array_t<void> src_arr = {};
+                src_arr.data = src_data;
+                src_arr.ndim = rec->src_ndim;
+                for (int d = 0; d < APIC_MAX_DIMS; d++) {
+                    src_arr.shape.dims[d] = rec->src_shape[d];
+                    src_arr.strides[d] = rec->src_strides[d];
+                }
+                wp_array_copy_host(&dst_arr, &src_arr, rec->dst_type, rec->src_type, rec->elem_size);
+            }
+            break;
+        }
+
         case APIC_OP_ALLOC:
             // Allocations are pre-existing for in-process replay
             break;
@@ -2461,6 +2557,30 @@ int wp_apic_replay_loaded_host_graph(APICGraph graph)
                     for (size_t w = 0; w < num_words; ++w)
                         ((int*)dst)[w] = rec->value;
                 }
+            }
+            break;
+        }
+
+        case APIC_OP_ARRAY_COPY: {
+            const APICArrayCopyRecord* rec = reinterpret_cast<const APICArrayCopyRecord*>(ptr);
+            void* dst_data = apic_resolve_region_ptr(graph, rec->dst_region_id, rec->dst_offset);
+            void* src_data = apic_resolve_region_ptr(graph, rec->src_region_id, rec->src_offset);
+            if (dst_data && src_data) {
+                wp::array_t<void> dst_arr = {};
+                dst_arr.data = dst_data;
+                dst_arr.ndim = rec->dst_ndim;
+                for (int d = 0; d < APIC_MAX_DIMS; d++) {
+                    dst_arr.shape.dims[d] = rec->dst_shape[d];
+                    dst_arr.strides[d] = rec->dst_strides[d];
+                }
+                wp::array_t<void> src_arr = {};
+                src_arr.data = src_data;
+                src_arr.ndim = rec->src_ndim;
+                for (int d = 0; d < APIC_MAX_DIMS; d++) {
+                    src_arr.shape.dims[d] = rec->src_shape[d];
+                    src_arr.strides[d] = rec->src_strides[d];
+                }
+                wp_array_copy_host(&dst_arr, &src_arr, rec->dst_type, rec->src_type, rec->elem_size);
             }
             break;
         }

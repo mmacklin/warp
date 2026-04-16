@@ -608,6 +608,9 @@ WP_API bool wp_array_copy_host(void* dst, void* src, int dst_type, int src_type,
     if (!src || !dst)
         return false;
 
+    if (wp_apic_is_recording_active())
+        wp_apic_record_array_copy(dst, src, dst_type, src_type, elem_size);
+
     const void* src_data = NULL;
     void* dst_data = NULL;
     int src_ndim = 0;

@@ -165,6 +165,32 @@ class TestCPUGraph(unittest.TestCase):
         np.testing.assert_allclose(b.numpy(), expected)
 
 
+    def test_cpu_strided_copy(self):
+        """Test capture and replay with non-contiguous (strided) wp.copy()."""
+        n = 20
+        device = "cpu"
+
+        # Create a strided source (every other element)
+        full = wp.array(np.arange(n, dtype=np.float32), dtype=float, device=device)
+        src = full[::2]  # [0, 2, 4, 6, 8, 10, 12, 14, 16, 18]
+
+        # Create a strided destination
+        dst_full = wp.zeros(n, dtype=float, device=device)
+        dst = dst_full[::2]
+
+        wp.capture_begin(device=device)
+        wp.copy(dst, src)
+        graph = wp.capture_end(device=device)
+
+        # Clear and replay
+        dst_full.zero_()
+        wp.capture_launch(graph)
+
+        expected = np.zeros(n, dtype=np.float32)
+        expected[::2] = np.arange(0, n, 2, dtype=np.float32)
+        np.testing.assert_allclose(dst_full.numpy(), expected)
+
+
 if __name__ == "__main__":
     wp.clear_kernel_cache()
     unittest.main(verbosity=2)

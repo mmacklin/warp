@@ -1409,6 +1409,9 @@ WP_API bool wp_array_copy_device(void* context, void* dst, void* src, int dst_ty
     if (!src || !dst)
         return false;
 
+    if (apic_is_recording(g_apic_state))
+        wp_apic_record_array_copy(dst, src, dst_type, src_type, elem_size);
+
     const void* src_data = NULL;
     void* dst_data = NULL;
     int src_ndim = 0;

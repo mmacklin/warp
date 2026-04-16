@@ -42,6 +42,7 @@ typedef enum {
     APIC_OP_MEMSET = 5,
     APIC_OP_ALLOC = 6,  // In-graph allocation
     APIC_OP_MEMCPY_H2H = 7,  // Host-to-host memcpy (CPU graphs, uses APICMemcpyD2DRecord format)
+    APIC_OP_ARRAY_COPY = 8,  // Strided array copy (non-contiguous wp.copy)
 
     // Future: high-level Warp operations
     // APIC_OP_MESH_CREATE = 10,
@@ -213,6 +214,28 @@ typedef struct {
     uint32_t _pad;
     uint64_t size;
 } APICAllocRecord;  // 24 bytes
+
+// Strided array copy (for non-contiguous wp.copy)
+// Stores full array descriptors so the copy can be replayed with correct strides
+typedef struct {
+    APICOpHeader header;  // op_type = APIC_OP_ARRAY_COPY
+    // Destination
+    int32_t dst_region_id;
+    int32_t dst_type;  // ARRAY_TYPE_*
+    uint64_t dst_offset;  // byte offset of data within region
+    int32_t dst_shape[APIC_MAX_DIMS];
+    int32_t dst_strides[APIC_MAX_DIMS];
+    int32_t dst_ndim;
+    // Source
+    int32_t src_region_id;
+    int32_t src_type;
+    uint64_t src_offset;
+    int32_t src_shape[APIC_MAX_DIMS];
+    int32_t src_strides[APIC_MAX_DIMS];
+    int32_t src_ndim;
+    // Common
+    int32_t elem_size;
+} APICArrayCopyRecord;
 
 // =============================================================================
 // Memory Section Records
