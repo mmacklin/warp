@@ -9680,6 +9680,20 @@ def copy(
             copy(tmp, src, stream=stream)
             src = tmp
 
+    # APIC: track both arrays for graph capture if a same-device capture is active.
+    # This must happen before any copy path so region IDs are available for recording.
+    if src.device == dest.device:
+        if dest.device.is_cuda:
+            if len(runtime.captures) > 0 and runtime.core.wp_cuda_stream_is_capturing(stream.cuda_stream):
+                capture_id = runtime.core.wp_cuda_stream_get_capture_id(stream.cuda_stream)
+                graph = runtime.captures.get(capture_id)
+                if graph is not None and graph.apic_capture is not None:
+                    graph.apic_capture.track_array(dest)
+                    graph.apic_capture.track_array(src)
+        elif runtime.cpu_capture is not None and runtime.cpu_capture.apic_capture is not None:
+            runtime.cpu_capture.apic_capture.track_array(dest)
+            runtime.cpu_capture.apic_capture.track_array(src)
+
     if src.is_contiguous and dest.is_contiguous:
         bytes_to_copy = count * warp._src.types.type_size_in_bytes(src.dtype)
 
@@ -9703,15 +9717,6 @@ def copy(
             )
 
         if dest.device.is_cuda:
-            # APIC: track arrays during graph capture so native memcpy can resolve region IDs
-            if len(runtime.captures) > 0 and runtime.core.wp_cuda_stream_is_capturing(stream.cuda_stream):
-                capture_id = runtime.core.wp_cuda_stream_get_capture_id(stream.cuda_stream)
-                graph = runtime.captures.get(capture_id)
-                if graph is not None and graph.apic_capture is not None:
-                    graph.apic_capture.track_array(dest)
-                    if src.device.is_cuda:
-                        graph.apic_capture.track_array(src)
-
             if src.device.is_cuda:
                 if src.device == dest.device:
                     result = runtime.core.wp_memcpy_d2d(
@@ -9731,10 +9736,6 @@ def copy(
                     src.device.context, dst_ptr, src_ptr, bytes_to_copy, stream.cuda_stream
                 )
             else:
-                # Track arrays for CPU graph capture (recording handled by C++ hook)
-                if runtime.cpu_capture is not None and runtime.cpu_capture.apic_capture is not None:
-                    runtime.cpu_capture.apic_capture.track_array(dest)
-                    runtime.cpu_capture.apic_capture.track_array(src)
                 result = runtime.core.wp_memcpy_h2h(dst_ptr, src_ptr, bytes_to_copy)
 
         if not result:
@@ -9780,10 +9781,6 @@ def copy(
                 )
                 stream.wait_stream(dest.device.stream)
         else:
-            # Track arrays for CPU graph capture
-            if runtime.cpu_capture is not None and runtime.cpu_capture.apic_capture is not None:
-                runtime.cpu_capture.apic_capture.track_array(dest)
-                runtime.cpu_capture.apic_capture.track_array(src)
             result = runtime.core.wp_array_copy_host(dst_ptr, src_ptr, dst_type, src_type, src_elem_size)
 
         if not result:
