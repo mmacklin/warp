@@ -154,18 +154,14 @@ WP_API void wp_apic_record_host_memset(void* dst, int value, size_t size);
 // Must be called AFTER execution so the full dst content can be captured as inline data.
 WP_API void wp_apic_record_host_memtile(void* dst, size_t total_size);
 
-// Launch a host kernel with optional APIC recording.
-// Mirrors wp_cuda_launch_kernel() for CPU function pointers.
-// bounds: pointer to launch_bounds_t; args: pointer to packed args struct;
-// adj_args: NULL for forward pass, pointer to adjoint args for backward;
-// args_size: sizeof the args struct (for potential recording);
-// apic_info: NULL when not capturing, otherwise APIC launch info.
-WP_API void wp_launch_host_kernel(
+// Record a CPU kernel launch to the active APIC state.
+// Called from Python before the kernel is invoked via ctypes (which handles
+// the by-value launch_bounds_t<N> calling convention correctly).
+// bounds: pointer to launch_bounds_t<N>; ndim: N (so C++ knows the layout).
+WP_API void wp_apic_record_cpu_launch(
     void* kernel_fn,
     void* bounds,
-    void* args,
-    void* adj_args,
-    size_t args_size,
+    int ndim,
     const APICLaunchInfo* apic_info
 );
 

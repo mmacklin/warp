@@ -1836,43 +1836,79 @@ void wp_apic_set_cpu_mode(APICState state)
         state->is_cpu = true;
 }
 
-// CPU kernel function pointer types - launch_bounds_t is passed by VALUE
-typedef void (*cpu_fwd_fn_t)(apic_launch_bounds_t, void*);
-typedef void (*cpu_bwd_fn_t)(apic_launch_bounds_t, void*, void*);
+// CPU kernel function pointer types, one per launch dimension.
+typedef void (*cpu_fwd_1d_fn_t)(wp::launch_bounds_t<1>, void*);
+typedef void (*cpu_fwd_2d_fn_t)(wp::launch_bounds_t<2>, void*);
+typedef void (*cpu_fwd_3d_fn_t)(wp::launch_bounds_t<3>, void*);
+typedef void (*cpu_fwd_4d_fn_t)(wp::launch_bounds_t<4>, void*);
+typedef void (*cpu_bwd_1d_fn_t)(wp::launch_bounds_t<1>, void*, void*);
+typedef void (*cpu_bwd_2d_fn_t)(wp::launch_bounds_t<2>, void*, void*);
+typedef void (*cpu_bwd_3d_fn_t)(wp::launch_bounds_t<3>, void*, void*);
+typedef void (*cpu_bwd_4d_fn_t)(wp::launch_bounds_t<4>, void*, void*);
 
-void wp_launch_host_kernel(
+// Helper: construct launch_bounds_t<N> from recorded shape/size and call function
+template <int N>
+static void apic_call_cpu_fwd(void* fn, const int* shape, size_t size, void* args)
+{
+    wp::launch_bounds_t<N> bounds;
+    for (int d = 0; d < N; d++) bounds.shape[d] = shape[d];
+    bounds.size = size;
+    bounds.tiled = false;
+    reinterpret_cast<void(*)(wp::launch_bounds_t<N>, void*)>(fn)(bounds, args);
+}
+
+template <int N>
+static void apic_call_cpu_bwd(void* fn, const int* shape, size_t size, void* args, void* adj_args)
+{
+    wp::launch_bounds_t<N> bounds;
+    for (int d = 0; d < N; d++) bounds.shape[d] = shape[d];
+    bounds.size = size;
+    bounds.tiled = false;
+    reinterpret_cast<void(*)(wp::launch_bounds_t<N>, void*, void*)>(fn)(bounds, args, adj_args);
+}
+
+// Helper: extract shape and size from a launch_bounds_t<N> given N
+static void apic_parse_launch_bounds(const void* bounds, int ndim, int* out_shape, size_t* out_size)
+{
+    // launch_bounds_t<N> layout: int shape[N], size_t size, bool tiled
+    const int* shape_ptr = reinterpret_cast<const int*>(bounds);
+    for (int d = 0; d < ndim && d < APIC_LAUNCH_MAX_DIMS; d++)
+        out_shape[d] = shape_ptr[d];
+
+    // size follows shape[N] — need to account for alignment padding before size_t
+    // shape is N ints; size_t is 8-byte aligned
+    size_t shape_bytes = ndim * sizeof(int);
+    size_t size_offset = (shape_bytes + sizeof(size_t) - 1) & ~(sizeof(size_t) - 1);
+    *out_size = *reinterpret_cast<const size_t*>(reinterpret_cast<const uint8_t*>(bounds) + size_offset);
+}
+
+void wp_apic_record_cpu_launch(
     void* kernel_fn,
     void* bounds,
-    void* args,
-    void* adj_args,
-    size_t args_size,
+    int ndim,
     const APICLaunchInfo* apic_info)
 {
-    const apic_launch_bounds_t* b = reinterpret_cast<const apic_launch_bounds_t*>(bounds);
+    if (!apic_is_recording(g_apic_state) || !apic_info)
+        return;
 
-    // Record if APIC is active
-    if (apic_is_recording(g_apic_state) && apic_info) {
-        apic_record_kernel_launch(
-            g_apic_state,
-            kernel_fn,
-            b->size,
-            b->shape,
-            b->ndim,
-            0,     // max_blocks (not used for CPU)
-            1,     // block_dim (single thread for CPU)
-            0,     // smem_bytes (not used for CPU)
-            apic_info->is_forward != 0,
-            apic_info->kernel_key,
-            apic_info->module_hash,
-            apic_info->params,
-            apic_info->num_params);
-    }
+    int shape[APIC_LAUNCH_MAX_DIMS] = {};
+    size_t dim = 0;
+    apic_parse_launch_bounds(bounds, ndim, shape, &dim);
 
-    // Execute the kernel - pass launch_bounds_t by value (matches CPU kernel ABI)
-    if (adj_args)
-        ((cpu_bwd_fn_t)kernel_fn)(*b, args, adj_args);
-    else
-        ((cpu_fwd_fn_t)kernel_fn)(*b, args);
+    apic_record_kernel_launch(
+        g_apic_state,
+        kernel_fn,
+        dim,
+        shape,
+        ndim,
+        0,     // max_blocks (not used for CPU)
+        1,     // block_dim (single thread for CPU)
+        0,     // smem_bytes (not used for CPU)
+        apic_info->is_forward != 0,
+        apic_info->kernel_key,
+        apic_info->module_hash,
+        apic_info->params,
+        apic_info->num_params);
 }
 
 void wp_apic_register_host_function(APICState state, const char* kernel_key, void* forward_fn, void* backward_fn)
@@ -1987,13 +2023,20 @@ int wp_apic_replay_host_ops(APICState state)
                 return 0;
             }
 
-            // Build launch bounds
-            apic_launch_bounds_t bounds = {};
-            bounds.ndim = rec->ndim;
-            bounds.size = rec->size;
-            for (int d = 0; d < rec->ndim && d < APIC_LAUNCH_MAX_DIMS; d++) {
-                bounds.shape[d] = rec->shape[d];
-            }
+            // Build launch bounds matching launch_bounds_t<N> layout:
+            //   int shape[N]; size_t size; bool tiled;
+            // We construct this dynamically on the stack since N varies.
+            int ndim = rec->ndim;
+            uint8_t bounds_buf[64] = {};  // large enough for any launch_bounds_t<N>
+            int* shape_ptr = reinterpret_cast<int*>(bounds_buf);
+            for (int d = 0; d < ndim && d < APIC_LAUNCH_MAX_DIMS; d++)
+                shape_ptr[d] = rec->shape[d];
+            // size_t follows shape[N] with alignment padding
+            size_t shape_bytes = ndim * sizeof(int);
+            size_t size_offset = (shape_bytes + sizeof(size_t) - 1) & ~(sizeof(size_t) - 1);
+            *reinterpret_cast<size_t*>(bounds_buf + size_offset) = rec->size;
+            // bool tiled follows size
+            *reinterpret_cast<bool*>(bounds_buf + size_offset + sizeof(size_t)) = false;
 
             // Parse parameter bindings
             const uint8_t* params_ptr = var_data + rec->kernel_key_len + rec->module_hash_len;
@@ -2005,7 +2048,12 @@ int wp_apic_replay_host_ops(APICState state)
             if (args_buf.size() < estimated_size)
                 args_buf.resize(estimated_size);
 
-            // Call the host function - pass launch_bounds_t by value
+            // Dispatch to the correct launch_bounds_t<N> overload via template helper
+            int shape[APIC_LAUNCH_MAX_DIMS] = {};
+            for (int d = 0; d < ndim && d < APIC_LAUNCH_MAX_DIMS; d++)
+                shape[d] = rec->shape[d];
+            size_t launch_size = rec->size;
+
             if (rec->is_forward) {
                 // Forward pass: all params are forward args
                 size_t args_size = apic_build_host_args(
@@ -2019,10 +2067,17 @@ int wp_apic_replay_host_ops(APICState state)
                     wp::set_error_string("No forward function registered for: %s", key_str.c_str());
                     return 0;
                 }
-                ((cpu_fwd_fn_t)fwd)(bounds, args_buf.data());
+                switch (ndim) {
+                case 1: apic_call_cpu_fwd<1>(fwd, shape, launch_size, args_buf.data()); break;
+                case 2: apic_call_cpu_fwd<2>(fwd, shape, launch_size, args_buf.data()); break;
+                case 3: apic_call_cpu_fwd<3>(fwd, shape, launch_size, args_buf.data()); break;
+                case 4: apic_call_cpu_fwd<4>(fwd, shape, launch_size, args_buf.data()); break;
+                default:
+                    wp::set_error_string("Unsupported launch ndim %d for: %s", ndim, key_str.c_str());
+                    return 0;
+                }
             } else {
-                // Backward pass: params contain forward args followed by adjoint args.
-                // The Python Tape records backward launches with 2*N_args params.
+                // Backward pass: params contain forward args followed by adjoint args
                 void* bwd = fn_it->second.second;
                 if (!bwd) {
                     wp::set_error_string("No backward function registered for: %s", key_str.c_str());
@@ -2038,11 +2093,16 @@ int wp_apic_replay_host_ops(APICState state)
                 std::vector<uint8_t> adj_buf(args_buf.size());
                 size_t adj_size = apic_build_host_args(
                     params + half, rec->num_params - half, state, adj_buf.data(), adj_buf.size());
-                if (adj_size == 0 && (rec->num_params - half) > 0) {
-                    wp::set_error_string("Failed to reconstruct adjoint args for backward: %s", key_str.c_str());
+                (void)adj_size;
+                switch (ndim) {
+                case 1: apic_call_cpu_bwd<1>(bwd, shape, launch_size, args_buf.data(), adj_buf.data()); break;
+                case 2: apic_call_cpu_bwd<2>(bwd, shape, launch_size, args_buf.data(), adj_buf.data()); break;
+                case 3: apic_call_cpu_bwd<3>(bwd, shape, launch_size, args_buf.data(), adj_buf.data()); break;
+                case 4: apic_call_cpu_bwd<4>(bwd, shape, launch_size, args_buf.data(), adj_buf.data()); break;
+                default:
+                    wp::set_error_string("Unsupported launch ndim %d for backward: %s", ndim, key_str.c_str());
                     return 0;
                 }
-                ((cpu_bwd_fn_t)bwd)(bounds, args_buf.data(), adj_buf.data());
             }
             break;
         }

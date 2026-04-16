@@ -5293,15 +5293,13 @@ class Runtime:
             self.core.wp_apic_is_recording_active.argtypes = []
             self.core.wp_apic_is_recording_active.restype = ctypes.c_int
 
-            self.core.wp_launch_host_kernel.argtypes = [
+            self.core.wp_apic_record_cpu_launch.argtypes = [
                 ctypes.c_void_p,  # kernel_fn
                 ctypes.c_void_p,  # bounds
-                ctypes.c_void_p,  # args
-                ctypes.c_void_p,  # adj_args
-                ctypes.c_size_t,   # args_size
+                ctypes.c_int,     # ndim
                 ctypes.c_void_p,  # apic_info
             ]
-            self.core.wp_launch_host_kernel.restype = None
+            self.core.wp_apic_record_cpu_launch.restype = None
 
             self.core.wp_apic_register_host_function.argtypes = [
                 ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_void_p
@@ -8025,29 +8023,18 @@ def launch(
                     )
 
             if apic_info is not None:
-                # Route through C++ dispatch for APIC recording + execution
-                ArgsStruct, args = _build_args_struct(kernel, params)
-                if adjoint:
-                    _AdjStruct, adj_args = _build_adj_args_struct(kernel, params, len(kernel.adj.args))
-                    runtime.core.wp_launch_host_kernel(
-                        hooks.backward,
-                        ctypes.byref(params[0]),
-                        ctypes.byref(args),
-                        ctypes.byref(adj_args),
-                        ctypes.sizeof(ArgsStruct),
-                        ctypes.byref(apic_info),
-                    )
-                else:
-                    runtime.core.wp_launch_host_kernel(
-                        hooks.forward,
-                        ctypes.byref(params[0]),
-                        ctypes.byref(args),
-                        None,
-                        ctypes.sizeof(ArgsStruct),
-                        ctypes.byref(apic_info),
-                    )
-            else:
-                invoke(kernel, hooks, params, adjoint)
+                # Record the launch to C++ operation stream
+                fn = hooks.backward if adjoint else hooks.forward
+                runtime.core.wp_apic_record_cpu_launch(
+                    fn,
+                    ctypes.byref(params[0]),
+                    len(bounds.shape),
+                    ctypes.byref(apic_info),
+                )
+
+            # Execute via invoke() which correctly handles launch_bounds_t<N>
+            # by-value calling convention through ctypes
+            invoke(kernel, hooks, params, adjoint)
 
         else:
             kernel_args = [ctypes.c_void_p(ctypes.addressof(x)) for x in params]
