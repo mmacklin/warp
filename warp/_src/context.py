@@ -4051,14 +4051,10 @@ class Graph:
         self.module_execs: set[ModuleExec] = set()
         self.graph_exec: ctypes.c_void_p | None = None
         self.graph: ctypes.c_void_p | None = None
-        # APIC capture state (optional, for graphs being captured)
-        self.apic = apic
-
-        # APIC loaded state (populated when loaded from file)
-        self._params: dict = {}  # name -> binding info (size, etc.)
-        self._source_path: str | None = None  # path if loaded from file
-        self._native_graph = None  # Native C++ APIC graph handle
-        self._is_cpu_graph = False
+        self.apic = apic  # APICapture for in-process capture, or None
+        self._native_graph = None  # C++ APICGraphInternal handle for loaded graphs
+        self._params: dict = {}  # name -> binding info (for loaded graphs)
+        self._source_path: str | None = None
 
     @classmethod
     def load(cls, path: str, device: Device = None) -> Graph:
@@ -4094,7 +4090,6 @@ class Graph:
         graph = cls(device)
         graph._source_path = str(base_path)
         graph._native_graph = native_graph
-        graph._is_cpu_graph = device.is_cpu
 
         # Populate params from native graph
         num_params = runtime.core.wp_apic_get_num_params(native_graph)
@@ -4156,30 +4151,26 @@ class Graph:
                 )
 
     def __del__(self):
-        if not hasattr(self, "graph") or not hasattr(self, "device"):
-            return
-
-        # For CPU graphs, just clean up APIC state
-        if getattr(self, '_is_cpu_graph', False):
-            if hasattr(self, 'apic') and self.apic is not None:
-                self.apic.destroy()
-            return
-
         try:
-            # use CUDA context guard to avoid side effects during garbage collection
-            with self.device.context_guard:
-                # If this is a native graph, use the native cleanup
-                if hasattr(self, "_native_graph") and self._native_graph is not None:
+            if self.device.is_cpu:
+                if self.apic is not None:
+                    self.apic.destroy()
+                if self._native_graph is not None:
                     runtime.core.wp_apic_destroy_graph(self._native_graph)
-                    # Don't clean up graph/graph_exec as they're owned by native
+                return
+
+            # CUDA cleanup
+            with self.device.context_guard:
+                if self._native_graph is not None:
+                    runtime.core.wp_apic_destroy_graph(self._native_graph)
                     return
 
                 if self.graph:
                     runtime.core.wp_cuda_graph_destroy(self.device.context, self.graph)
-                if hasattr(self, "graph_exec") and self.graph_exec is not None:
+                if self.graph_exec is not None:
                     runtime.core.wp_cuda_graph_exec_destroy(self.device.context, self.graph_exec)
         except (TypeError, AttributeError):
-            # Suppress TypeError and AttributeError when callables become None during shutdown
+            # Suppress errors when callables become None during shutdown
             pass
 
     # retain executable CUDA modules used by this graph, which prevents them from being unloaded
@@ -9025,7 +9016,6 @@ def capture_begin(
         # Use the native state pointer as a unique capture ID
         capture_id = ctypes.cast(apic_state.native_state, ctypes.c_void_p).value
         graph = Graph(device, capture_id, apic_state)
-        graph._is_cpu_graph = True
         runtime.cpu_capture = graph
         device.captures[None] = graph  # CPU has no stream key
         runtime.captures[capture_id] = graph
@@ -9501,19 +9491,15 @@ def capture_launch(graph: Graph, stream: Stream | None = None):
     """
 
     # CPU graph replay
-    if getattr(graph, '_is_cpu_graph', False):
+    if graph.device.is_cpu:
         if graph._native_graph is not None:
-            # Loaded CPU graph — replay via native loaded graph
             result = runtime.core.wp_apic_replay_loaded_host_graph(graph._native_graph)
-            if not result:
-                raise RuntimeError(f"CPU graph replay failed: {runtime.get_error_string()}")
-        elif graph.apic is not None and graph.apic.native_state is not None:
-            # In-process captured CPU graph
+        elif graph.apic is not None:
             result = runtime.core.wp_apic_replay_host_ops(graph.apic.native_state)
-            if not result:
-                raise RuntimeError(f"CPU graph replay failed: {runtime.get_error_string()}")
         else:
             raise RuntimeError("CPU graph has no recorded operations")
+        if not result:
+            raise RuntimeError(f"CPU graph replay failed: {runtime.get_error_string()}")
         return
 
     if stream is not None:

@@ -42,7 +42,7 @@ class TestCPUGraph(unittest.TestCase):
         wp.capture_begin(device=device)
         graph = wp.capture_end(device=device)
         self.assertIsNotNone(graph)
-        self.assertTrue(graph._is_cpu_graph)
+        self.assertTrue(graph.device.is_cpu)
 
     def test_cpu_single_kernel(self):
         """Test capture and replay of a single CPU kernel."""
