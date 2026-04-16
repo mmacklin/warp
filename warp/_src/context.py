@@ -5332,16 +5332,15 @@ class Runtime:
             self.core.wp_apic_get_param_size.restype = ctypes.c_size_t
 
             # CPU graph support
-            self.core.wp_apic_record_launch.argtypes = [
+            self.core.wp_launch_host_kernel.argtypes = [
                 ctypes.c_void_p,  # kernel_fn
                 ctypes.c_void_p,  # bounds
-                ctypes.c_size_t,  # dim
-                ctypes.c_int,     # max_blocks
-                ctypes.c_int,     # block_dim
-                ctypes.c_int,     # smem_bytes
+                ctypes.c_int,     # ndim
+                ctypes.c_void_p,  # args
+                ctypes.c_void_p,  # adj_args
                 ctypes.c_void_p,  # apic_info
             ]
-            self.core.wp_apic_record_launch.restype = None
+            self.core.wp_launch_host_kernel.restype = None
 
             self.core.wp_apic_register_host_function.argtypes = [
                 ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_void_p
@@ -8049,7 +8048,7 @@ def launch(
                 return launch
 
             # Check for active CPU capture
-            apic_info = None
+            apic_info_ptr = None
             if runtime.cpu_capture is not None:
                 graph = runtime.cpu_capture
                 graph.retain_module_exec(module_exec)
@@ -8063,6 +8062,7 @@ def launch(
                     adjoint=adjoint,
                 )
                 apic_info = graph.apic.build_launch_info(apic_launch, inputs=inputs, outputs=outputs)
+                apic_info_ptr = ctypes.byref(apic_info)
                 # Register host function for native replay
                 runtime.core.wp_apic_register_host_function(
                     graph.apic.native_state,
@@ -8071,22 +8071,20 @@ def launch(
                     hooks.backward if hooks.backward else None,
                 )
 
-            if apic_info is not None:
-                # Record the launch to C++ operation stream
-                fn = hooks.backward if adjoint else hooks.forward
-                runtime.core.wp_apic_record_launch(
-                    fn,
-                    ctypes.byref(params[0]),
-                    bounds.size,
-                    0,  # max_blocks (not used for CPU)
-                    1,  # block_dim (single thread for CPU)
-                    0,  # smem_bytes (not used for CPU)
-                    ctypes.byref(apic_info),
+            # Build args struct and dispatch through C++ (records + executes)
+            ArgsStruct, args = _build_args_struct(kernel, params)
+            fn = hooks.backward if adjoint else hooks.forward
+            if adjoint:
+                _AdjStruct, adj_args = _build_adj_args_struct(kernel, params, len(kernel.adj.args))
+                runtime.core.wp_launch_host_kernel(
+                    fn, ctypes.byref(params[0]), len(bounds.shape),
+                    ctypes.byref(args), ctypes.byref(adj_args), apic_info_ptr,
                 )
-
-            # Execute via invoke() which correctly handles launch_bounds_t<N>
-            # by-value calling convention through ctypes
-            invoke(kernel, hooks, params, adjoint)
+            else:
+                runtime.core.wp_launch_host_kernel(
+                    fn, ctypes.byref(params[0]), len(bounds.shape),
+                    ctypes.byref(args), None, apic_info_ptr,
+                )
 
         else:
             kernel_args = [ctypes.c_void_p(ctypes.addressof(x)) for x in params]

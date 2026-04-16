@@ -1988,36 +1988,56 @@ void apic_parse_launch_bounds(const void* bounds, int ndim, int* out_shape, size
     *out_size = *reinterpret_cast<const size_t*>(reinterpret_cast<const uint8_t*>(bounds) + size_offset);
 }
 
-void wp_apic_record_launch(
+void wp_launch_host_kernel(
     void* kernel_fn,
     void* bounds,
-    size_t dim,
-    int max_blocks,
-    int block_dim,
-    int smem_bytes,
+    int ndim,
+    void* args,
+    void* adj_args,
     const APICLaunchInfo* apic_info)
 {
-    if (!apic_is_recording(g_apic_state) || !apic_info)
-        return;
+    // Record if APIC capture is active
+    if (apic_is_recording(g_apic_state) && apic_info) {
+        int shape[APIC_LAUNCH_MAX_DIMS] = {};
+        size_t launch_size = 0;
+        apic_parse_launch_bounds(bounds, ndim, shape, &launch_size);
 
+        apic_record_kernel_launch(
+            g_apic_state,
+            kernel_fn,
+            launch_size,
+            shape,
+            ndim,
+            0,     // max_blocks (not used for CPU)
+            1,     // block_dim (single thread for CPU)
+            0,     // smem_bytes (not used for CPU)
+            apic_info->is_forward != 0,
+            apic_info->kernel_key,
+            apic_info->module_hash,
+            apic_info->params,
+            apic_info->num_params);
+    }
+
+    // Execute — parse bounds and dispatch by ndim to pass launch_bounds_t<N> by value
     int shape[APIC_LAUNCH_MAX_DIMS] = {};
-    size_t launch_size = 0;
-    apic_parse_launch_bounds(bounds, apic_info->ndim, shape, &launch_size);
+    size_t size = 0;
+    apic_parse_launch_bounds(bounds, ndim, shape, &size);
 
-    apic_record_kernel_launch(
-        g_apic_state,
-        kernel_fn,
-        dim,
-        shape,
-        apic_info->ndim,
-        max_blocks,
-        block_dim,
-        smem_bytes,
-        apic_info->is_forward != 0,
-        apic_info->kernel_key,
-        apic_info->module_hash,
-        apic_info->params,
-        apic_info->num_params);
+    if (adj_args) {
+        switch (ndim) {
+        case 1: apic_call_cpu_bwd<1>(kernel_fn, shape, size, args, adj_args); break;
+        case 2: apic_call_cpu_bwd<2>(kernel_fn, shape, size, args, adj_args); break;
+        case 3: apic_call_cpu_bwd<3>(kernel_fn, shape, size, args, adj_args); break;
+        case 4: apic_call_cpu_bwd<4>(kernel_fn, shape, size, args, adj_args); break;
+        }
+    } else {
+        switch (ndim) {
+        case 1: apic_call_cpu_fwd<1>(kernel_fn, shape, size, args); break;
+        case 2: apic_call_cpu_fwd<2>(kernel_fn, shape, size, args); break;
+        case 3: apic_call_cpu_fwd<3>(kernel_fn, shape, size, args); break;
+        case 4: apic_call_cpu_fwd<4>(kernel_fn, shape, size, args); break;
+        }
+    }
 }
 
 void wp_apic_register_host_function(APICState state, const char* kernel_key, void* forward_fn, void* backward_fn)
