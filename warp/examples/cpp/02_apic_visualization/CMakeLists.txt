@@ -22,8 +22,12 @@ enable_testing()
 # Find CUDA
 find_package(CUDAToolkit REQUIRED)
 
-# Find OpenGL
-find_package(OpenGL REQUIRED)
+# Find OpenGL (optional - example is skipped on headless build environments like CI)
+find_package(OpenGL)
+if(NOT OpenGL_FOUND)
+    message(STATUS "Skipping 02_apic_visualization: OpenGL not found (this is expected on headless systems)")
+    return()
+endif()
 
 # Fetch GLFW and GLAD
 include(FetchContent)
