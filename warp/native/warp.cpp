@@ -221,7 +221,11 @@ void wp_free_host(void* ptr)
 
 bool wp_memcpy_h2h(void* dest, void* src, size_t n)
 {
-    if (apic_is_recording(g_apic_state)) {
+    // Only record CPU host ops during CPU graph capture. During CUDA graph
+    // capture, host ops are not part of the graph, so let them execute
+    // normally (FEM/control-flow code relies on host operations being
+    // observable immediately).
+    if (apic_is_recording(g_apic_state) && g_apic_state->is_cpu) {
         apic_record_memcpy(g_apic_state, dest, src, n, APIC_OP_MEMCPY_H2H);
         return true;
     }
@@ -231,7 +235,7 @@ bool wp_memcpy_h2h(void* dest, void* src, size_t n)
 
 void wp_memset_host(void* dest, int value, size_t n)
 {
-    if (apic_is_recording(g_apic_state)) {
+    if (apic_is_recording(g_apic_state) && g_apic_state->is_cpu) {
         apic_record_memset(g_apic_state, dest, value, n);
         return;
     }
@@ -254,7 +258,7 @@ template <typename T> void memtile_value_host(T* dst, T value, size_t n)
 
 void wp_memtile_host(void* dst, const void* src, size_t srcsize, size_t n)
 {
-    if (apic_is_recording(g_apic_state)) {
+    if (apic_is_recording(g_apic_state) && g_apic_state->is_cpu) {
         wp_apic_record_memtile(dst, src, srcsize, n);
         return;
     }
@@ -613,7 +617,7 @@ WP_API bool wp_array_copy_host(void* dst, void* src, int dst_type, int src_type,
     if (!src || !dst)
         return false;
 
-    if (apic_is_recording(g_apic_state)) {
+    if (apic_is_recording(g_apic_state) && g_apic_state->is_cpu) {
         wp_apic_record_array_copy(dst, src, dst_type, src_type, elem_size);
         return true;
     }

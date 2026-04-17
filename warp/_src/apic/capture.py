@@ -60,6 +60,10 @@ class APICLaunchInfo(ctypes.Structure):
     Only includes fields needed to identify the kernel. Other launch parameters
     (dim, block_dim, smem_bytes) are passed directly to wp_cuda_launch_kernel(),
     and shape/ndim are in launch_bounds_t which is always args[0].
+
+    Scalar parameters larger than 64 bytes (too large to fit inline in
+    APICLaunchParam's shape + strides) have their bytes stored in scalar_data;
+    the param's shape[0] holds the byte offset into scalar_data.
     """
 
     _pack_ = 1
@@ -71,6 +75,9 @@ class APICLaunchInfo(ctypes.Structure):
         ("_pad", ctypes.c_uint8 * 2),
         ("params", ctypes.POINTER(APICLaunchParam)),
         ("num_params", ctypes.c_int32),
+        ("scalar_data", ctypes.c_void_p),  # Buffer of bytes for large scalar params (may be NULL)
+        ("scalar_data_size", ctypes.c_uint32),  # Size of scalar_data buffer
+        ("_pad2", ctypes.c_uint32),
     ]
 
 
@@ -231,10 +238,16 @@ class APICapture:
         Also automatically registers any handle pointer locations in the dtype.
 
         Returns:
-            (region_id, offset) - The region ID and byte offset within the region
+            (region_id, offset) - The region ID and byte offset within the region,
+            or (-1, 0) if the array cannot be tracked (e.g. fabricarray).
         """
         import warp
         import warp._src.context
+
+        # Non-contiguous array types (fabricarray, indexedfabricarray) don't
+        # have a single base pointer and cannot be tracked as a memory region.
+        if not hasattr(arr, "ptr") or arr.ptr is None:
+            return -1, 0
 
         # Walk the _ref chain to find base allocation
         base = arr
@@ -357,7 +370,7 @@ class APICapture:
             )
 
         # Build parameter bindings
-        launch_params = self._build_launch_params(launch, inputs, outputs)
+        launch_params, scalar_data_bytes = self._build_launch_params(launch, inputs, outputs)
 
         # Build APICLaunchInfo struct
         # Store strings as instance attributes to keep them alive
@@ -379,6 +392,16 @@ class APICapture:
             info.params = None
             info.num_params = 0
 
+        # Scalar overflow buffer (for scalars > 64 bytes)
+        if scalar_data_bytes:
+            self._current_scalar_data = (ctypes.c_uint8 * len(scalar_data_bytes)).from_buffer_copy(scalar_data_bytes)
+            info.scalar_data = ctypes.addressof(self._current_scalar_data)
+            info.scalar_data_size = len(scalar_data_bytes)
+        else:
+            self._current_scalar_data = None
+            info.scalar_data = None
+            info.scalar_data_size = 0
+
         return info
 
     def _build_launch_params(self, launch, inputs=None, outputs=None):
@@ -386,6 +409,13 @@ class APICapture:
 
         Launch bounds (shape/ndim/size) are embedded directly in the launch record.
         All other parameters starting from index 1 are captured.
+
+        Returns:
+            (params_ctypes_array, scalar_data_bytes) or (None, b"")
+            - params_ctypes_array: ctypes array of APICLaunchParam (or None if no params).
+            - scalar_data_bytes: bytes buffer holding scalar params that are too large
+              to fit inline (> 64 bytes). Each such param's shape[0] stores the byte
+              offset into this buffer.
         """
         import warp
 
@@ -402,6 +432,10 @@ class APICapture:
 
         kernel = launch.kernel
         params = []
+        # Inline storage for scalars is shape[] (32B) + strides[] (32B) = 64 bytes.
+        # Larger scalars are appended to this overflow buffer.
+        max_inline_scalar_size = ARRAY_MAX_DIMS * 8 * 2  # 64 bytes
+        scalar_overflow = bytearray()
 
         # Capture all parameters (starting from index 1, param 0 is launch_bounds)
         array_idx = 0
@@ -436,7 +470,7 @@ class APICapture:
                     param.ndim = 0
                     param.element_size = 0
             else:
-                # Scalar parameter - store value bytes in shape[] and strides[]
+                # Scalar parameter
                 param.is_array = 0
                 param.ndim = 0
                 param.region_id = -1
@@ -447,31 +481,35 @@ class APICapture:
                 scalar_size = len(value_bytes)
                 param.byte_offset = scalar_size  # Store size in byte_offset
 
-                # Store value bytes in shape[] (32 bytes) and strides[] (32 bytes)
-                max_scalar_size = ARRAY_MAX_DIMS * 8 * 2  # 64 bytes
-                if scalar_size > max_scalar_size:
-                    raise ValueError(f"Scalar parameter too large: {scalar_size} bytes (max {max_scalar_size})")
-
-                # Copy bytes into shape[] and strides[] arrays
-                shape_bytes = (ctypes.c_uint8 * (ARRAY_MAX_DIMS * 8)).from_buffer_copy(
-                    value_bytes[: min(scalar_size, ARRAY_MAX_DIMS * 8)].ljust(ARRAY_MAX_DIMS * 8, b"\x00")
-                )
-                param.shape = (ctypes.c_int64 * ARRAY_MAX_DIMS).from_buffer_copy(shape_bytes)
-
-                if scalar_size > ARRAY_MAX_DIMS * 8:
-                    strides_bytes = (ctypes.c_uint8 * (ARRAY_MAX_DIMS * 8)).from_buffer_copy(
-                        value_bytes[ARRAY_MAX_DIMS * 8 :].ljust(ARRAY_MAX_DIMS * 8, b"\x00")
+                if scalar_size <= max_inline_scalar_size:
+                    # Fast path: store inline in shape[] (32 bytes) + strides[] (32 bytes)
+                    shape_bytes = (ctypes.c_uint8 * (ARRAY_MAX_DIMS * 8)).from_buffer_copy(
+                        value_bytes[: min(scalar_size, ARRAY_MAX_DIMS * 8)].ljust(ARRAY_MAX_DIMS * 8, b"\x00")
                     )
-                    param.strides = (ctypes.c_int64 * ARRAY_MAX_DIMS).from_buffer_copy(strides_bytes)
+                    param.shape = (ctypes.c_int64 * ARRAY_MAX_DIMS).from_buffer_copy(shape_bytes)
+
+                    if scalar_size > ARRAY_MAX_DIMS * 8:
+                        strides_bytes = (ctypes.c_uint8 * (ARRAY_MAX_DIMS * 8)).from_buffer_copy(
+                            value_bytes[ARRAY_MAX_DIMS * 8 :].ljust(ARRAY_MAX_DIMS * 8, b"\x00")
+                        )
+                        param.strides = (ctypes.c_int64 * ARRAY_MAX_DIMS).from_buffer_copy(strides_bytes)
+                else:
+                    # Overflow path: byte_offset > 64 signals the bytes live in
+                    # the scalar_data buffer. shape[0] stores the offset into it.
+                    offset_in_overflow = len(scalar_overflow)
+                    scalar_overflow.extend(value_bytes)
+                    param.shape[0] = offset_in_overflow
+                    # shape[1..3] and strides[] are unused for overflow scalars;
+                    # ctypes zero-initializes them for us.
 
             params.append(param)
 
         if not params:
-            return None
+            return None, b""
 
         # Convert to ctypes array
         result = (APICLaunchParam * len(params))(*params)
-        return result
+        return result, bytes(scalar_overflow)
 
     def set_binding(self, name: str, arr):
         """Mark an array as a named parameter."""

@@ -104,6 +104,14 @@ extern "C" WP_API bool apic_rebuild_cuda_graph(APICGraphInternal* graph, CUstrea
             // Skip past strings to param bindings
             const uint8_t* params_ptr = var_data + rec->kernel_key_len + rec->module_hash_len;
 
+            // Trailing scalar overflow section (for scalars > 64 bytes).
+            // Sits immediately after the parameter records.
+            const uint8_t* scalar_data = params_ptr + rec->num_params * sizeof(APICLaunchParamRecord);
+            size_t used_so_far = sizeof(APICLaunchRecord) + rec->kernel_key_len + rec->module_hash_len
+                               + rec->num_params * sizeof(APICLaunchParamRecord);
+            size_t scalar_data_size = (rec->header.total_size > used_so_far)
+                                    ? (rec->header.total_size - used_so_far) : 0;
+
             std::vector<void*> args;
             std::vector<std::unique_ptr<uint8_t[]>> arg_storage;
 
@@ -146,18 +154,30 @@ extern "C" WP_API bool apic_rebuild_cuda_graph(APICGraphInternal* graph, CUstrea
                     args.push_back(arr_ptr);
                     arg_storage.push_back(std::move(arr));
                 } else {
-                    // Scalar parameter - value bytes are stored in shape[] and strides[]
+                    // Scalar parameter: value bytes are stored inline in shape[]/strides[]
+                    // for sizes <= 64 bytes, or in the trailing scalar_data section for
+                    // larger scalars (shape[0] holds the offset into scalar_data).
+                    constexpr size_t MAX_INLINE_SCALAR = APIC_MAX_DIMS * sizeof(int64_t) * 2;
                     size_t scalar_size = binding->byte_offset;
                     auto scalar = std::make_unique<uint8_t[]>(scalar_size);
 
-                    // Copy from shape[] (first 32 bytes) and strides[] (next 32 bytes)
-                    const uint8_t* shape_bytes = reinterpret_cast<const uint8_t*>(binding->shape);
-                    const uint8_t* strides_bytes = reinterpret_cast<const uint8_t*>(binding->strides);
-
-                    size_t first_part = std::min(scalar_size, (size_t)(APIC_MAX_DIMS * sizeof(int64_t)));
-                    memcpy(scalar.get(), shape_bytes, first_part);
-                    if (scalar_size > first_part) {
-                        memcpy(scalar.get() + first_part, strides_bytes, scalar_size - first_part);
+                    if (scalar_size > MAX_INLINE_SCALAR) {
+                        // Overflow scalar -- bytes are in trailing section.
+                        uint64_t src_off = static_cast<uint64_t>(binding->shape[0]);
+                        if (!scalar_data || src_off + scalar_size > scalar_data_size) {
+                            success = false;
+                            break;
+                        }
+                        memcpy(scalar.get(), scalar_data + src_off, scalar_size);
+                    } else {
+                        // Inline: shape[] (first 32B) + strides[] (next 32B)
+                        const uint8_t* shape_bytes = reinterpret_cast<const uint8_t*>(binding->shape);
+                        const uint8_t* strides_bytes = reinterpret_cast<const uint8_t*>(binding->strides);
+                        size_t first_part = std::min(scalar_size, (size_t)(APIC_MAX_DIMS * sizeof(int64_t)));
+                        memcpy(scalar.get(), shape_bytes, first_part);
+                        if (scalar_size > first_part) {
+                            memcpy(scalar.get() + first_part, strides_bytes, scalar_size - first_part);
+                        }
                     }
 
                     args.push_back(scalar.get());

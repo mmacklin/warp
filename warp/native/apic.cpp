@@ -267,14 +267,25 @@ void apic_record_kernel_launch(
     const char* kernel_key,
     const char* module_hash,
     const APICLaunchParam* params,
-    int num_params
+    int num_params,
+    const void* scalar_data,
+    uint32_t scalar_data_size
 )
 {
     if (!state || !state->recording)
         return;
 
-    // Build param bindings data (arrays and scalars)
+    // Inline scalar storage is 4*int64 shape + 4*int64 strides = 64 bytes.
+    // Scalars larger than that live in the scalar_data buffer (shape[0] = offset).
+    constexpr size_t MAX_INLINE_SCALAR = APIC_MAX_DIMS * sizeof(int64_t) * 2;
+
+    // Build param bindings data (arrays and scalars).
+    // For overflow scalars, we'll copy bytes into a trailing section and rewrite
+    // shape[0] to point at the record-relative offset.
     std::vector<uint8_t> params_data;
+    std::vector<uint8_t> trailing_scalar_data;
+    const uint8_t* src_scalar_data = static_cast<const uint8_t*>(scalar_data);
+
     for (int i = 0; i < num_params; i++) {
         const APICLaunchParam& param = params[i];
         APICLaunchParamRecord rec = {};
@@ -288,6 +299,33 @@ void apic_record_kernel_launch(
             rec.strides[d] = param.strides[d];
         }
         rec.element_size = param.element_size;
+
+        // Scalar overflow: byte_offset > 64 means the bytes are in scalar_data,
+        // not inline. Copy them into the trailing section and update shape[0]
+        // to the offset within the trailing section (so record is self-contained).
+        if (!param.is_array && param.byte_offset > MAX_INLINE_SCALAR) {
+            uint64_t src_off = static_cast<uint64_t>(param.shape[0]);
+            size_t scalar_size = static_cast<size_t>(param.byte_offset);
+            if (src_scalar_data && src_off + scalar_size <= scalar_data_size) {
+                size_t trailing_off = trailing_scalar_data.size();
+                trailing_scalar_data.insert(
+                    trailing_scalar_data.end(),
+                    src_scalar_data + src_off,
+                    src_scalar_data + src_off + scalar_size);
+                rec.shape[0] = static_cast<int64_t>(trailing_off);
+                // shape[1..3] and strides[] remain zero for overflow scalars.
+                for (int d = 1; d < APIC_MAX_DIMS; d++)
+                    rec.shape[d] = 0;
+                for (int d = 0; d < APIC_MAX_DIMS; d++)
+                    rec.strides[d] = 0;
+            } else {
+                fprintf(stderr,
+                    "APIC: Warning - scalar overflow of %zu bytes at offset %llu exceeds scalar_data (%u bytes)\n",
+                    scalar_size, (unsigned long long)src_off, scalar_data_size);
+                rec.byte_offset = 0;  // mark as empty scalar so replay skips it
+            }
+        }
+
         size_t off = params_data.size();
         params_data.resize(off + sizeof(rec));
         memcpy(params_data.data() + off, &rec, sizeof(rec));
@@ -295,7 +333,8 @@ void apic_record_kernel_launch(
 
     size_t key_len = kernel_key ? strlen(kernel_key) : 0;
     size_t hash_len = module_hash ? strlen(module_hash) : 0;
-    uint32_t total_size = sizeof(APICLaunchRecord) + key_len + hash_len + params_data.size();
+    uint32_t total_size = static_cast<uint32_t>(
+        sizeof(APICLaunchRecord) + key_len + hash_len + params_data.size() + trailing_scalar_data.size());
 
     // Build launch record with embedded launch bounds
     APICLaunchRecord rec = {};
@@ -316,7 +355,7 @@ void apic_record_kernel_launch(
     rec.module_hash_len = static_cast<uint16_t>(hash_len);
     rec.num_params = static_cast<uint16_t>(num_params);
 
-    // Append to operation stream
+    // Append to operation stream: header, kernel_key, module_hash, params, scalar_data.
     state->append_bytes(&rec, sizeof(rec));
     if (key_len > 0)
         state->append_bytes(kernel_key, key_len);
@@ -324,6 +363,8 @@ void apic_record_kernel_launch(
         state->append_bytes(module_hash, hash_len);
     if (!params_data.empty())
         state->append_bytes(params_data.data(), params_data.size());
+    if (!trailing_scalar_data.empty())
+        state->append_bytes(trailing_scalar_data.data(), trailing_scalar_data.size());
 
     state->operation_count++;
 }
@@ -1547,7 +1588,9 @@ void wp_launch_host_kernel(
             apic_info->kernel_key,
             apic_info->module_hash,
             apic_info->params,
-            apic_info->num_params);
+            apic_info->num_params,
+            apic_info->scalar_data,
+            apic_info->scalar_data_size);
         return;
     }
 
@@ -1583,15 +1626,20 @@ void wp_apic_register_host_function(APICState state, const char* kernel_key, voi
 // Build a CPU kernel args struct from APIC parameter records.
 // Returns the total size written to args_buf.
 // For arrays, builds array_t with resolved data pointer via g->resolve_region_ptr().
-// For scalars, copies inline value bytes.
+// For scalars, copies inline value bytes (<=64B) or bytes from scalar_data (>64B).
+// scalar_data points to the trailing scalar section within the launch record
+// (immediately after the parameter records); may be NULL if no overflow scalars.
 // Works for both recording state and loaded graph (unified struct).
 static size_t apic_build_host_args(
     const APICLaunchParamRecord* params,
     int num_params,
     const APICGraphInternal* g,
     uint8_t* args_buf,
-    size_t buf_capacity)
+    size_t buf_capacity,
+    const uint8_t* scalar_data,
+    size_t scalar_data_size)
 {
+    constexpr size_t MAX_INLINE_SCALAR = APIC_MAX_DIMS * sizeof(int64_t) * 2;
     size_t offset = 0;
 
     for (int j = 0; j < num_params; j++) {
@@ -1635,13 +1683,24 @@ static size_t apic_build_host_args(
             if (offset + scalar_size > buf_capacity)
                 return 0;
 
-            // Scalar bytes stored in shape[] (first 32B) and strides[] (next 32B)
-            const uint8_t* shape_bytes = reinterpret_cast<const uint8_t*>(p.shape);
-            const uint8_t* strides_bytes = reinterpret_cast<const uint8_t*>(p.strides);
-            size_t first_part = std::min(scalar_size, (size_t)(APIC_MAX_DIMS * sizeof(int64_t)));
-            memcpy(args_buf + offset, shape_bytes, first_part);
-            if (scalar_size > first_part) {
-                memcpy(args_buf + offset + first_part, strides_bytes, scalar_size - first_part);
+            if (scalar_size > MAX_INLINE_SCALAR) {
+                // Overflow scalar: bytes live in the trailing scalar_data section.
+                // shape[0] is the offset into scalar_data.
+                uint64_t src_off = static_cast<uint64_t>(p.shape[0]);
+                if (!scalar_data || src_off + scalar_size > scalar_data_size) {
+                    // Corrupt record: bail out.
+                    return 0;
+                }
+                memcpy(args_buf + offset, scalar_data + src_off, scalar_size);
+            } else {
+                // Inline scalar: bytes stored in shape[] (first 32B) and strides[] (next 32B).
+                const uint8_t* shape_bytes = reinterpret_cast<const uint8_t*>(p.shape);
+                const uint8_t* strides_bytes = reinterpret_cast<const uint8_t*>(p.strides);
+                size_t first_part = std::min(scalar_size, (size_t)(APIC_MAX_DIMS * sizeof(int64_t)));
+                memcpy(args_buf + offset, shape_bytes, first_part);
+                if (scalar_size > first_part) {
+                    memcpy(args_buf + offset + first_part, strides_bytes, scalar_size - first_part);
+                }
             }
             offset += scalar_size;
         }
@@ -1690,15 +1749,24 @@ static int apic_replay_cpu_ops(APICGraphInternal* g)
             const APICLaunchParamRecord* params
                 = reinterpret_cast<const APICLaunchParamRecord*>(params_ptr);
 
-            // Ensure args buffer is large enough
-            size_t estimated_size = rec->num_params * (WP_ARRAY_T_SIZE + 8);
+            // Trailing scalar overflow section (if any) sits after the params array.
+            // Its size is whatever total_size has left over.
+            const uint8_t* scalar_data = params_ptr + rec->num_params * sizeof(APICLaunchParamRecord);
+            size_t used_so_far = sizeof(APICLaunchRecord) + rec->kernel_key_len + rec->module_hash_len
+                               + rec->num_params * sizeof(APICLaunchParamRecord);
+            size_t scalar_data_size = (rec->header.total_size > used_so_far)
+                                    ? (rec->header.total_size - used_so_far) : 0;
+
+            // Ensure args buffer is large enough (include space for overflow scalars).
+            size_t estimated_size = rec->num_params * (WP_ARRAY_T_SIZE + 8) + scalar_data_size;
             if (args_buf.size() < estimated_size)
                 args_buf.resize(estimated_size);
 
             if (rec->is_forward) {
                 // Forward pass: all params are forward args
                 size_t args_size = apic_build_host_args(
-                    params, rec->num_params, g, args_buf.data(), args_buf.size());
+                    params, rec->num_params, g, args_buf.data(), args_buf.size(),
+                    scalar_data, scalar_data_size);
                 if (args_size == 0 && rec->num_params > 0) {
                     wp::set_error_string("Failed to reconstruct kernel args for: %s", key_str.c_str());
                     return 0;
@@ -1726,14 +1794,16 @@ static int apic_replay_cpu_ops(APICGraphInternal* g)
                 }
                 int half = rec->num_params / 2;
                 size_t fwd_size = apic_build_host_args(
-                    params, half, g, args_buf.data(), args_buf.size());
+                    params, half, g, args_buf.data(), args_buf.size(),
+                    scalar_data, scalar_data_size);
                 if (fwd_size == 0 && half > 0) {
                     wp::set_error_string("Failed to reconstruct forward args for backward: %s", key_str.c_str());
                     return 0;
                 }
                 std::vector<uint8_t> adj_buf(args_buf.size());
                 size_t adj_size = apic_build_host_args(
-                    params + half, rec->num_params - half, g, adj_buf.data(), adj_buf.size());
+                    params + half, rec->num_params - half, g, adj_buf.data(), adj_buf.size(),
+                    scalar_data, scalar_data_size);
                 (void)adj_size;
                 switch (ndim) {
                 case 1: apic_call_cpu_bwd<1>(bwd, shape, launch_size, args_buf.data(), adj_buf.data()); break;

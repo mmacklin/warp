@@ -9590,8 +9590,16 @@ def _track_array_for_capture(arr):
 
     This ensures APIC can resolve the array's memory pointer to a region ID
     when native hooks record operations like memset, memtile, or array_copy.
+
+    Only contiguous arrays (with a ``.ptr`` attribute) are tracked.
+    Non-contiguous array types (fabricarray, indexedfabricarray) have
+    distributed/indexed storage and are handled by the strided array_copy path.
     """
     if runtime is None:
+        return
+    # Skip arrays without a ptr attribute (e.g. fabricarray / indexedfabricarray).
+    # These use different memory backing that cannot be resolved to a single region.
+    if not hasattr(arr, "ptr") or arr.ptr is None:
         return
     # CPU capture
     if runtime.cpu_capture is not None:

@@ -4573,7 +4573,7 @@ size_t wp_cuda_launch_kernel(
         apic_record_kernel_launch(
             g_apic_state, kernel, dim, shape, apic_info->ndim, max_blocks, block_dim, shared_memory_bytes,
             apic_info->is_forward != 0, apic_info->kernel_key, apic_info->module_hash, apic_info->params,
-            apic_info->num_params);
+            apic_info->num_params, apic_info->scalar_data, apic_info->scalar_data_size);
     }
 
     if (block_dim <= 0) {

@@ -341,6 +341,8 @@ extern thread_local APICState g_apic_state;
 bool apic_is_recording(APICState state);
 
 // Internal recording functions (called from wp_cuda_launch_kernel, wp_memcpy_*, etc.)
+// scalar_data: optional trailing buffer for scalar params larger than 64 bytes
+//   (each such param's shape[0] holds the byte offset into scalar_data).
 void apic_record_kernel_launch(
     APICGraphInternal* state,
     void* kernel,
@@ -354,7 +356,9 @@ void apic_record_kernel_launch(
     const char* kernel_key,
     const char* module_hash,
     const APICLaunchParam* params,
-    int num_params
+    int num_params,
+    const void* scalar_data,
+    uint32_t scalar_data_size
 );
 
 void apic_record_memcpy(APICGraphInternal* state, void* dst, void* src, size_t size, APICOpType kind);

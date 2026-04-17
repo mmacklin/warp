@@ -274,6 +274,10 @@ typedef APICLaunchParamRecord APICLaunchParam;
 // Only includes fields needed to identify the kernel - other launch parameters
 // (dim, block_dim, smem_bytes) are passed directly to wp_cuda_launch_kernel(),
 // and shape/ndim are in launch_bounds_t which is always args[0].
+//
+// For scalar parameters larger than 64 bytes (cannot fit inline in
+// APICLaunchParam::shape + strides), the bytes live in the scalar_data buffer.
+// Each such param's shape[0] holds the byte offset into scalar_data.
 typedef struct {
     const char* kernel_key;  // Kernel identifier string
     const char* module_hash;  // Module hash string
@@ -282,6 +286,9 @@ typedef struct {
     uint8_t _pad[2];
     const APICLaunchParam* params;  // Array of parameter bindings
     int32_t num_params;  // Number of parameter bindings
+    const void* scalar_data;  // Buffer of bytes for scalar params that overflow inline storage (may be NULL)
+    uint32_t scalar_data_size;  // Size of scalar_data buffer in bytes
+    uint32_t _pad2;
 } APICLaunchInfo;
 
 #pragma pack(pop)
