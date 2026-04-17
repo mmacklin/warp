@@ -1,9 +1,13 @@
+---
+orphan: true
+---
+
 # APIC (API Capture) Design Document
 ## CUDA Graph Capture, Serialization, and Replay for Warp
 
-### Version: 1.6
-### Date: February 2026
-### Status: Implemented (Phases 1-4 Complete, Mesh Serialization)
+**Version:** 1.6
+**Date:** February 2026
+**Status:** Implemented (Phases 1-4 Complete, Mesh Serialization)
 
 ---
 
