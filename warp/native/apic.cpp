@@ -1020,10 +1020,10 @@ static void apic_fixup_ptr_locations(APICGraphInternal* graph)
                 uint8_t* device_ptr = base + loc.offset;
                 if (graph->is_cpu) {
                     // Direct host memory access
-                    uint64_t old_val = *(uint64_t*)device_ptr;
+                    uint64_t old_val = *reinterpret_cast<uint64_t*>(device_ptr);
                     auto remap_it = graph->handle_ptr_remap.find(old_val);
                     if (remap_it != graph->handle_ptr_remap.end()) {
-                        *(uint64_t*)device_ptr = remap_it->second;
+                        *reinterpret_cast<uint64_t*>(device_ptr) = remap_it->second;
                     }
                 } else {
 #if WP_ENABLE_CUDA
@@ -1043,10 +1043,10 @@ static void apic_fixup_ptr_locations(APICGraphInternal* graph)
                 uint8_t* device_ptr = base + off;
                 if (graph->is_cpu) {
                     // Direct host memory access
-                    uint64_t old_val = *(uint64_t*)device_ptr;
+                    uint64_t old_val = *reinterpret_cast<uint64_t*>(device_ptr);
                     auto remap_it = graph->handle_ptr_remap.find(old_val);
                     if (remap_it != graph->handle_ptr_remap.end()) {
-                        *(uint64_t*)device_ptr = remap_it->second;
+                        *reinterpret_cast<uint64_t*>(device_ptr) = remap_it->second;
                     }
                 } else {
 #if WP_ENABLE_CUDA

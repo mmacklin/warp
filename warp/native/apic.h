@@ -240,10 +240,10 @@ struct APICKernel {
 
 // Memory region info (used for both recording and loaded state)
 struct APICRegion {
-    uint32_t region_id;
-    uint64_t base_ptr;  // Original device pointer during recording
-    uint64_t size;
-    uint32_t element_size;
+    uint32_t region_id = 0;
+    uint64_t base_ptr = 0;  // Original device pointer during recording
+    uint64_t size = 0;
+    uint32_t element_size = 0;
     std::vector<uint8_t> initial_data;  // For internal regions during recording
     void* ptr = nullptr;  // Allocated device pointer after loading
 };
