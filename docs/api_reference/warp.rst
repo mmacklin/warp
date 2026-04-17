@@ -53,6 +53,7 @@ Scalars
    float16
    float32
    float64
+   handle
    int8
    int16
    int32
@@ -413,6 +414,8 @@ CUDA Graph Management
    capture_end
    capture_if
    capture_launch
+   capture_load
+   capture_save
    capture_while
    is_conditional_graph_supported
 
