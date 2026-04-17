@@ -104,7 +104,7 @@ class TestCPUGraph(unittest.TestCase):
 
         # Replay 5 times - each should increment by 1
         # (capture itself does NOT execute, matching CUDA graph semantics)
-        for i in range(5):
+        for _i in range(5):
             wp.capture_launch(graph)
 
         # 5 replays = 5 increments (capture phase is record-only)
@@ -164,7 +164,6 @@ class TestCPUGraph(unittest.TestCase):
 
         expected = np.ones(n) * 21.0
         np.testing.assert_allclose(b.numpy(), expected)
-
 
     def test_cpu_strided_copy(self):
         """Test capture and replay with non-contiguous (strided) wp.copy()."""

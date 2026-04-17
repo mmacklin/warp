@@ -11,11 +11,11 @@
 
 #include "warp.h"  // includes apic.h, apic_types.h, builtin.h
 
-#include <algorithm>  // For std::replace (Windows path fix), std::min
-#include <memory>  // For std::make_unique, std::unique_ptr
-
 #include "error.h"  // For wp::set_error_string
 #include "mesh.h"  // For wp::Mesh, wp::g_mesh_descriptors
+
+#include <algorithm>  // For std::replace (Windows path fix), std::min
+#include <memory>  // For std::make_unique, std::unique_ptr
 
 // Helper to check if APIC is recording (hides struct internals from other TUs)
 bool apic_is_recording(APICGraphInternal* state) { return state && state->recording; }
@@ -36,16 +36,19 @@ APICGraphInternal::~APICGraphInternal()
             cudaGraphDestroy((cudaGraph_t)cuda_graph);
         if (!is_cpu) {
             for (auto& pair : regions)
-                if (pair.second.ptr) cudaFree(pair.second.ptr);
+                if (pair.second.ptr)
+                    cudaFree(pair.second.ptr);
         }
         for (auto& pair : modules)
-            if (pair.second.cuda_module) cuModuleUnload_f(pair.second.cuda_module);
+            if (pair.second.cuda_module)
+                cuModuleUnload_f(pair.second.cuda_module);
     }
 #endif
     // CPU loaded graph cleanup (regions allocated with malloc)
     if (is_cpu) {
         for (auto& pair : regions)
-            if (pair.second.ptr) free(pair.second.ptr);
+            if (pair.second.ptr)
+                free(pair.second.ptr);
     }
     // Recording state doesn't own any allocated memory (arrays belong to Python)
 }
@@ -226,7 +229,8 @@ void wp_apic_register_binding(APICState state, const char* name, uint32_t region
 #if WP_ENABLE_CUDA
                 // CUDA: device-to-host copy
                 cudaError_t err = cudaMemcpy(
-                    region.initial_data.data(), (void*)region.base_ptr, region.size, cudaMemcpyDeviceToHost);
+                    region.initial_data.data(), (void*)region.base_ptr, region.size, cudaMemcpyDeviceToHost
+                );
                 if (err != cudaSuccess) {
                     fprintf(stderr, "APIC: Warning - failed to capture data for bound region '%s': %d\n", name, err);
                     region.initial_data.clear();
@@ -309,9 +313,8 @@ void apic_record_kernel_launch(
             if (src_scalar_data && src_off + scalar_size <= scalar_data_size) {
                 size_t trailing_off = trailing_scalar_data.size();
                 trailing_scalar_data.insert(
-                    trailing_scalar_data.end(),
-                    src_scalar_data + src_off,
-                    src_scalar_data + src_off + scalar_size);
+                    trailing_scalar_data.end(), src_scalar_data + src_off, src_scalar_data + src_off + scalar_size
+                );
                 rec.shape[0] = static_cast<int64_t>(trailing_off);
                 // shape[1..3] and strides[] remain zero for overflow scalars.
                 for (int d = 1; d < APIC_MAX_DIMS; d++)
@@ -319,9 +322,11 @@ void apic_record_kernel_launch(
                 for (int d = 0; d < APIC_MAX_DIMS; d++)
                     rec.strides[d] = 0;
             } else {
-                fprintf(stderr,
+                fprintf(
+                    stderr,
                     "APIC: Warning - scalar overflow of %zu bytes at offset %llu exceeds scalar_data (%u bytes)\n",
-                    scalar_size, (unsigned long long)src_off, scalar_data_size);
+                    scalar_size, (unsigned long long)src_off, scalar_data_size
+                );
                 rec.byte_offset = 0;  // mark as empty scalar so replay skips it
             }
         }
@@ -334,7 +339,8 @@ void apic_record_kernel_launch(
     size_t key_len = kernel_key ? strlen(kernel_key) : 0;
     size_t hash_len = module_hash ? strlen(module_hash) : 0;
     uint32_t total_size = static_cast<uint32_t>(
-        sizeof(APICLaunchRecord) + key_len + hash_len + params_data.size() + trailing_scalar_data.size());
+        sizeof(APICLaunchRecord) + key_len + hash_len + params_data.size() + trailing_scalar_data.size()
+    );
 
     // Build launch record with embedded launch bounds
     APICLaunchRecord rec = {};
@@ -1182,8 +1188,9 @@ APICGraph wp_apic_load_graph(void* context, const char* path)
         for (auto& pair : graph->regions) {
             void* host_ptr = malloc(pair.second.size);
             if (!host_ptr) {
-                wp::set_error_string("Failed to allocate %llu bytes for CPU region",
-                    (unsigned long long)pair.second.size);
+                wp::set_error_string(
+                    "Failed to allocate %llu bytes for CPU region", (unsigned long long)pair.second.size
+                );
                 delete graph;
                 return nullptr;
             }
@@ -1235,7 +1242,9 @@ APICGraph wp_apic_load_graph(void* context, const char* path)
                 void* device_ptr = nullptr;
                 cudaError_t err = cudaMalloc(&device_ptr, pair.second.size);
                 if (err != cudaSuccess) {
-                    wp::set_error_string("Failed to allocate %llu bytes: %d", (unsigned long long)pair.second.size, err);
+                    wp::set_error_string(
+                        "Failed to allocate %llu bytes: %d", (unsigned long long)pair.second.size, err
+                    );
                     delete graph;
                     return nullptr;
                 }
@@ -1471,8 +1480,10 @@ void wp_apic_record_array_copy(void* dst, void* src, int dst_type, int src_type,
 
     // Only support regular arrays for now
     if (dst_type != wp::ARRAY_TYPE_REGULAR || src_type != wp::ARRAY_TYPE_REGULAR) {
-        fprintf(stderr, "APIC: Warning - array_copy with non-regular array types (%d, %d) not recorded\n",
-                dst_type, src_type);
+        fprintf(
+            stderr, "APIC: Warning - array_copy with non-regular array types (%d, %d) not recorded\n", dst_type,
+            src_type
+        );
         return;
     }
 
@@ -1526,24 +1537,24 @@ typedef void (*cpu_bwd_3d_fn_t)(wp::launch_bounds_t<3>, void*, void*);
 typedef void (*cpu_bwd_4d_fn_t)(wp::launch_bounds_t<4>, void*, void*);
 
 // Helper: construct launch_bounds_t<N> from recorded shape/size and call function
-template <int N>
-static void apic_call_cpu_fwd(void* fn, const int* shape, size_t size, void* args)
+template <int N> static void apic_call_cpu_fwd(void* fn, const int* shape, size_t size, void* args)
 {
     wp::launch_bounds_t<N> bounds;
-    for (int d = 0; d < N; d++) bounds.shape[d] = shape[d];
+    for (int d = 0; d < N; d++)
+        bounds.shape[d] = shape[d];
     bounds.size = size;
     bounds.tiled = false;
-    reinterpret_cast<void(*)(wp::launch_bounds_t<N>, void*)>(fn)(bounds, args);
+    reinterpret_cast<void (*)(wp::launch_bounds_t<N>, void*)>(fn)(bounds, args);
 }
 
-template <int N>
-static void apic_call_cpu_bwd(void* fn, const int* shape, size_t size, void* args, void* adj_args)
+template <int N> static void apic_call_cpu_bwd(void* fn, const int* shape, size_t size, void* args, void* adj_args)
 {
     wp::launch_bounds_t<N> bounds;
-    for (int d = 0; d < N; d++) bounds.shape[d] = shape[d];
+    for (int d = 0; d < N; d++)
+        bounds.shape[d] = shape[d];
     bounds.size = size;
     bounds.tiled = false;
-    reinterpret_cast<void(*)(wp::launch_bounds_t<N>, void*, void*)>(fn)(bounds, args, adj_args);
+    reinterpret_cast<void (*)(wp::launch_bounds_t<N>, void*, void*)>(fn)(bounds, args, adj_args);
 }
 
 // Helper: extract shape and size from a launch_bounds_t<N> given N
@@ -1562,12 +1573,8 @@ void apic_parse_launch_bounds(const void* bounds, int ndim, int* out_shape, size
 }
 
 void wp_launch_host_kernel(
-    void* kernel_fn,
-    void* bounds,
-    int ndim,
-    void* args,
-    void* adj_args,
-    const APICLaunchInfo* apic_info)
+    void* kernel_fn, void* bounds, int ndim, void* args, void* adj_args, const APICLaunchInfo* apic_info
+)
 {
     // If recording, just record the op and return (matching CUDA graph capture semantics)
     if (apic_is_recording(g_apic_state) && apic_info) {
@@ -1576,21 +1583,13 @@ void wp_launch_host_kernel(
         apic_parse_launch_bounds(bounds, ndim, shape, &launch_size);
 
         apic_record_kernel_launch(
-            g_apic_state,
-            kernel_fn,
-            launch_size,
-            shape,
-            ndim,
-            0,     // max_blocks (not used for CPU)
-            1,     // block_dim (single thread for CPU)
-            0,     // smem_bytes (not used for CPU)
-            apic_info->is_forward != 0,
-            apic_info->kernel_key,
-            apic_info->module_hash,
-            apic_info->params,
-            apic_info->num_params,
-            apic_info->scalar_data,
-            apic_info->scalar_data_size);
+            g_apic_state, kernel_fn, launch_size, shape, ndim,
+            0,  // max_blocks (not used for CPU)
+            1,  // block_dim (single thread for CPU)
+            0,  // smem_bytes (not used for CPU)
+            apic_info->is_forward != 0, apic_info->kernel_key, apic_info->module_hash, apic_info->params,
+            apic_info->num_params, apic_info->scalar_data, apic_info->scalar_data_size
+        );
         return;
     }
 
@@ -1601,17 +1600,33 @@ void wp_launch_host_kernel(
 
     if (adj_args) {
         switch (ndim) {
-        case 1: apic_call_cpu_bwd<1>(kernel_fn, shape, size, args, adj_args); break;
-        case 2: apic_call_cpu_bwd<2>(kernel_fn, shape, size, args, adj_args); break;
-        case 3: apic_call_cpu_bwd<3>(kernel_fn, shape, size, args, adj_args); break;
-        case 4: apic_call_cpu_bwd<4>(kernel_fn, shape, size, args, adj_args); break;
+        case 1:
+            apic_call_cpu_bwd<1>(kernel_fn, shape, size, args, adj_args);
+            break;
+        case 2:
+            apic_call_cpu_bwd<2>(kernel_fn, shape, size, args, adj_args);
+            break;
+        case 3:
+            apic_call_cpu_bwd<3>(kernel_fn, shape, size, args, adj_args);
+            break;
+        case 4:
+            apic_call_cpu_bwd<4>(kernel_fn, shape, size, args, adj_args);
+            break;
         }
     } else {
         switch (ndim) {
-        case 1: apic_call_cpu_fwd<1>(kernel_fn, shape, size, args); break;
-        case 2: apic_call_cpu_fwd<2>(kernel_fn, shape, size, args); break;
-        case 3: apic_call_cpu_fwd<3>(kernel_fn, shape, size, args); break;
-        case 4: apic_call_cpu_fwd<4>(kernel_fn, shape, size, args); break;
+        case 1:
+            apic_call_cpu_fwd<1>(kernel_fn, shape, size, args);
+            break;
+        case 2:
+            apic_call_cpu_fwd<2>(kernel_fn, shape, size, args);
+            break;
+        case 3:
+            apic_call_cpu_fwd<3>(kernel_fn, shape, size, args);
+            break;
+        case 4:
+            apic_call_cpu_fwd<4>(kernel_fn, shape, size, args);
+            break;
         }
     }
 }
@@ -1637,7 +1652,8 @@ static size_t apic_build_host_args(
     uint8_t* args_buf,
     size_t buf_capacity,
     const uint8_t* scalar_data,
-    size_t scalar_data_size)
+    size_t scalar_data_size
+)
 {
     constexpr size_t MAX_INLINE_SCALAR = APIC_MAX_DIMS * sizeof(int64_t) * 2;
     size_t offset = 0;
@@ -1746,16 +1762,15 @@ static int apic_replay_cpu_ops(APICGraphInternal* g)
 
             // Parse parameter bindings
             const uint8_t* params_ptr = var_data + rec->kernel_key_len + rec->module_hash_len;
-            const APICLaunchParamRecord* params
-                = reinterpret_cast<const APICLaunchParamRecord*>(params_ptr);
+            const APICLaunchParamRecord* params = reinterpret_cast<const APICLaunchParamRecord*>(params_ptr);
 
             // Trailing scalar overflow section (if any) sits after the params array.
             // Its size is whatever total_size has left over.
             const uint8_t* scalar_data = params_ptr + rec->num_params * sizeof(APICLaunchParamRecord);
             size_t used_so_far = sizeof(APICLaunchRecord) + rec->kernel_key_len + rec->module_hash_len
-                               + rec->num_params * sizeof(APICLaunchParamRecord);
-            size_t scalar_data_size = (rec->header.total_size > used_so_far)
-                                    ? (rec->header.total_size - used_so_far) : 0;
+                + rec->num_params * sizeof(APICLaunchParamRecord);
+            size_t scalar_data_size
+                = (rec->header.total_size > used_so_far) ? (rec->header.total_size - used_so_far) : 0;
 
             // Ensure args buffer is large enough (include space for overflow scalars).
             size_t estimated_size = rec->num_params * (WP_ARRAY_T_SIZE + 8) + scalar_data_size;
@@ -1765,8 +1780,8 @@ static int apic_replay_cpu_ops(APICGraphInternal* g)
             if (rec->is_forward) {
                 // Forward pass: all params are forward args
                 size_t args_size = apic_build_host_args(
-                    params, rec->num_params, g, args_buf.data(), args_buf.size(),
-                    scalar_data, scalar_data_size);
+                    params, rec->num_params, g, args_buf.data(), args_buf.size(), scalar_data, scalar_data_size
+                );
                 if (args_size == 0 && rec->num_params > 0) {
                     wp::set_error_string("Failed to reconstruct kernel args for: %s", key_str.c_str());
                     return 0;
@@ -1777,10 +1792,18 @@ static int apic_replay_cpu_ops(APICGraphInternal* g)
                     return 0;
                 }
                 switch (ndim) {
-                case 1: apic_call_cpu_fwd<1>(fwd, shape, launch_size, args_buf.data()); break;
-                case 2: apic_call_cpu_fwd<2>(fwd, shape, launch_size, args_buf.data()); break;
-                case 3: apic_call_cpu_fwd<3>(fwd, shape, launch_size, args_buf.data()); break;
-                case 4: apic_call_cpu_fwd<4>(fwd, shape, launch_size, args_buf.data()); break;
+                case 1:
+                    apic_call_cpu_fwd<1>(fwd, shape, launch_size, args_buf.data());
+                    break;
+                case 2:
+                    apic_call_cpu_fwd<2>(fwd, shape, launch_size, args_buf.data());
+                    break;
+                case 3:
+                    apic_call_cpu_fwd<3>(fwd, shape, launch_size, args_buf.data());
+                    break;
+                case 4:
+                    apic_call_cpu_fwd<4>(fwd, shape, launch_size, args_buf.data());
+                    break;
                 default:
                     wp::set_error_string("Unsupported launch ndim %d for: %s", ndim, key_str.c_str());
                     return 0;
@@ -1794,22 +1817,31 @@ static int apic_replay_cpu_ops(APICGraphInternal* g)
                 }
                 int half = rec->num_params / 2;
                 size_t fwd_size = apic_build_host_args(
-                    params, half, g, args_buf.data(), args_buf.size(),
-                    scalar_data, scalar_data_size);
+                    params, half, g, args_buf.data(), args_buf.size(), scalar_data, scalar_data_size
+                );
                 if (fwd_size == 0 && half > 0) {
                     wp::set_error_string("Failed to reconstruct forward args for backward: %s", key_str.c_str());
                     return 0;
                 }
                 std::vector<uint8_t> adj_buf(args_buf.size());
                 size_t adj_size = apic_build_host_args(
-                    params + half, rec->num_params - half, g, adj_buf.data(), adj_buf.size(),
-                    scalar_data, scalar_data_size);
+                    params + half, rec->num_params - half, g, adj_buf.data(), adj_buf.size(), scalar_data,
+                    scalar_data_size
+                );
                 (void)adj_size;
                 switch (ndim) {
-                case 1: apic_call_cpu_bwd<1>(bwd, shape, launch_size, args_buf.data(), adj_buf.data()); break;
-                case 2: apic_call_cpu_bwd<2>(bwd, shape, launch_size, args_buf.data(), adj_buf.data()); break;
-                case 3: apic_call_cpu_bwd<3>(bwd, shape, launch_size, args_buf.data(), adj_buf.data()); break;
-                case 4: apic_call_cpu_bwd<4>(bwd, shape, launch_size, args_buf.data(), adj_buf.data()); break;
+                case 1:
+                    apic_call_cpu_bwd<1>(bwd, shape, launch_size, args_buf.data(), adj_buf.data());
+                    break;
+                case 2:
+                    apic_call_cpu_bwd<2>(bwd, shape, launch_size, args_buf.data(), adj_buf.data());
+                    break;
+                case 3:
+                    apic_call_cpu_bwd<3>(bwd, shape, launch_size, args_buf.data(), adj_buf.data());
+                    break;
+                case 4:
+                    apic_call_cpu_bwd<4>(bwd, shape, launch_size, args_buf.data(), adj_buf.data());
+                    break;
                 default:
                     wp::set_error_string("Unsupported launch ndim %d for backward: %s", ndim, key_str.c_str());
                     return 0;

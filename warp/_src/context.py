@@ -5335,7 +5335,7 @@ class Runtime:
             self.core.wp_launch_host_kernel.argtypes = [
                 ctypes.c_void_p,  # kernel_fn
                 ctypes.c_void_p,  # bounds
-                ctypes.c_int,     # ndim
+                ctypes.c_int,  # ndim
                 ctypes.c_void_p,  # args
                 ctypes.c_void_p,  # adj_args
                 ctypes.c_void_p,  # apic_info
@@ -5343,7 +5343,10 @@ class Runtime:
             self.core.wp_launch_host_kernel.restype = None
 
             self.core.wp_apic_register_host_function.argtypes = [
-                ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_void_p
+                ctypes.c_void_p,
+                ctypes.c_char_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
             ]
             self.core.wp_apic_register_host_function.restype = None
 
@@ -5354,7 +5357,10 @@ class Runtime:
             self.core.wp_apic_set_cpu_mode.restype = None
 
             self.core.wp_apic_graph_register_host_function.argtypes = [
-                ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_void_p
+                ctypes.c_void_p,
+                ctypes.c_char_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
             ]
             self.core.wp_apic_graph_register_host_function.restype = None
 
@@ -8072,18 +8078,26 @@ def launch(
                 )
 
             # Build args struct and dispatch through C++ (records + executes)
-            ArgsStruct, args = _build_args_struct(kernel, params)
+            _ArgsStruct, args = _build_args_struct(kernel, params)
             fn = hooks.backward if adjoint else hooks.forward
             if adjoint:
                 _AdjStruct, adj_args = _build_adj_args_struct(kernel, params, len(kernel.adj.args))
                 runtime.core.wp_launch_host_kernel(
-                    fn, ctypes.byref(params[0]), len(bounds.shape),
-                    ctypes.byref(args), ctypes.byref(adj_args), apic_info_ptr,
+                    fn,
+                    ctypes.byref(params[0]),
+                    len(bounds.shape),
+                    ctypes.byref(args),
+                    ctypes.byref(adj_args),
+                    apic_info_ptr,
                 )
             else:
                 runtime.core.wp_launch_host_kernel(
-                    fn, ctypes.byref(params[0]), len(bounds.shape),
-                    ctypes.byref(args), None, apic_info_ptr,
+                    fn,
+                    ctypes.byref(params[0]),
+                    len(bounds.shape),
+                    ctypes.byref(args),
+                    None,
+                    apic_info_ptr,
                 )
 
         else:

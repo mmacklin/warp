@@ -41,7 +41,7 @@ class APICLaunchParam(ctypes.Structure):
     """
 
     _pack_ = 1
-    _fields_ = [  # noqa: RUF012
+    _fields_ = [
         ("is_array", ctypes.c_uint8),  # 1 for array, 0 for scalar
         ("ndim", ctypes.c_uint8),  # Number of dimensions (arrays only)
         ("param_index", ctypes.c_uint16),
@@ -67,7 +67,7 @@ class APICLaunchInfo(ctypes.Structure):
     """
 
     _pack_ = 1
-    _fields_ = [  # noqa: RUF012
+    _fields_ = [
         ("kernel_key", ctypes.c_char_p),
         ("module_hash", ctypes.c_char_p),
         ("is_forward", ctypes.c_uint8),

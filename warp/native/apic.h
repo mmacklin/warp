@@ -154,22 +154,13 @@ WP_API void wp_apic_record_array_copy(void* dst, void* src, int dst_type, int sr
 // bounds: pointer to launch_bounds_t<N>; ndim: N for by-value dispatch;
 // args/adj_args: packed kernel arg structs; apic_info: NULL when not capturing.
 WP_API void wp_launch_host_kernel(
-    void* kernel_fn,
-    void* bounds,
-    int ndim,
-    void* args,
-    void* adj_args,
-    const APICLaunchInfo* apic_info
+    void* kernel_fn, void* bounds, int ndim, void* args, void* adj_args, const APICLaunchInfo* apic_info
 );
 
 // Register a host function pointer for CPU graph replay.
 // Must be called during capture for each unique kernel.
-WP_API void wp_apic_register_host_function(
-    APICState state,
-    const char* kernel_key,
-    void* forward_fn,
-    void* backward_fn
-);
+WP_API void
+wp_apic_register_host_function(APICState state, const char* kernel_key, void* forward_fn, void* backward_fn);
 
 // Replay all operations in the state's operation stream on CPU.
 // Uses registered host functions for kernel launches, memcpy/memset for memory ops.
@@ -182,7 +173,8 @@ WP_API void wp_apic_set_cpu_mode(APICState state);
 // Register host function on a loaded graph (for CPU graph replay after loading).
 // Python calls this after loading .o modules via wp_load_obj + wp_lookup to provide
 // the function pointers that wp_apic_replay_loaded_host_graph() needs.
-WP_API void wp_apic_graph_register_host_function(APICGraph graph, const char* kernel_key, void* forward_fn, void* backward_fn);
+WP_API void
+wp_apic_graph_register_host_function(APICGraph graph, const char* kernel_key, void* forward_fn, void* backward_fn);
 
 // Replay a loaded CPU graph using registered host functions.
 // Operates on an APICGraphInternal loaded via wp_apic_load_graph(NULL, path).

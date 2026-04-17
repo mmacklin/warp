@@ -22,6 +22,7 @@ from warp._src.types import int32 as int32
 from warp._src.types import uint32 as uint32
 from warp._src.types import int64 as int64
 from warp._src.types import uint64 as uint64
+from warp._src.types import handle as handle
 from warp._src.types import float16 as float16
 from warp._src.types import float32 as float32
 from warp._src.types import float64 as float64
@@ -172,6 +173,8 @@ from warp._src.context import is_conditional_graph_supported as is_conditional_g
 from warp._src.context import capture_begin as capture_begin
 from warp._src.context import capture_end as capture_end
 from warp._src.context import capture_launch as capture_launch
+from warp._src.context import capture_save as capture_save
+from warp._src.context import capture_load as capture_load
 from warp._src.context import capture_if as capture_if
 from warp._src.context import capture_while as capture_while
 from warp._src.context import capture_debug_dot_print as capture_debug_dot_print

@@ -10,9 +10,9 @@
 // This file is included at the end of warp.cu.
 // Platform-independent code lives in apic.cpp.
 
-#include <memory>  // For std::make_unique, std::unique_ptr
-
 #include "mesh.h"  // For wp::Mesh, wp_mesh_create_device
+
+#include <memory>  // For std::make_unique, std::unique_ptr
 
 // Helper: get kernel function (looks up or retrieves from cache)
 extern "C" WP_API CUfunction apic_get_kernel_function(
@@ -108,9 +108,9 @@ extern "C" WP_API bool apic_rebuild_cuda_graph(APICGraphInternal* graph, CUstrea
             // Sits immediately after the parameter records.
             const uint8_t* scalar_data = params_ptr + rec->num_params * sizeof(APICLaunchParamRecord);
             size_t used_so_far = sizeof(APICLaunchRecord) + rec->kernel_key_len + rec->module_hash_len
-                               + rec->num_params * sizeof(APICLaunchParamRecord);
-            size_t scalar_data_size = (rec->header.total_size > used_so_far)
-                                    ? (rec->header.total_size - used_so_far) : 0;
+                + rec->num_params * sizeof(APICLaunchParamRecord);
+            size_t scalar_data_size
+                = (rec->header.total_size > used_so_far) ? (rec->header.total_size - used_so_far) : 0;
 
             std::vector<void*> args;
             std::vector<std::unique_ptr<uint8_t[]>> arg_storage;
@@ -260,8 +260,9 @@ extern "C" WP_API bool apic_rebuild_cuda_graph(APICGraphInternal* graph, CUstrea
                     src_arr.shape.dims[d] = rec->src_shape[d];
                     src_arr.strides[d] = rec->src_strides[d];
                 }
-                wp_array_copy_device(graph->cuda_context, &dst_arr, &src_arr,
-                                     rec->dst_type, rec->src_type, rec->elem_size);
+                wp_array_copy_device(
+                    graph->cuda_context, &dst_arr, &src_arr, rec->dst_type, rec->src_type, rec->elem_size
+                );
             }
             break;
         }
@@ -276,9 +277,9 @@ extern "C" WP_API bool apic_rebuild_cuda_graph(APICGraphInternal* graph, CUstrea
             if (dst) {
                 for (uint64_t i = 0; i < rec->n; i++) {
                     cuda_err = cudaMemcpyAsync(
-                        (uint8_t*)dst + i * rec->srcsize,
-                        pattern, rec->srcsize,
-                        cudaMemcpyHostToDevice, (cudaStream_t)stream);
+                        (uint8_t*)dst + i * rec->srcsize, pattern, rec->srcsize, cudaMemcpyHostToDevice,
+                        (cudaStream_t)stream
+                    );
                     if (cuda_err != cudaSuccess) {
                         wp::set_error_string("Failed memtile H2D copy: %d", cuda_err);
                         success = false;
@@ -437,4 +438,3 @@ extern "C" WP_API void* wp_apic_get_cuda_graph_exec(APICGraph graph)
 
     return graph->cuda_graph_exec;
 }
-
