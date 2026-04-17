@@ -439,6 +439,7 @@ class FfiKernel:
                     hooks.forward_smem_bytes,
                     kernel_params,
                     stream,
+                    None,  # APICLaunchInfo* (not recording)
                 )
 
         except Exception as e:
