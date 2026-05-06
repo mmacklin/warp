@@ -7684,6 +7684,18 @@ def _launch_deterministic(
 
     if det_meta.has_counter:
         # === Two-pass execution ===
+        # Pattern B requires a host-side prefix sum between two kernel passes, which is
+        # fundamentally incompatible with CUDA graph capture.
+        if runtime.core.wp_cuda_stream_is_capturing(stream.cuda_stream):
+            raise RuntimeError(
+                f"Kernel '{kernel.key}' uses deterministic Pattern B (atomic operations whose "
+                "return value is consumed, e.g. 'slot = wp.atomic_add(counter, 0, 1)'). "
+                "This pattern requires two kernel passes with a host-side prefix sum between "
+                "them and cannot be captured in a CUDA graph. "
+                "To use this kernel inside wp.ScopedCapture, either set deterministic=False "
+                "for the kernel/module or refactor the counter allocation to avoid consuming "
+                "the atomic return value."
+            )
 
         # Phase 0: counting pass (side effects suppressed, scatter disabled).
         det_params_p0 = build_det_params(
