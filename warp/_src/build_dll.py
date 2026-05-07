@@ -538,6 +538,8 @@ def build_dll_for_arch(args, dll_path, cpp_paths, cu_paths, arch, libs: list[str
             "--extended-lambda",
             "-diag-suppress=221",  # suppress "floating-point value does not fit" warning from INFINITY macro in CUDA headers
         ]
+        if sys.platform == "win32" and ctk_version >= (13, 0):
+            nvcc_opts.append("-Xcompiler=/Zc:preprocessor")  # CUDA 13 CCCL requires MSVC conformant preprocessor
 
         # Clang options
         clang_opts = [

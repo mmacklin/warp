@@ -113,22 +113,14 @@ def sanitize_det_name(name: str) -> str:
     return sanitized
 
 
-def scatter_helper_name(array_var_label: str, index: int) -> str:
+def scatter_helper_name(array_var_label: str) -> str:
     """Return the deterministic scatter helper name for an array."""
-    return f"det_scatter_{index}_{sanitize_det_name(array_var_label)}"
+    return f"det_{sanitize_det_name(array_var_label)}"
 
 
-def counter_helper_name(array_var_label: str, index: int) -> str:
+def counter_helper_name(array_var_label: str) -> str:
     """Return the deterministic counter helper name for an array."""
-    return f"det_counter_{index}_{sanitize_det_name(array_var_label)}"
-
-
-def target_label(array_var_label: str, attr_path=()) -> str:
-    """Return a stable display/helper label for a deterministic target."""
-    attr_path = tuple(attr_path)
-    if not attr_path:
-        return array_var_label
-    return ".".join((array_var_label, *attr_path))
+    return f"det_{sanitize_det_name(array_var_label)}"
 
 
 def scatter_cpp_type(target: ScatterTarget) -> str:
@@ -163,11 +155,6 @@ class ScatterTarget:
     scalar_dtype: type
     reduce_op: int
     index: int = 0
-    attr_path: tuple[str, ...] = ()
-
-    @property
-    def target_label(self) -> str:
-        return target_label(self.array_var_label, self.attr_path)
 
 
 @dataclass(eq=False)
@@ -178,11 +165,6 @@ class CounterTarget:
     helper_name: str
     value_ctype: str
     index: int = 0
-    attr_path: tuple[str, ...] = ()
-
-    @property
-    def target_label(self) -> str:
-        return target_label(self.array_var_label, self.attr_path)
 
 
 @dataclass
@@ -233,14 +215,11 @@ class DeterministicRegistry:
 
     scatter_targets: list[ScatterTarget] = field(default_factory=list)
     counter_targets: list[CounterTarget] = field(default_factory=list)
-    _scatter_targets_by_array: dict[tuple[str, tuple[str, ...]], ScatterTarget] = field(default_factory=dict)
-    _counter_targets_by_array: dict[tuple[str, tuple[str, ...]], CounterTarget] = field(default_factory=dict)
-    _next_target_index: int = 0
+    _scatter_targets_by_array: dict[str, ScatterTarget] = field(default_factory=dict)
+    _counter_targets_by_array: dict[str, CounterTarget] = field(default_factory=dict)
 
 
-def get_or_create_scatter_target(
-    registry, meta, array_var_label, value_dtype, value_ctype, scalar_dtype, reduce_op, attr_path=()
-):
+def get_or_create_scatter_target(registry, meta, array_var_label, value_dtype, value_ctype, scalar_dtype, reduce_op):
     """Get or create a stable scatter target and attach it to ``meta``.
 
     Deterministic mode currently supports only one normalized reduction family
@@ -249,21 +228,18 @@ def get_or_create_scatter_target(
     is rejected as a first-pass limitation.
     """
     family = reduce_op_to_family(reduce_op)
-    attr_path = tuple(attr_path)
-    key = (array_var_label, attr_path)
-    label = target_label(array_var_label, attr_path)
-    if key in registry._counter_targets_by_array:
+    if array_var_label in registry._counter_targets_by_array:
         raise ValueError(
-            f"Deterministic mode does not support using array '{label}' as both a counter target "
+            f"Deterministic mode does not support using array '{array_var_label}' as both a counter target "
             "and a scatter target in the same function or kernel."
         )
-    target = registry._scatter_targets_by_array.get(key)
+    target = registry._scatter_targets_by_array.get(array_var_label)
 
     if target is not None:
         if target.family != family:
             raise ValueError(
                 f"Deterministic mode does not support mixing '{target.family}' and '{family}' reductions on array "
-                f"'{label}' in the same function or kernel."
+                f"'{array_var_label}' in the same function or kernel."
             )
         if (
             target.value_dtype != value_dtype
@@ -272,53 +248,44 @@ def get_or_create_scatter_target(
             or target.reduce_op != reduce_op
         ):
             raise ValueError(
-                f"Deterministic mode does not support multiple value layouts for array '{label}' "
+                f"Deterministic mode does not support multiple value layouts for array '{array_var_label}' "
                 f"within the same reduction family."
             )
     else:
-        index = registry._next_target_index
-        registry._next_target_index += 1
         target = ScatterTarget(
             array_var_label=array_var_label,
-            helper_name=scatter_helper_name(label, index),
+            helper_name=scatter_helper_name(array_var_label),
             family=family,
             value_dtype=value_dtype,
             value_ctype=value_ctype,
             scalar_dtype=scalar_dtype,
             reduce_op=reduce_op,
-            index=index,
-            attr_path=attr_path,
+            index=len(registry.scatter_targets),
         )
         registry.scatter_targets.append(target)
-        registry._scatter_targets_by_array[key] = target
+        registry._scatter_targets_by_array[array_var_label] = target
 
     meta.add_scatter_target(target)
     return target
 
 
-def get_or_create_counter_target(registry, meta, array_var_label, value_ctype, attr_path=()):
+def get_or_create_counter_target(registry, meta, array_var_label, value_ctype):
     """Get or create a stable counter target and attach it to ``meta``."""
-    attr_path = tuple(attr_path)
-    key = (array_var_label, attr_path)
-    label = target_label(array_var_label, attr_path)
-    if key in registry._scatter_targets_by_array:
+    if array_var_label in registry._scatter_targets_by_array:
         raise ValueError(
-            f"Deterministic mode does not support using array '{label}' as both a counter target "
+            f"Deterministic mode does not support using array '{array_var_label}' as both a counter target "
             "and a scatter target in the same function or kernel."
         )
-    target = registry._counter_targets_by_array.get(key)
+    target = registry._counter_targets_by_array.get(array_var_label)
     if target is None:
-        index = registry._next_target_index
-        registry._next_target_index += 1
         target = CounterTarget(
             array_var_label=array_var_label,
-            helper_name=counter_helper_name(label, index),
+            helper_name=counter_helper_name(array_var_label),
             value_ctype=value_ctype,
-            index=index,
-            attr_path=attr_path,
+            index=len(registry.counter_targets),
         )
         registry.counter_targets.append(target)
-        registry._counter_targets_by_array[key] = target
+        registry._counter_targets_by_array[array_var_label] = target
     meta.add_counter_target(target)
     return target
 
@@ -406,12 +373,6 @@ def run_sort_reduce(runtime, scatter_targets, scatter_buffers, dest_arrays, devi
     for i, target in enumerate(scatter_targets):
         keys, values, _counter, capacity = scatter_buffers[i]
         dest_arr = dest_arrays[i]
-
-        # Optional route-specific outputs may be passed as ``None``. Their
-        # guarded kernel paths must remain inactive, so there is no destination
-        # buffer to reduce into.
-        if dest_arr is None:
-            continue
 
         try:
             scalar_type_id = warp_scalar_type_to_id(target.scalar_dtype)

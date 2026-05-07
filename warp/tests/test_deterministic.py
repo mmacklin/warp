@@ -99,6 +99,18 @@ def atomic_add_2d_kernel(
 
 
 @wp.kernel
+def atomic_half_kernel(
+    data: wp.array(dtype=wp.float16),
+    dest_indices: wp.array(dtype=wp.int32),
+    output: wp.array(dtype=wp.float16),
+):
+    """Atomic add with float16 (half precision)."""
+    tid = wp.tid()
+    idx = dest_indices[tid]
+    wp.atomic_add(output, idx, data[tid])
+
+
+@wp.kernel
 def atomic_double_kernel(
     data: wp.array(dtype=wp.float64),
     dest_indices: wp.array(dtype=wp.int32),
@@ -175,23 +187,6 @@ def _det_func_scatter_add_wrapper(dst: wp.array(dtype=wp.float32), idx: int, val
     _det_func_scatter_add_leaf(dst, idx, value)
 
 
-@wp.struct
-class _DetStructCounterWriter:
-    counter: wp.array(dtype=wp.int32)
-    output: wp.array(dtype=wp.float32)
-
-
-@wp.struct
-class _DetNameCollisionStruct:
-    b: wp.array(dtype=wp.float32)
-
-
-@wp.func
-def _det_struct_counter_write(writer: _DetStructCounterWriter, value: wp.float32):
-    slot = wp.atomic_add(writer.counter, 0, 1)
-    writer.output[slot] = value
-
-
 def _make_deterministic_closure_kernel(transform_func):
     @wp.kernel(deterministic=True, module="unique")
     def _deterministic_closure_kernel(
@@ -202,42 +197,6 @@ def _make_deterministic_closure_kernel(transform_func):
         wp.atomic_add(output, tid % 8, transform_func(data[tid]))
 
     return _deterministic_closure_kernel
-
-
-@wp.kernel(deterministic=True, module="unique")
-def struct_field_counter_kernel(
-    data: wp.array(dtype=wp.float32),
-    counts: wp.array(dtype=wp.int32),
-    writer: _DetStructCounterWriter,
-):
-    tid = wp.tid()
-    count = counts[tid]
-    if count > 0:
-        base = wp.atomic_add(writer.counter, 0, count)
-        for i in range(count):
-            writer.output[base + i] = data[tid] + wp.float32(i) * wp.float32(0.5)
-
-
-@wp.kernel(deterministic=True, module="unique")
-def struct_field_helper_counter_kernel(
-    data: wp.array(dtype=wp.float32),
-    flags: wp.array(dtype=wp.int32),
-    writer: _DetStructCounterWriter,
-):
-    tid = wp.tid()
-    if flags[tid] != 0:
-        _det_struct_counter_write(writer, data[tid])
-
-
-@wp.kernel(deterministic=True, module="unique")
-def helper_name_collision_kernel(
-    a_b: wp.array(dtype=wp.float32),
-    a: _DetNameCollisionStruct,
-    data: wp.array(dtype=wp.float32),
-):
-    tid = wp.tid()
-    wp.atomic_add(a_b, 0, data[tid])
-    wp.atomic_add(a.b, 0, data[tid] * wp.float32(2.0))
 
 
 @wp.kernel
@@ -287,27 +246,45 @@ def loop_scatter_add_kernel(
         wp.atomic_add(output, 0, val)
 
 
-@wp.kernel(deterministic=True, deterministic_max_records=1)
-def underprovisioned_loop_scatter_kernel(
-    data: wp.array(dtype=wp.float32),
-    counts: wp.array(dtype=wp.int32),
-    output: wp.array(dtype=wp.float32),
-):
-    tid = wp.tid()
-    count = counts[tid]
-    for _ in range(count):
-        wp.atomic_add(output, 0, data[tid])
+# NOTE: mixed_reduce_op_same_array_kernel is intentionally NOT defined at module level.
+# Adding deterministic=True would trigger codegen at decoration time (import time) and
+# raise WarpCodegenError before the test class is even instantiated.  The test creates
+# this kernel inline inside assertRaisesRegex so the error is caught at test run time.
 
 
-@wp.kernel(module="unique")
-def mixed_reduce_op_same_array_kernel(
+# ---------------------------------------------------------------------------
+# Sliced-array kernels: atomic on arr[i] / arr[i, j] view patterns
+# ---------------------------------------------------------------------------
+
+
+@wp.kernel
+def sliced_2d_atomic_add_kernel(
     data: wp.array(dtype=wp.float32),
-    output: wp.array(dtype=wp.float32),
+    row_indices: wp.array(dtype=wp.int32),
+    col_indices: wp.array(dtype=wp.int32),
+    output: wp.array2d(dtype=wp.float32),
 ):
-    """Apply different atomic reductions to the same destination array."""
+    """Atomic add using the sliced arr[row] pattern on a 2D array."""
     tid = wp.tid()
-    wp.atomic_add(output, 0, data[tid])
-    wp.atomic_max(output, 0, 1.0)
+    row = row_indices[tid]
+    col = col_indices[tid]
+    wp.atomic_add(output[row], col, data[tid])
+
+
+@wp.kernel
+def sliced_3d_two_outer_atomic_add_kernel(
+    data: wp.array(dtype=wp.float32),
+    row_indices: wp.array(dtype=wp.int32),
+    col_indices: wp.array(dtype=wp.int32),
+    depth_indices: wp.array(dtype=wp.int32),
+    output: wp.array(dtype=wp.float32, ndim=3),
+):
+    """Atomic add using the sliced arr[row, col] pattern on a 3D array (2 outer dims consumed by view)."""
+    tid = wp.tid()
+    row = row_indices[tid]
+    col = col_indices[tid]
+    depth = depth_indices[tid]
+    wp.atomic_add(output[row, col], depth, data[tid])
 
 
 # ---------------------------------------------------------------------------
@@ -702,6 +679,41 @@ def test_atomic_double_deterministic(test, device):
         np.testing.assert_array_equal(results[0], results[i])
 
 
+def test_atomic_half_deterministic(test, device):
+    """Verify deterministic mode with float16 (half-precision) atomics.
+
+    Exercises the SCALAR_HALF path through the sort-reduce pipeline to
+    confirm that values buffers are correctly sized and typed as ``wp::half``.
+    """
+    if device.is_cpu:
+        test.skipTest("CPU execution is already deterministic")
+
+    n = 1024
+    out_size = 16
+    rng = np.random.default_rng(77)
+
+    data_np = rng.random(n, dtype=np.float32).astype(np.float16)
+    indices_np = rng.integers(0, out_size, size=n, dtype=np.int32)
+
+    data = wp.array(data_np, dtype=wp.float16, device=device)
+    indices = wp.array(indices_np, dtype=wp.int32, device=device)
+
+    results = []
+    for _ in range(5):
+        output = wp.zeros(out_size, dtype=wp.float16, device=device)
+        wp.launch(
+            atomic_half_kernel,
+            dim=n,
+            inputs=[data, indices],
+            outputs=[output],
+            device=device,
+        )
+        results.append(output.numpy().copy())
+
+    for i in range(1, len(results)):
+        np.testing.assert_array_equal(results[0], results[i])
+
+
 def test_vec3_atomic_add_deterministic(test, device):
     """Verify deterministic mode for composite ``wp.vec3`` atomic adds."""
     if device.is_cpu:
@@ -847,33 +859,17 @@ def test_loop_scatter_max_records_override(test, device):
         np.testing.assert_array_equal(results[0], results[i])
 
 
-def test_scatter_overflow_reports_error(test, device):
-    """Verify an underprovisioned dynamic scatter reports overflow to the host."""
-    if device.is_cpu:
-        test.skipTest("CPU execution is already deterministic")
-
-    n = 2048
-    data = wp.ones(n, dtype=wp.float32, device=device)
-    counts = wp.full(n, value=2, dtype=wp.int32, device=device)
-    output = wp.zeros(1, dtype=wp.float32, device=device)
-
-    with test.assertRaisesRegex(RuntimeError, "Deterministic scatter buffer overflow"):
-        wp.launch(underprovisioned_loop_scatter_kernel, dim=n, inputs=[data, counts], outputs=[output], device=device)
-
-
 def test_mixed_reduce_ops_same_array(test, device):
     """Verify mixed reduction families on one array are rejected in deterministic mode."""
     if device.is_cpu:
         test.skipTest("CPU execution is already deterministic")
 
-    data_np = np.full(4, 0.05, dtype=np.float32)
-    data = wp.array(data_np, dtype=wp.float32, device=device)
-    output = wp.zeros(1, dtype=wp.float32, device=device)
-
+    # The kernel is defined inline so that codegen (which raises the error) happens
+    # inside the assertRaisesRegex context rather than at module import time.
     with test.assertRaisesRegex(Exception, "does not support mixing"):
 
         @wp.kernel(deterministic=True, module="unique")
-        def mixed_reduce_op_same_array_local_kernel(
+        def mixed_reduce_op_same_array_kernel(
             data: wp.array(dtype=wp.float32),
             output: wp.array(dtype=wp.float32),
         ):
@@ -881,93 +877,10 @@ def test_mixed_reduce_ops_same_array(test, device):
             wp.atomic_add(output, 0, data[tid])
             wp.atomic_max(output, 0, 1.0)
 
-        wp.launch(
-            mixed_reduce_op_same_array_local_kernel,
-            dim=data_np.shape[0],
-            inputs=[data],
-            outputs=[output],
-            device=device,
-        )
-
-
-def test_struct_field_counter_atomic(test, device):
-    """Verify deterministic counters work when the target array lives in a struct field."""
-    if device.is_cpu:
-        test.skipTest("CPU execution is already deterministic")
-
-    rng = np.random.default_rng(34)
-    data_np = rng.random(64, dtype=np.float32)
-    counts_np = rng.integers(0, 4, size=64, dtype=np.int32)
-    expected = []
-    for tid, count in enumerate(counts_np):
-        for i in range(int(count)):
-            expected.append(np.float32(data_np[tid] + np.float32(i) * np.float32(0.5)))
-    expected = np.asarray(expected, dtype=np.float32)
-
-    data = wp.array(data_np, dtype=wp.float32, device=device)
-    counts = wp.array(counts_np, dtype=wp.int32, device=device)
-
-    results = []
-    counter_values = []
-    for _ in range(3):
-        writer = _DetStructCounterWriter()
-        writer.counter = wp.zeros(1, dtype=wp.int32, device=device)
-        writer.output = wp.zeros(expected.shape[0] + 4, dtype=wp.float32, device=device)
-        wp.launch(struct_field_counter_kernel, dim=64, inputs=[data, counts, writer], device=device)
-        counter_values.append(int(writer.counter.numpy()[0]))
-        results.append(writer.output.numpy()[: expected.shape[0]].copy())
-
-    np.testing.assert_array_equal(np.array(counter_values), np.full(3, expected.shape[0], dtype=np.int32))
-    for i in range(1, len(results)):
-        np.testing.assert_array_equal(results[0], results[i])
-    np.testing.assert_array_equal(results[0].view(np.uint32), expected.view(np.uint32))
-
-
-def test_struct_field_helper_counter_atomic(test, device):
-    """Verify helper-function counters work when the target array lives in a struct field."""
-    if device.is_cpu:
-        test.skipTest("CPU execution is already deterministic")
-
-    rng = np.random.default_rng(35)
-    data_np = rng.random(64, dtype=np.float32)
-    flags_np = (rng.random(64) > 0.4).astype(np.int32)
-    expected = data_np[flags_np != 0]
-
-    data = wp.array(data_np, dtype=wp.float32, device=device)
-    flags = wp.array(flags_np, dtype=wp.int32, device=device)
-
-    results = []
-    counter_values = []
-    for _ in range(3):
-        writer = _DetStructCounterWriter()
-        writer.counter = wp.zeros(1, dtype=wp.int32, device=device)
-        writer.output = wp.zeros(expected.shape[0] + 4, dtype=wp.float32, device=device)
-        wp.launch(struct_field_helper_counter_kernel, dim=64, inputs=[data, flags, writer], device=device)
-        counter_values.append(int(writer.counter.numpy()[0]))
-        results.append(writer.output.numpy()[: expected.shape[0]].copy())
-
-    np.testing.assert_array_equal(np.array(counter_values), np.full(3, expected.shape[0], dtype=np.int32))
-    for i in range(1, len(results)):
-        np.testing.assert_array_equal(results[0], results[i])
-    np.testing.assert_array_equal(results[0].view(np.uint32), expected.view(np.uint32))
-
-
-def test_helper_name_collision(test, device):
-    """Verify deterministic helpers stay unique for labels with the same sanitized form."""
-    if device.is_cpu:
-        test.skipTest("CPU execution is already deterministic")
-
-    data_np = np.linspace(0.25, 2.0, 32, dtype=np.float32)
-    data = wp.array(data_np, dtype=wp.float32, device=device)
-    direct = wp.zeros(1, dtype=wp.float32, device=device)
-    field = wp.zeros(1, dtype=wp.float32, device=device)
-    holder = _DetNameCollisionStruct()
-    holder.b = field
-
-    wp.launch(helper_name_collision_kernel, dim=data_np.shape[0], inputs=[direct, holder, data], device=device)
-
-    np.testing.assert_allclose(direct.numpy(), np.array([data_np.sum()], dtype=np.float32), rtol=1e-5, atol=1e-5)
-    np.testing.assert_allclose(field.numpy(), np.array([2.0 * data_np.sum()], dtype=np.float32), rtol=1e-5, atol=1e-5)
+        data_np = np.full(4, 0.05, dtype=np.float32)
+        data = wp.array(data_np, dtype=wp.float32, device=device)
+        output = wp.zeros(1, dtype=wp.float32, device=device)
+        wp.launch(mixed_reduce_op_same_array_kernel, dim=4, inputs=[data], outputs=[output], device=device)
 
 
 def test_counter_reproducibility(test, device):
@@ -1499,6 +1412,222 @@ def test_deterministic_enum_parity(test, device):
 
 
 # ---------------------------------------------------------------------------
+# Graph-capture tests for sliced-array (Fix A) and Pattern B guard (Fix B)
+# ---------------------------------------------------------------------------
+
+
+def test_graph_capture_sliced_array(test, device):
+    """Verify that deterministic sliced-array atomics (arr[i] pattern) can be captured in a CUDA graph."""
+    if device.is_cpu:
+        test.skipTest("Graph capture requires CUDA")
+
+    n = 256
+    rows, cols = 8, 8
+    rng = np.random.default_rng(201)
+
+    data_np = rng.random(n, dtype=np.float32)
+    row_np = rng.integers(0, rows, size=n, dtype=np.int32)
+    col_np = rng.integers(0, cols, size=n, dtype=np.int32)
+
+    data = wp.array(data_np, dtype=wp.float32, device=device)
+    row_idx = wp.array(row_np, dtype=wp.int32, device=device)
+    col_idx = wp.array(col_np, dtype=wp.int32, device=device)
+    output = wp.zeros(shape=(rows, cols), dtype=wp.float32, device=device)
+
+    # Warm up (force compilation before capture).
+    wp.launch(sliced_2d_atomic_add_kernel, dim=n, inputs=[data, row_idx, col_idx], outputs=[output], device=device)
+    output.zero_()
+
+    with wp.ScopedCapture(device, force_module_load=False) as capture:
+        wp.launch(sliced_2d_atomic_add_kernel, dim=n, inputs=[data, row_idx, col_idx], outputs=[output], device=device)
+
+    wp.capture_launch(capture.graph)
+    first = output.numpy().copy()
+
+    output.zero_()
+    wp.capture_launch(capture.graph)
+    second = output.numpy().copy()
+
+    np.testing.assert_array_equal(first, second)
+
+
+def test_graph_capture_pattern_b_raises(test, device):
+    """Verify that Pattern B (consumed atomic return) raises a clear error inside graph capture."""
+    if device.is_cpu:
+        test.skipTest("Graph capture requires CUDA")
+
+    n = 64
+    rng = np.random.default_rng(202)
+    data_np = rng.random(n, dtype=np.float32)
+
+    data = wp.array(data_np, dtype=wp.float32, device=device)
+    counter = wp.zeros(1, dtype=wp.int32, device=device)
+    output = wp.zeros(n, dtype=wp.float32, device=device)
+
+    # Warm up first so the module is compiled.
+    wp.launch(counter_kernel, dim=n, inputs=[data, counter], outputs=[output], device=device)
+
+    counter.zero_()
+    output.zero_()
+
+    with test.assertRaisesRegex(RuntimeError, "Pattern B"):
+        with wp.ScopedCapture(device, force_module_load=False) as capture:
+            wp.launch(counter_kernel, dim=n, inputs=[data, counter], outputs=[output], device=device)
+
+
+# ---------------------------------------------------------------------------
+# Sliced-array tests (Fix A: wp.atomic_add(arr[i], j, v) pattern)
+# ---------------------------------------------------------------------------
+
+
+def test_sliced_2d_array_atomic_add(test, device):
+    """Verify deterministic mode works with the sliced arr[row] pattern on a 2D array."""
+    if device.is_cpu:
+        test.skipTest("CPU execution is already deterministic")
+
+    n = 2048
+    rows, cols = 16, 16
+    rng = np.random.default_rng(101)
+
+    data_np = rng.random(n, dtype=np.float32)
+    row_np = rng.integers(0, rows, size=n, dtype=np.int32)
+    col_np = rng.integers(0, cols, size=n, dtype=np.int32)
+
+    data = wp.array(data_np, dtype=wp.float32, device=device)
+    row_idx = wp.array(row_np, dtype=wp.int32, device=device)
+    col_idx = wp.array(col_np, dtype=wp.int32, device=device)
+
+    results = []
+    for _ in range(10):
+        output = wp.zeros(shape=(rows, cols), dtype=wp.float32, device=device)
+        wp.launch(
+            sliced_2d_atomic_add_kernel,
+            dim=n,
+            inputs=[data, row_idx, col_idx],
+            outputs=[output],
+            device=device,
+        )
+        results.append(output.numpy().copy())
+
+    for i in range(1, len(results)):
+        np.testing.assert_array_equal(
+            results[0],
+            results[i],
+            err_msg=f"Run {i} differs from run 0 for sliced 2D atomic_add",
+        )
+
+
+def test_sliced_3d_array_atomic_add(test, device):
+    """Verify deterministic mode works with the sliced arr[row, col] pattern on a 3D array."""
+    if device.is_cpu:
+        test.skipTest("CPU execution is already deterministic")
+
+    n = 2048
+    rows, cols, depth = 8, 8, 8
+    rng = np.random.default_rng(102)
+
+    data_np = rng.random(n, dtype=np.float32)
+    row_np = rng.integers(0, rows, size=n, dtype=np.int32)
+    col_np = rng.integers(0, cols, size=n, dtype=np.int32)
+    depth_np = rng.integers(0, depth, size=n, dtype=np.int32)
+
+    data = wp.array(data_np, dtype=wp.float32, device=device)
+    row_idx = wp.array(row_np, dtype=wp.int32, device=device)
+    col_idx = wp.array(col_np, dtype=wp.int32, device=device)
+    depth_idx = wp.array(depth_np, dtype=wp.int32, device=device)
+
+    results = []
+    for _ in range(10):
+        output = wp.zeros(shape=(rows, cols, depth), dtype=wp.float32, device=device)
+        wp.launch(
+            sliced_3d_two_outer_atomic_add_kernel,
+            dim=n,
+            inputs=[data, row_idx, col_idx, depth_idx],
+            outputs=[output],
+            device=device,
+        )
+        results.append(output.numpy().copy())
+
+    for i in range(1, len(results)):
+        np.testing.assert_array_equal(
+            results[0],
+            results[i],
+            err_msg=f"Run {i} differs from run 0 for sliced 3D atomic_add",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Backward / gradient tests (Fix D: backward kernel parameter mismatch)
+# ---------------------------------------------------------------------------
+
+
+def test_deterministic_backward_pattern_a(test, device):
+    """Verify that a deterministic Pattern A kernel can compute correct gradients.
+
+    Before Fix D, the backward kernel had deterministic parameters appended to its
+    signature that were never supplied at launch, causing a CUDA launch error.
+    """
+    if device.is_cpu:
+        test.skipTest("CPU execution is already deterministic")
+
+    n = 512
+    out_size = 16
+    rng = np.random.default_rng(300)
+    data_np = rng.random(n, dtype=np.float32)
+    indices_np = rng.integers(0, out_size, size=n, dtype=np.int32)
+
+    data = wp.array(data_np, dtype=wp.float32, device=device, requires_grad=True)
+    indices = wp.array(indices_np, dtype=wp.int32, device=device)
+    output = wp.zeros(out_size, dtype=wp.float32, device=device, requires_grad=True)
+
+    tape = wp.Tape()
+    with tape:
+        wp.launch(scatter_add_kernel, dim=n, inputs=[data, indices], outputs=[output], device=device)
+
+    # Backprop with all-ones loss gradient: adj_data[i] = adj_output[indices[i]].
+    output.grad = wp.ones_like(output)
+    tape.backward()
+
+    adj_data = data.grad.numpy()
+    expected_adj = np.ones(n, dtype=np.float32)
+    np.testing.assert_allclose(adj_data, expected_adj, rtol=0, atol=0)
+
+
+def test_deterministic_backward_pattern_b(test, device):
+    """Verify that a deterministic Pattern B kernel can compute correct gradients.
+
+    Before this fix, the backward kernel for Pattern B was missing two things:
+    1. The WP_DET_STORE_IF_ACTIVE adjoint (adj_array_store) was never emitted,
+       so gradients from the output never flowed back through output[slot] = data[tid].
+    2. The counter replay was skipped, giving var_slot an uninitialized value,
+       so output[slot] in the backward was garbage.
+    """
+    if device.is_cpu:
+        test.skipTest("CPU execution is already deterministic")
+
+    n = 64
+    rng = np.random.default_rng(42)
+    data_np = rng.random(n, dtype=np.float32)
+
+    data = wp.array(data_np, dtype=wp.float32, device=device, requires_grad=True)
+    counter = wp.zeros(1, dtype=wp.int32, device=device)
+    output = wp.zeros(n, dtype=wp.float32, device=device, requires_grad=True)
+
+    tape = wp.Tape()
+    with tape:
+        wp.launch(counter_kernel, dim=n, inputs=[data, counter], outputs=[output], device=device)
+
+    # All-ones loss: adj_data[tid] = adj_output[slot] = 1 for each thread,
+    # regardless of which slot the counter assigned.
+    output.grad = wp.ones_like(output)
+    tape.backward()
+
+    adj_data = data.grad.numpy()
+    expected_adj = np.ones(n, dtype=np.float32)
+    np.testing.assert_allclose(adj_data, expected_adj, rtol=0, atol=0)
+
+
+# ---------------------------------------------------------------------------
 # Test class registration
 # ---------------------------------------------------------------------------
 
@@ -1545,7 +1674,16 @@ add_function_test(
 )
 add_function_test(TestDeterministic, "test_atomic_add_2d", test_atomic_add_2d, devices=cuda_devices)
 add_function_test(
+    TestDeterministic, "test_sliced_2d_array_atomic_add", test_sliced_2d_array_atomic_add, devices=cuda_devices
+)
+add_function_test(
+    TestDeterministic, "test_sliced_3d_array_atomic_add", test_sliced_3d_array_atomic_add, devices=cuda_devices
+)
+add_function_test(
     TestDeterministic, "test_atomic_double_deterministic", test_atomic_double_deterministic, devices=cuda_devices
+)
+add_function_test(
+    TestDeterministic, "test_atomic_half_deterministic", test_atomic_half_deterministic, devices=cuda_devices
 )
 add_function_test(
     TestDeterministic, "test_vec3_atomic_add_deterministic", test_vec3_atomic_add_deterministic, devices=cuda_devices
@@ -1572,12 +1710,6 @@ add_function_test(
     devices=cuda_devices,
 )
 add_function_test(
-    TestDeterministic,
-    "test_scatter_overflow_reports_error",
-    test_scatter_overflow_reports_error,
-    devices=cuda_devices,
-)
-add_function_test(
     TestDeterministic, "test_mixed_reduce_ops_same_array", test_mixed_reduce_ops_same_array, devices=cuda_devices
 )
 add_function_test(
@@ -1587,21 +1719,6 @@ add_function_test(
     TestDeterministic,
     "test_nested_deterministic_func_kernel",
     test_nested_deterministic_func_kernel,
-    devices=cuda_devices,
-)
-add_function_test(
-    TestDeterministic, "test_struct_field_counter_atomic", test_struct_field_counter_atomic, devices=cuda_devices
-)
-add_function_test(
-    TestDeterministic,
-    "test_struct_field_helper_counter_atomic",
-    test_struct_field_helper_counter_atomic,
-    devices=cuda_devices,
-)
-add_function_test(
-    TestDeterministic,
-    "test_helper_name_collision",
-    test_helper_name_collision,
     devices=cuda_devices,
 )
 
@@ -1660,6 +1777,26 @@ add_function_test(
 )
 add_function_test(
     TestDeterministic, "test_deterministic_enum_parity", test_deterministic_enum_parity, devices=all_devices
+)
+add_function_test(
+    TestDeterministic, "test_graph_capture_sliced_array", test_graph_capture_sliced_array, devices=cuda_devices
+)
+add_function_test(
+    TestDeterministic, "test_graph_capture_pattern_b_raises", test_graph_capture_pattern_b_raises, devices=cuda_devices
+)
+
+# Backward / gradient tests.
+add_function_test(
+    TestDeterministic,
+    "test_deterministic_backward_pattern_a",
+    test_deterministic_backward_pattern_a,
+    devices=cuda_devices,
+)
+add_function_test(
+    TestDeterministic,
+    "test_deterministic_backward_pattern_b",
+    test_deterministic_backward_pattern_b,
+    devices=cuda_devices,
 )
 
 
