@@ -3,6 +3,11 @@
 
 // METH_FASTCALL wrappers for performance-critical native functions.
 // Embedded in warp.dll and loaded as a Python extension module via importlib.
+
+// Python.h must be included before any standard/system headers. It defines
+// feature-test macros (e.g. _XOPEN_SOURCE) that affect the standard headers;
+// warp.h transitively pulls in glibc <features.h>, so including it first
+// causes a _XOPEN_SOURCE redefinition that fails under -Werror on newer glibc.
 #include "warp.h"
 
 #include <Python.h>
